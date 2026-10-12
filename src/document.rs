@@ -1,135 +1,258 @@
 use regex::RegexBuilder;
 use serde_json::Value;
-use serde_json_path::JsonPath;
+use serde_json_path::{JsonPath, PathElement};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     io::{self, Write},
+    sync::Arc,
 };
 
+#[derive(Clone, Copy)]
+enum Kind {
+    Object,
+    Array,
+    String,
+    Number,
+    Boolean,
+    Null,
+}
+impl Kind {
+    fn of(value: &Value) -> Self {
+        match value {
+            Value::Object(_) => Self::Object,
+            Value::Array(_) => Self::Array,
+            Value::String(_) => Self::String,
+            Value::Number(_) => Self::Number,
+            Value::Bool(_) => Self::Boolean,
+            Value::Null => Self::Null,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Object => "object",
+            Self::Array => "array",
+            Self::String => "string",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Null => "null",
+        }
+    }
+}
+
+// Preorder node IDs remain stable. Strings and complete paths are never stored per node.
 pub struct Node {
-    pub key: String,
-    pub pointer: String,
-    pub path: String,
     pub parent: Option<usize>,
     pub depth: usize,
     pub end: usize,
-    pub kind: &'static str,
-    pub preview: String,
-    pub searchable: String,
-    pub container: bool,
+    segment: usize,
+    child_start: usize,
+    child_count: usize,
+    kind: Kind,
+}
+impl Node {
+    pub fn kind(&self) -> &'static str {
+        self.kind.name()
+    }
+    pub fn container(&self) -> bool {
+        matches!(self.kind, Kind::Object | Kind::Array)
+    }
 }
 pub struct Document {
     pub value: Value,
     pub nodes: Vec<Node>,
     pub bytes: usize,
+    children: Vec<usize>,
+    keys: Vec<Arc<str>>,
+    key_ids: HashMap<Arc<str>, usize>,
 }
-
-impl Document {
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-            .map_err(|e| format!("Invalid JSON: {e}"))?;
-        let mut doc = Self {
-            value,
-            nodes: Vec::new(),
-            bytes: text.len(),
-        };
-        Self::index(
-            &doc.value,
-            &mut doc.nodes,
-            "$".into(),
-            String::new(),
-            "$".into(),
-            None,
-            0,
-        );
-        Ok(doc)
-    }
+struct IndexBuilder {
+    nodes: Vec<Node>,
+    children: Vec<usize>,
+    keys: Vec<Arc<str>>,
+    key_ids: HashMap<Arc<str>, usize>,
+}
+impl IndexBuilder {
     fn index(
+        &mut self,
         value: &Value,
-        nodes: &mut Vec<Node>,
-        key: String,
-        pointer: String,
-        path: String,
+        segment: usize,
         parent: Option<usize>,
         depth: usize,
-    ) {
-        let id = nodes.len();
-        let (kind, preview, searchable, container) = match value {
-            Value::Object(v) => (
-                "object",
-                format!("{{ {} keys }}", v.len()),
-                String::new(),
-                true,
-            ),
-            Value::Array(v) => (
-                "array",
-                format!("[ {} items ]", v.len()),
-                String::new(),
-                true,
-            ),
-            Value::String(s) => (
-                "string",
-                serde_json::to_string(&short(s, 160)).unwrap(),
-                s.clone(),
-                false,
-            ),
-            Value::Number(n) => ("number", n.to_string(), n.to_string(), false),
-            Value::Bool(b) => ("boolean", b.to_string(), b.to_string(), false),
-            Value::Null => ("null", "null".into(), "null".into(), false),
+    ) -> usize {
+        let id = self.nodes.len();
+        let count = match value {
+            Value::Object(v) => v.len(),
+            Value::Array(v) => v.len(),
+            _ => 0,
         };
-        nodes.push(Node {
-            key,
-            pointer: pointer.clone(),
-            path: path.clone(),
+        let start = self.children.len();
+        self.children.resize(start + count, 0);
+        self.nodes.push(Node {
             parent,
             depth,
             end: id + 1,
-            kind,
-            preview,
-            searchable,
-            container,
+            segment,
+            child_start: start,
+            child_count: count,
+            kind: Kind::of(value),
         });
         match value {
             Value::Object(map) => {
-                for (key, child) in map {
-                    let segment = key.replace('~', "~0").replace('/', "~1");
-                    let child_path = if is_identifier(key) {
-                        format!("{path}.{key}")
+                for (ordinal, (key, child)) in map.iter().enumerate() {
+                    let segment = if let Some(&index) = self.key_ids.get(key.as_str()) {
+                        index
                     } else {
-                        format!("{path}[{}]", serde_json::to_string(key).unwrap())
+                        let index = self.keys.len();
+                        let key: Arc<str> = Arc::from(key.as_str());
+                        self.key_ids.insert(Arc::clone(&key), index);
+                        self.keys.push(key);
+                        index
                     };
-                    Self::index(
-                        child,
-                        nodes,
-                        key.clone(),
-                        format!("{pointer}/{segment}"),
-                        child_path,
-                        Some(id),
-                        depth + 1,
-                    );
+                    let child_id = self.index(child, segment, Some(id), depth + 1);
+                    self.children[start + ordinal] = child_id;
                 }
+                // Lookup order is independent of display order, which stays in preorder.
+                self.children[start..start + count]
+                    .sort_unstable_by_key(|&child| self.nodes[child].segment);
             }
             Value::Array(array) => {
-                for (i, child) in array.iter().enumerate() {
-                    Self::index(
-                        child,
-                        nodes,
-                        i.to_string(),
-                        format!("{pointer}/{i}"),
-                        format!("{path}[{i}]"),
-                        Some(id),
-                        depth + 1,
-                    );
+                for (ordinal, child) in array.iter().enumerate() {
+                    let child_id = self.index(child, ordinal, Some(id), depth + 1);
+                    self.children[start + ordinal] = child_id;
                 }
             }
             _ => (),
         }
-        nodes[id].end = nodes.len();
+        self.nodes[id].end = self.nodes.len();
+        id
+    }
+}
+fn node_count(value: &Value) -> usize {
+    1 + match value {
+        Value::Object(v) => v.values().map(node_count).sum(),
+        Value::Array(v) => v.iter().map(node_count).sum(),
+        _ => 0,
+    }
+}
+impl Document {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+            .map_err(|e| format!("Invalid JSON: {e}"))?;
+        // Counting avoids geometric capacity growth for the two large index arrays.
+        let count = node_count(&value);
+        let mut index = IndexBuilder {
+            nodes: Vec::with_capacity(count),
+            children: Vec::with_capacity(count.saturating_sub(1)),
+            keys: Vec::new(),
+            key_ids: HashMap::new(),
+        };
+        index.index(&value, 0, None, 0);
+        Ok(Self {
+            value,
+            nodes: index.nodes,
+            bytes: text.len(),
+            children: index.children,
+            keys: index.keys,
+            key_ids: index.key_ids,
+        })
     }
     pub fn at(&self, id: usize) -> &Value {
-        self.value
-            .pointer(&self.nodes[id].pointer)
-            .expect("indexed pointer")
+        let node = &self.nodes[id];
+        let Some(parent) = node.parent else {
+            return &self.value;
+        };
+        match self.at(parent) {
+            Value::Object(map) => &map[self.keys[node.segment].as_ref()],
+            Value::Array(array) => &array[node.segment],
+            _ => unreachable!("only containers have children"),
+        }
+    }
+    pub fn key(&self, id: usize) -> Cow<'_, str> {
+        let node = &self.nodes[id];
+        match node.parent {
+            None => Cow::Borrowed("$"),
+            Some(parent) if matches!(self.nodes[parent].kind, Kind::Array) => {
+                Cow::Owned(node.segment.to_string())
+            }
+            Some(_) => Cow::Borrowed(&self.keys[node.segment]),
+        }
+    }
+    fn ancestors(&self, mut id: usize) -> Vec<usize> {
+        let mut result = Vec::with_capacity(self.nodes[id].depth);
+        while let Some(parent) = self.nodes[id].parent {
+            result.push(id);
+            id = parent;
+        }
+        result.reverse();
+        result
+    }
+    pub fn path(&self, id: usize) -> String {
+        let mut path = String::from("$");
+        for child in self.ancestors(id) {
+            let node = &self.nodes[child];
+            if matches!(self.nodes[node.parent.unwrap()].kind, Kind::Array) {
+                path.push_str(&format!("[{}]", node.segment));
+            } else {
+                let key = &self.keys[node.segment];
+                if is_identifier(key) {
+                    path.push('.');
+                    path.push_str(key);
+                } else {
+                    path.push('[');
+                    path.push_str(&serde_json::to_string(key.as_ref()).unwrap());
+                    path.push(']');
+                }
+            }
+        }
+        path
+    }
+    #[cfg(test)]
+    fn pointer(&self, id: usize) -> String {
+        let mut pointer = String::new();
+        for child in self.ancestors(id) {
+            pointer.push('/');
+            pointer.push_str(&self.key(child).replace('~', "~0").replace('/', "~1"));
+        }
+        pointer
+    }
+    fn child_name(&self, parent: usize, name: &str) -> Option<usize> {
+        if !matches!(self.nodes[parent].kind, Kind::Object) {
+            return None;
+        }
+        let &segment = self.key_ids.get(name)?;
+        let node = &self.nodes[parent];
+        let children = &self.children[node.child_start..node.child_start + node.child_count];
+        children
+            .binary_search_by_key(&segment, |&id| self.nodes[id].segment)
+            .ok()
+            .map(|i| children[i])
+    }
+    fn child_index(&self, parent: usize, index: usize) -> Option<usize> {
+        let node = &self.nodes[parent];
+        (matches!(node.kind, Kind::Array) && index < node.child_count)
+            .then(|| self.children[node.child_start + index])
+    }
+    fn pointer_id(&self, pointer: &str) -> Option<usize> {
+        let mut id = 0;
+        for token in pointer.strip_prefix('/')?.split('/') {
+            let mut bytes = token.bytes();
+            while let Some(byte) = bytes.next() {
+                if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+                    return None;
+                }
+            }
+            let token = token.replace("~1", "/").replace("~0", "~");
+            id = if matches!(self.nodes[id].kind, Kind::Array) {
+                if token.starts_with('+') || (token.len() > 1 && token.starts_with('0')) {
+                    return None;
+                }
+                self.child_index(id, token.parse().ok()?)?
+            } else {
+                self.child_name(id, &token)?
+            };
+        }
+        Some(id)
     }
     pub fn find_path(&self, path: &str) -> Result<usize, String> {
         let ids = self.query_path(path)?;
@@ -140,14 +263,19 @@ impl Document {
         }
     }
     pub fn query_path(&self, expression: &str) -> Result<Vec<usize>, String> {
+        self.query_path_cancellable(expression, || false)
+    }
+    pub fn query_path_cancellable(
+        &self,
+        expression: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Vec<usize>, String> {
+        if cancelled() {
+            return Err("Query cancelled".into());
+        }
         let expression = expression.trim();
         if expression.starts_with('/') {
-            return Ok(self
-                .nodes
-                .iter()
-                .position(|n| n.pointer == expression)
-                .into_iter()
-                .collect());
+            return Ok(self.pointer_id(expression).into_iter().collect());
         }
         let normalized = if expression == "." {
             "$".into()
@@ -157,33 +285,46 @@ impl Document {
             expression.to_owned()
         };
         let query = JsonPath::parse(&normalized).map_err(|e| format!("Invalid JSONPath: {e}"))?;
-        let index: HashMap<&str, usize> = self
-            .nodes
+        let results = query.query_located(&self.value);
+        if cancelled() {
+            return Err("Query cancelled".into());
+        }
+        results
             .iter()
             .enumerate()
-            .map(|(id, node)| (node.pointer.as_str(), id))
-            .collect();
-        query
-            .query_located(&self.value)
-            .iter()
-            .map(|node| {
-                let pointer = node.location().to_json_pointer();
-                index
-                    .get(pointer.as_str())
-                    .copied()
-                    .ok_or_else(|| "Query result not found in tree".into())
+            .map(|(index, node)| {
+                if index % 1024 == 0 && cancelled() {
+                    return Err("Query cancelled".into());
+                }
+                let mut id = 0;
+                for element in node.location().iter() {
+                    id = match element {
+                        PathElement::Name(name) => self.child_name(id, name),
+                        PathElement::Index(index) => self.child_index(id, *index),
+                    }
+                    .ok_or_else(|| "Query result not found in tree".to_string())?;
+                }
+                Ok(id)
             })
             .collect()
+    }
+    pub fn row_preview(&self, id: usize) -> String {
+        match self.at(id) {
+            Value::Object(v) => format!("{{ {} keys }}", v.len()),
+            Value::Array(v) => format!("[ {} items ]", v.len()),
+            Value::String(v) => serde_json::to_string(&short(v, 160)).unwrap(),
+            Value::Number(v) => short(v.as_str(), 160),
+            value => value.to_string(),
+        }
     }
     pub fn preview(&self, id: usize) -> String {
         bounded_preview(self.at(id))
     }
     pub fn results_json(&self, ids: &[usize]) -> String {
-        serde_json::to_string_pretty(&ids.iter().map(|&id| self.at(id)).collect::<Vec<_>>())
-            .unwrap()
+        serde_json::to_string_pretty(&SelectedValues { doc: self, ids }).unwrap()
     }
     pub fn results_preview(&self, ids: &[usize]) -> String {
-        bounded_preview(&ids.iter().map(|&id| self.at(id)).collect::<Vec<_>>())
+        bounded_preview(&SelectedValues { doc: self, ids })
     }
     pub fn search(
         &self,
@@ -191,6 +332,16 @@ impl Document {
         case: bool,
         regex: bool,
         scope: SearchScope,
+    ) -> Result<Vec<usize>, String> {
+        self.search_cancellable(term, case, regex, scope, || false)
+    }
+    pub fn search_cancellable(
+        &self,
+        term: &str,
+        case: bool,
+        regex: bool,
+        scope: SearchScope,
+        cancelled: impl Fn() -> bool,
     ) -> Result<Vec<usize>, String> {
         if term.is_empty() {
             return Ok(Vec::new());
@@ -204,31 +355,92 @@ impl Document {
             .case_insensitive(!case)
             .build()
             .map_err(|e| format!("Invalid regular expression: {e}"))?;
-        Ok(self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| {
-                (scope != SearchScope::Values && matcher.is_match(&n.key))
-                    || (scope != SearchScope::Keys
-                        && !n.container
-                        && matcher.is_match(&n.searchable))
-            })
-            .map(|(id, _)| id)
-            .collect())
+        // Repeated object keys are tested once. Array keys contain only ASCII
+        // digits, so a literal containing other characters cannot match them.
+        let mut key_matches = Vec::new();
+        if scope != SearchScope::Values {
+            key_matches.reserve(self.keys.len());
+            for (index, key) in self.keys.iter().enumerate() {
+                if index % 1024 == 0 && cancelled() {
+                    return Err("Search cancelled".into());
+                }
+                key_matches.push(matcher.is_match(key));
+            }
+        }
+        let match_array_keys = regex || term.bytes().all(|byte| byte.is_ascii_digit());
+        let root_match = scope != SearchScope::Values && matcher.is_match("$");
+        let mut matches = Vec::new();
+        let mut id = 0;
+        let completed = walk(&self.value, &mut |value| {
+            if id % 1024 == 0 && cancelled() {
+                return false;
+            }
+            let node = &self.nodes[id];
+            let key_match = scope != SearchScope::Values
+                && match node.parent {
+                    None => root_match,
+                    Some(parent) if matches!(self.nodes[parent].kind, Kind::Array) => {
+                        match_array_keys && matcher.is_match(&node.segment.to_string())
+                    }
+                    Some(_) => key_matches[node.segment],
+                };
+            let value_match = !key_match
+                && scope != SearchScope::Keys
+                && match value {
+                    Value::String(s) => matcher.is_match(s),
+                    Value::Number(n) => matcher.is_match(n.as_str()),
+                    Value::Bool(b) => matcher.is_match(if *b { "true" } else { "false" }),
+                    Value::Null => matcher.is_match("null"),
+                    _ => false,
+                };
+            if key_match || value_match {
+                matches.push(id);
+            }
+            id += 1;
+            true
+        });
+        if completed {
+            Ok(matches)
+        } else {
+            Err("Search cancelled".into())
+        }
     }
     pub fn visible(&self, expanded: &[bool]) -> Vec<usize> {
         let mut rows = Vec::new();
         let mut id = 0;
         while id < self.nodes.len() {
             rows.push(id);
-            id = if self.nodes[id].container && !expanded[id] {
+            id = if self.nodes[id].container() && !expanded[id] {
                 self.nodes[id].end
             } else {
                 id + 1
             };
         }
         rows
+    }
+}
+struct SelectedValues<'a> {
+    doc: &'a Document,
+    ids: &'a [usize],
+}
+impl serde::Serialize for SelectedValues<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.ids.len()))?;
+        for &id in self.ids {
+            sequence.serialize_element(self.doc.at(id))?;
+        }
+        sequence.end()
+    }
+}
+fn walk(value: &Value, visit: &mut impl FnMut(&Value) -> bool) -> bool {
+    if !visit(value) {
+        return false;
+    }
+    match value {
+        Value::Object(map) => map.values().all(|child| walk(child, visit)),
+        Value::Array(array) => array.iter().all(|child| walk(child, visit)),
+        _ => true,
     }
 }
 #[derive(Clone, Copy, PartialEq)]
@@ -295,11 +507,93 @@ fn bounded_preview<T: serde::Serialize>(value: &T) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn compact_index_shares_keys_and_preserves_object_and_array_locations() {
+        let d =
+            Document::parse(r#"{"z":{"b":1,"a":2},"a":{"a":3,"b":4},"rows":[{"b":5},{"b":6}]}"#)
+                .unwrap();
+        assert!(std::mem::size_of::<Node>() <= 64);
+        assert_eq!(d.keys.len(), 4);
+        assert_eq!(d.nodes.capacity(), d.nodes.len());
+        for id in 0..d.nodes.len() {
+            assert_eq!(d.value.pointer(&d.pointer(id)), Some(d.at(id)));
+            assert_eq!(d.find_path(&d.path(id)).unwrap(), id);
+        }
+        assert_eq!(
+            d.results_json(&d.query_path("$.rows[1,0,1].b").unwrap()),
+            "[\n  6,\n  5,\n  6\n]"
+        );
+    }
+    #[test]
+    fn pointer_lookup_rejects_invalid_escapes_and_array_indices() {
+        let d = Document::parse(r#"{"~2":1,"~":2,"a":[0,1]}"#).unwrap();
+        assert_eq!(d.at(d.find_path("/~02").unwrap()), &serde_json::json!(1));
+        for path in ["/~2", "/~", "/a/01", "/a/+1", "/a/-1", "/a/2"] {
+            assert!(d.query_path(path).unwrap().is_empty(), "{path}");
+        }
+    }
+    #[test]
+    fn search_can_stop_before_scanning_the_document() {
+        let d =
+            Document::parse(r#"{"name":"你好","number":123456789012345678901234567890}"#).unwrap();
+        assert!(
+            d.search_cancellable("name", false, false, SearchScope::All, || true)
+                .is_err()
+        );
+        assert_eq!(
+            d.search("78901234567890", true, false, SearchScope::Values)
+                .unwrap(),
+            vec![2]
+        );
+        assert_eq!(
+            d.search("你好", false, false, SearchScope::Values).unwrap(),
+            vec![1]
+        );
+    }
+    #[test]
+    fn search_preserves_array_index_keys_regex_and_case_semantics() {
+        let d = Document::parse(r#"[null,123,{"1":"你好","Email":"e"}]"#).unwrap();
+        assert_eq!(
+            d.search("1", true, false, SearchScope::Keys).unwrap(),
+            vec![2, 4]
+        );
+        assert_eq!(
+            d.search("^[0-9]$", true, true, SearchScope::Keys).unwrap(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            d.search("1", true, false, SearchScope::Values).unwrap(),
+            vec![2]
+        );
+        assert_eq!(
+            d.search("email", false, false, SearchScope::All).unwrap(),
+            vec![5]
+        );
+        assert!(
+            d.search("email", true, false, SearchScope::All)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            d.search("你好", false, true, SearchScope::Values).unwrap(),
+            vec![4]
+        );
+    }
+    #[test]
+    fn result_preview_stops_resolving_nodes_after_the_output_limit() {
+        let d =
+            Document::parse(&serde_json::json!({"large":"x".repeat(250_000)}).to_string()).unwrap();
+        // The invalid trailing ID must never be visited after serialization is truncated.
+        assert!(
+            d.results_preview(&[1, usize::MAX])
+                .contains("Preview truncated")
+        );
+    }
+    #[test]
     fn paths_round_trip_special_keys_and_arrays() {
         let d = Document::parse(r#"{"a/b":{"~x":[{"a.b":"中文","quote\"":null}]},"":42}"#).unwrap();
-        for (id, n) in d.nodes.iter().enumerate() {
-            assert_eq!(d.find_path(&n.path).unwrap(), id);
-            assert!(d.value.pointer(&n.pointer).is_some());
+        for id in 0..d.nodes.len() {
+            assert_eq!(d.find_path(&d.path(id)).unwrap(), id);
+            assert!(d.value.pointer(&d.pointer(id)).is_some());
         }
         assert_eq!(d.find_path("/a~1b/~0x/0/a.b").unwrap(), 4);
         assert!(d.find_path("$.missing").is_err());

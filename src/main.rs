@@ -10,6 +10,7 @@ mod fonts;
 mod palette;
 mod ui;
 mod vim;
+mod worker;
 use document::{Document, SearchScope};
 use std::{
     io::{self, IsTerminal, Read},
@@ -104,7 +105,7 @@ fn run() -> Result<(), String> {
             println!("{}", doc.results_json(&doc.query_path(&expression)?));
         } else if let Some(term) = search {
             for id in doc.search(&term, false, false, SearchScope::All)? {
-                println!("{}", doc.nodes[id].path);
+                println!("{}", doc.path(id));
             }
         } else {
             println!("{}", serde_json::to_string_pretty(&doc.value).unwrap());

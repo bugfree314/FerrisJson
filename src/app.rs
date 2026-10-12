@@ -3,11 +3,16 @@ use crate::{
     palette::{ColorSettings, Preset, color},
     ui::{json_preview, kind_color},
     vim::{Action, Command, Vim},
+    worker::{Operation, Output, Worker},
 };
 use eframe::egui::{self, Color32, Key, RichText};
 use std::{
+    collections::HashMap,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver},
+    },
     time::{Duration, Instant},
 };
 
@@ -22,7 +27,13 @@ struct PathResults {
 }
 
 pub struct Viewer {
-    doc: Option<Document>,
+    doc: Option<Arc<Document>>,
+    search_worker: Option<Worker>,
+    path_worker: Option<Worker>,
+    search_due: Option<Instant>,
+    pending_expression: String,
+    row_labels: HashMap<usize, (String, String)>,
+    selected_path: String,
     source: String,
     file: Option<PathBuf>,
     pending: Option<Receiver<LoadResult>>,
@@ -101,6 +112,12 @@ impl Viewer {
     fn empty() -> Self {
         Self {
             doc: None,
+            search_worker: None,
+            path_worker: None,
+            search_due: None,
+            pending_expression: String::new(),
+            row_labels: HashMap::new(),
+            selected_path: String::new(),
             source: "No document".into(),
             file: None,
             pending: None,
@@ -142,7 +159,7 @@ impl Viewer {
         }
     }
     fn cursor_location(&self) -> Option<(String, String)> {
-        let doc = self.doc.as_ref()?;
+        self.doc.as_ref()?;
         // Visible IDs stay sorted; avoid scanning the whole document on every frame.
         let row = self.rows.binary_search(&self.selected).ok()? + 1;
         let total = self.rows.len();
@@ -157,7 +174,7 @@ impl Viewer {
         };
         Some((
             format!("Ln {row}/{total} {progress}"),
-            doc.nodes[self.selected].path.clone(),
+            self.selected_path.clone(),
         ))
     }
     fn save_colors(&mut self) {
@@ -210,7 +227,10 @@ impl Viewer {
                 match result {
                     Ok((doc, source, file)) => {
                         self.expanded = doc.nodes.iter().map(|n| n.depth < 2).collect();
-                        self.doc = Some(doc);
+                        self.cancel_operations();
+                        self.row_labels.clear();
+                        self.detail.clear();
+                        self.doc = Some(Arc::new(doc));
                         self.source = source;
                         self.file = file;
                         self.selected = 0;
@@ -264,8 +284,11 @@ impl Viewer {
             self.history.push(id);
             self.history_index = self.history.len() - 1;
         }
+        if self.selected != id || self.detail.is_empty() {
+            self.detail = doc.preview(id);
+            self.selected_path = doc.path(id);
+        }
         self.selected = id;
-        self.detail = doc.preview(id);
     }
     fn history_move(&mut self, backwards: bool) {
         if self.history.is_empty() {
@@ -309,14 +332,14 @@ impl Viewer {
                     let doc = self.doc.as_ref().unwrap();
                     let node = &doc.nodes[self.selected];
                     if command.action == Action::Left {
-                        if node.container && self.expanded[self.selected] {
+                        if node.container() && self.expanded[self.selected] {
                             self.toggle(self.selected);
                         } else if let Some(parent) = node.parent {
                             self.reveal(parent);
                         } else {
                             break;
                         }
-                    } else if node.container && !self.expanded[self.selected] {
+                    } else if node.container() && !self.expanded[self.selected] {
                         self.toggle(self.selected);
                     } else if node.end > self.selected + 1 {
                         self.reveal(self.selected + 1);
@@ -342,7 +365,7 @@ impl Viewer {
                 }
             }
             Action::Toggle | Action::Open | Action::Close => {
-                if self.doc.as_ref().unwrap().nodes[self.selected].container {
+                if self.doc.as_ref().unwrap().nodes[self.selected].container() {
                     let want_open = command.action == Action::Open;
                     if command.action == Action::Toggle || self.expanded[self.selected] != want_open
                     {
@@ -408,16 +431,66 @@ impl Viewer {
         self.rebuild_rows();
         self.scroll_to = true;
     }
+    fn cancel_operations(&mut self) {
+        self.search_due = None;
+        if let Some(worker) = &mut self.search_worker {
+            worker.cancel();
+        }
+        if let Some(worker) = &mut self.path_worker {
+            worker.cancel();
+        }
+    }
+    fn schedule_search(&mut self, ctx: &egui::Context) {
+        if let Some(worker) = &mut self.search_worker {
+            worker.cancel();
+        }
+        self.matches.clear();
+        self.search_error = None;
+        self.query_duration = None;
+        if self.term.is_empty() {
+            self.search_due = None;
+        } else {
+            self.search_due = Some(Instant::now() + Duration::from_millis(200));
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
     fn search(&mut self) {
-        let started = Instant::now();
+        self.search_due = None;
         self.matches.clear();
         self.search_error = None;
         self.match_index = 0;
-        if let Some(doc) = &self.doc {
-            match doc.search(&self.term, self.case, self.regex, self.scope) {
-                Ok(ids) => self.matches = ids,
-                Err(error) => self.search_error = Some(error),
-            }
+        self.query_duration = None;
+        if let Some(worker) = &mut self.search_worker {
+            worker.cancel();
+        }
+        let Some(doc) = &self.doc else {
+            return;
+        };
+        if self.term.is_empty() {
+            return;
+        }
+        if let Some(worker) = &mut self.search_worker {
+            worker.submit(
+                Arc::clone(doc),
+                Operation::Search {
+                    term: self.term.clone(),
+                    case: self.case,
+                    regex: self.regex,
+                    scope: self.scope,
+                },
+            );
+        } else {
+            // Headless callers can use the same completion path without an egui context.
+            let started = Instant::now();
+            let result = doc.search(&self.term, self.case, self.regex, self.scope);
+            self.finish_search(result, started.elapsed());
+        }
+    }
+    fn finish_search(&mut self, result: Result<Vec<usize>, String>, elapsed: Duration) {
+        let started = Instant::now();
+        match result {
+            Ok(ids) => self.matches = ids,
+            Err(error) => self.search_error = Some(error),
         }
         if !self.matches.is_empty() {
             self.match_index = if self.search_reverse {
@@ -433,13 +506,12 @@ impl Viewer {
             };
             self.reveal(self.matches[self.match_index]);
         }
-        self.query_duration = if self.doc.is_some() && !self.term.is_empty() {
-            Some(("Search", started.elapsed()))
-        } else {
-            None
-        };
+        self.query_duration = Some(("Search", elapsed + started.elapsed()));
     }
     fn go_to_path(&mut self) {
+        if let Some(worker) = &mut self.path_worker {
+            worker.cancel();
+        }
         if self.query.trim().is_empty() {
             self.path_results = None;
             self.query_duration = None;
@@ -448,14 +520,27 @@ impl Viewer {
         let Some(doc) = &self.doc else {
             return;
         };
+        self.pending_expression = self.query.clone();
+        if let Some(worker) = &mut self.path_worker {
+            worker.submit(Arc::clone(doc), Operation::Query(self.query.clone()));
+        } else {
+            let started = Instant::now();
+            let result = doc.query_path(&self.query).map(|ids| {
+                let preview = doc.results_preview(&ids);
+                (ids, preview)
+            });
+            self.finish_path(result, started.elapsed());
+        }
+    }
+    fn finish_path(&mut self, result: Result<(Vec<usize>, String), String>, elapsed: Duration) {
         let started = Instant::now();
-        match doc.query_path(&self.query) {
-            Ok(ids) => {
+        match result {
+            Ok((ids, preview)) => {
                 self.error = None;
                 let first = ids.first().copied();
                 self.path_results = Some(PathResults {
-                    expression: self.query.clone(),
-                    preview: doc.results_preview(&ids),
+                    expression: self.pending_expression.clone(),
+                    preview,
                     ids,
                     error: None,
                 });
@@ -465,14 +550,48 @@ impl Viewer {
             }
             Err(error) => {
                 self.path_results = Some(PathResults {
-                    expression: self.query.clone(),
+                    expression: self.pending_expression.clone(),
                     ids: Vec::new(),
                     preview: String::new(),
                     error: Some(error),
-                })
+                });
             }
         }
-        self.query_duration = Some(("Path", started.elapsed()));
+        self.query_duration = Some(("Path", elapsed + started.elapsed()));
+    }
+    fn poll_operations(&mut self, ctx: &egui::Context) {
+        if self.search_due.is_some_and(|due| Instant::now() >= due) {
+            self.search();
+        }
+        if let Some(completed) = self.search_worker.as_mut().and_then(Worker::poll) {
+            self.finish_search(
+                completed.result.map(|output| match output {
+                    Output::Search(ids) => ids,
+                    _ => unreachable!(),
+                }),
+                completed.elapsed,
+            );
+        }
+        if let Some(completed) = self.path_worker.as_mut().and_then(Worker::poll) {
+            let result = completed.result.map(|output| match output {
+                Output::Query {
+                    expression,
+                    ids,
+                    preview,
+                } => {
+                    self.pending_expression = expression;
+                    (ids, preview)
+                }
+                _ => unreachable!(),
+            });
+            self.finish_path(result, completed.elapsed);
+        }
+        if self.search_due.is_some()
+            || self.search_worker.as_ref().is_some_and(|w| w.busy)
+            || self.path_worker.as_ref().is_some_and(|w| w.busy)
+        {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
     }
     fn next_match(&mut self, backwards: bool) {
         self.match_step(backwards, 1);
@@ -492,7 +611,7 @@ impl Viewer {
     fn copy(&mut self, ctx: &egui::Context, path: bool) {
         if let Some(doc) = &self.doc {
             ctx.copy_text(if path {
-                doc.nodes[self.selected].path.clone()
+                self.selected_path.clone()
             } else {
                 serde_json::to_string_pretty(doc.at(self.selected)).unwrap()
             });
@@ -650,7 +769,7 @@ impl Viewer {
         ui.horizontal_wrapped(|ui| {
             ui.heading("Value preview");
             let node = &self.doc.as_ref().unwrap().nodes[self.selected];
-            ui.colored_label(kind_color(node.kind, self.colors.active()), node.kind);
+            ui.colored_label(kind_color(node.kind(), self.colors.active()), node.kind());
             if ui
                 .checkbox(&mut self.colors.wrap_values, "Wrap")
                 .on_hover_text("Automatically wrap long values")
@@ -659,9 +778,9 @@ impl Viewer {
                 self.save_colors();
             }
         });
-        let node = &self.doc.as_ref().unwrap().nodes[self.selected];
-        ui.add(egui::Label::new(RichText::new(&node.path).monospace()).truncate())
-            .on_hover_text(&node.path);
+        let path = &self.selected_path;
+        ui.add(egui::Label::new(RichText::new(path).monospace()).truncate())
+            .on_hover_text(path);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Copy JSON").clicked() {
                 self.copy(ctx, false);
@@ -736,12 +855,20 @@ impl Viewer {
         }
         if reset {
             self.path_results = None;
+            if let Some(worker) = &mut self.path_worker {
+                worker.cancel();
+            }
             self.query.clear();
             self.query_duration = None;
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.search_worker
+            .get_or_insert_with(|| Worker::new(ctx.clone()));
+        self.path_worker
+            .get_or_insert_with(|| Worker::new(ctx.clone()));
         self.poll();
+        self.poll_operations(ctx);
         self.keyboard(ctx);
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()))
         {
@@ -848,9 +975,15 @@ impl Viewer {
                 }
                 if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     response.surrender_focus();
+                    self.search();
+                    changed = false;
                 }
                 if changed {
-                    self.search();
+                    self.schedule_search(ctx);
+                }
+                if self.search_due.is_some() || self.search_worker.as_ref().is_some_and(|w| w.busy)
+                {
+                    ui.spinner();
                 }
                 ui.label(if self.matches.is_empty() {
                     "0 / 0".into()
@@ -873,6 +1006,9 @@ impl Viewer {
             }
             ui.horizontal(|ui| {
                 ui.label("JSONPath");
+                if self.path_worker.as_ref().is_some_and(|w| w.busy) {
+                    ui.spinner();
+                }
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .font(egui::TextStyle::Monospace)
@@ -881,6 +1017,9 @@ impl Viewer {
                 );
                 if response.changed() && self.query.trim().is_empty() {
                     self.path_results = None;
+                    if let Some(worker) = &mut self.path_worker {
+                        worker.cancel();
+                    }
                     self.query_duration = None;
                 }
                 if ui.button("Go").clicked()
@@ -895,6 +1034,9 @@ impl Viewer {
                 {
                     self.query.clear();
                     self.path_results = None;
+                    if let Some(worker) = &mut self.path_worker {
+                        worker.cancel();
+                    }
                     self.query_duration = None;
                 }
                 if ui.button("Expand all").clicked() {
@@ -1054,7 +1196,15 @@ impl Viewer {
                 self.viewport_first = range.start;
                 for row in range {
                     let id = self.rows[row];
-                    let node = &self.doc.as_ref().unwrap().nodes[id];
+                    let doc = self.doc.as_ref().unwrap();
+                    let node = &doc.nodes[id];
+                    if self.row_labels.len() >= 512 && !self.row_labels.contains_key(&id) {
+                        self.row_labels.clear();
+                    }
+                    let (row_key, row_preview) = self
+                        .row_labels
+                        .entry(id)
+                        .or_insert_with(|| (doc.key(id).into_owned(), doc.row_preview(id)));
                     let is_match = self.matches.binary_search(&id).is_ok();
                     let palette = self.colors.active();
                     let fill = if id == self.selected {
@@ -1069,7 +1219,7 @@ impl Viewer {
                         ui.horizontal(|ui| {
                             ui.set_height(row_height);
                             ui.add_space(node.depth as f32 * 18.0);
-                            if node.container {
+                            if node.container() {
                                 if ui
                                     .add_sized(
                                         [18.0, 18.0],
@@ -1087,9 +1237,9 @@ impl Viewer {
                             } else {
                                 ui.add_space(26.0);
                             }
-                            let mut key = RichText::new(&node.key)
+                            let mut key = RichText::new(row_key.as_str())
                                 .monospace()
-                                .color(kind_color(node.kind, self.colors.active()));
+                                .color(kind_color(node.kind(), self.colors.active()));
                             if is_match {
                                 key = key.background_color(color(palette.search_match));
                             }
@@ -1098,15 +1248,15 @@ impl Viewer {
                             if response.clicked() {
                                 select = Some(id);
                             }
-                            if response.double_clicked() && node.container {
+                            if response.double_clicked() && node.container() {
                                 toggle = Some(id);
                             }
                             ui.label(":");
                             let response = ui.add(
                                 egui::Label::new(
-                                    RichText::new(&node.preview)
+                                    RichText::new(row_preview.as_str())
                                         .monospace()
-                                        .color(kind_color(node.kind, self.colors.active())),
+                                        .color(kind_color(node.kind(), self.colors.active())),
                                 )
                                 .sense(egui::Sense::click()),
                             );
@@ -1168,10 +1318,80 @@ mod tests {
         let mut app = Viewer::empty();
         let doc = Document::parse(DEMO).unwrap();
         app.expanded = vec![false; doc.nodes.len()];
-        app.doc = Some(doc);
+        app.doc = Some(Arc::new(doc));
         app.select(0);
         app.rebuild_rows();
         app
+    }
+    fn wait_operations(app: &mut Viewer, ctx: &egui::Context) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.poll_operations(ctx);
+            if app.search_due.is_none()
+                && !app.search_worker.as_ref().is_some_and(|w| w.busy)
+                && !app.path_worker.as_ref().is_some_and(|w| w.busy)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "operations did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn background_operations_update_navigation_and_loading_invalidates_old_results() {
+        let mut app = loaded();
+        let ctx = egui::Context::default();
+        app.search_worker = Some(Worker::new(ctx.clone()));
+        app.path_worker = Some(Worker::new(ctx.clone()));
+        app.term = "email".into();
+        app.scope = SearchScope::Keys;
+        app.search();
+        assert!(app.matches.is_empty());
+        wait_operations(&mut app, &ctx);
+        assert_eq!(app.matches.len(), 2);
+        assert!(app.rows.contains(&app.selected));
+        app.query = "$.users[*].name".into();
+        app.go_to_path();
+        wait_operations(&mut app, &ctx);
+        assert_eq!(app.path_results.as_ref().unwrap().ids.len(), 2);
+        app.search();
+        app.go_to_path();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok((
+            Document::parse(r#"{"fresh":true}"#).unwrap(),
+            "new".into(),
+            None,
+        )))
+        .unwrap();
+        app.pending = Some(rx);
+        app.poll();
+        app.poll_operations(&ctx);
+        assert!(app.matches.is_empty());
+        assert!(app.path_results.is_none());
+        assert_eq!(app.selected_path, "$");
+        assert_eq!(
+            app.doc.as_ref().unwrap().value,
+            serde_json::json!({"fresh":true})
+        );
+    }
+    #[test]
+    fn search_input_is_debounced_and_clearing_cancels_pending_work() {
+        let mut app = loaded();
+        let ctx = egui::Context::default();
+        app.search_worker = Some(Worker::new(ctx.clone()));
+        app.term = "email".into();
+        app.schedule_search(&ctx);
+        assert!(app.search_due.unwrap() > Instant::now());
+        assert!(!app.search_worker.as_ref().unwrap().busy);
+        app.term.clear();
+        app.schedule_search(&ctx);
+        assert!(app.search_due.is_none());
+        app.term = "email".into();
+        app.scope = SearchScope::Keys;
+        app.schedule_search(&ctx);
+        app.search_due = Some(Instant::now());
+        wait_operations(&mut app, &ctx);
+        assert_eq!(app.matches.len(), 2);
     }
     #[test]
     fn search_reveals_match_and_collapsing_preserves_visible_selection() {
@@ -1524,7 +1744,7 @@ mod tests {
         app.reveal(middle);
         let (position, path) = app.cursor_location().unwrap();
         assert!(position.ends_with('%'));
-        assert_eq!(path, app.doc.as_ref().unwrap().nodes[middle].path);
+        assert_eq!(path, app.doc.as_ref().unwrap().path(middle));
         app.reveal(*app.rows.last().unwrap());
         assert!(app.cursor_location().unwrap().0.ends_with("Bot"));
         app.toggle(0);
