@@ -1,6 +1,6 @@
 # FerrisJson
 
-当前版本：**0.3.0**。
+当前版本：**0.3.1**。
 
 一个使用 **Rust 编写并编译为原生可执行程序**的本地 JSON 查看器，提供树形浏览、JSONPath 查询和 Vim 风格导航。
 
@@ -161,6 +161,8 @@ cargo clippy --offline --all-targets -- -D warnings
 
 ## 许可证
 
-本项目使用 [0BSD（Zero-Clause BSD）](LICENSE)：允许任何目的的使用、复制、修改和分发，包括商业用途，无需保留署名或许可证文本。软件按原样提供，不提供担保。完整条款以 [LICENSE](LICENSE) 为准，见 [OSI 许可证说明](https://opensource.org/license/0bsd)。
+本项目采用 **GNU General Public License v3.0 或后续版本（GPL-3.0-or-later）**。允许使用、修改和分发，包括商业用途；分发受 GPL 覆盖的程序或修改版本时，应遵守 GPL 的源码提供、许可证保留及相同许可等要求。软件按原样提供，不提供担保。完整条款以 [LICENSE](LICENSE) 与 [GNU 官方许可证](https://www.gnu.org/licenses/gpl-3.0.html) 为准。
+
+历史版本的许可请以相应 Git 标签中的 LICENSE 文件为准。
 
 第三方依赖及系统字体分别遵循其自身许可证。
