@@ -111,6 +111,9 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
+    // Finder launches with an empty redirected stdin. Start with an empty viewer
+    // instead of trying to parse that as a JSON document; CLI parsing stays strict.
+    let text = text.filter(|text| !text.is_empty());
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_icon(

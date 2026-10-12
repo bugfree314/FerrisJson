@@ -1,6 +1,6 @@
 # FerrisJson
 
-当前版本：**0.3.4**。
+当前版本：**0.3.5**。
 
 <img src="assets/FerrisJson.png" alt="FerrisJson 图标：花括号中的橙色螃蟹" width="96" height="96">
 
@@ -38,7 +38,7 @@ cargo run --release --example generate_json -- 64MiB random-64mib.json 42
 
 ## 从源码运行
 
-开发环境使用 Rust 1.99。Windows 为当前主要验证平台，需要 Rust MSVC 工具链及对应的 C++ 构建工具。
+开发环境使用 Rust 1.99。Windows 需要 Rust MSVC 工具链及对应的 C++ 构建工具；macOS 需要 Rust 和 Xcode Command Line Tools（`xcode-select --install`）。
 
 ```powershell
 cargo run --bin FerrisJson
@@ -71,6 +71,25 @@ Windows 构建后启动：
 图标采用原创的“橙色螃蟹 + JSON 花括号”，窗口使用 PNG，Windows EXE 在构建时嵌入多尺寸 ICO。Windows 构建需要包含资源编译器的 Windows SDK。图标文件位于 `assets/FerrisJson.svg`、`assets/FerrisJson.png` 和 `assets/FerrisJson.ico`；SVG 是可编辑源文件。
 
 图标可通过 SVG 源文件继续编辑，再导出 PNG 和多尺寸 ICO。正常构建直接使用仓库中的图标文件。
+
+### 自动编译与打包（Windows / macOS）
+
+在项目目录执行同一个命令，程序会自动识别当前系统和 Rust 工具链架构，编译 Release 版本并打包：
+
+```sh
+cargo run --release --locked --example package
+```
+
+产物位于 `target/release/bundle/`：
+
+| 当前系统 | 产物 |
+| --- | --- |
+| Windows | `FerrisJson.exe`，同目录附带 README 和 LICENSE |
+| macOS | `FerrisJson.app`，文档位于 App 的 `Contents/Resources/` |
+
+macOS App 可在 Finder 中双击启动，或拖入「应用程序」目录。图标会从现有 PNG 自动生成 ICNS，版本号使用 `Cargo.toml` 中的版本。macOS 最低版本为 11.0；Apple Silicon 使用原生 Rust 工具链时生成 `aarch64` 产物，Intel Mac 生成 `x86_64` 产物。每次只打包当前平台与架构，不生成通用二进制，也不跨系统编译。
+
+macOS 打包使用系统自带的 `sips`、`iconutil`、`plutil` 和 `codesign`，进行无需 Apple 开发者账号的本地 ad-hoc 签名；向其他用户公开分发时，Developer ID 签名与 Apple 公证需另行完成。Windows 沿用现有 EXE 图标资源编译配置。两种平台均不生成 ZIP；重复运行会更新同名产物。
 
 ## 桌面操作
 
