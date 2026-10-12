@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod app;
 mod document;
 mod fonts;
@@ -8,6 +10,20 @@ use std::{
 };
 
 fn main() {
+    // Attach to an existing terminal for CLI use; never allocate a new console.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let output = io::stdout().as_raw_handle();
+        // A valid inherited output handle may be a pipe: leave it intact.
+        if output.is_null() || output as isize == -1 {
+            unsafe {
+                windows_sys::Win32::System::Console::AttachConsole(
+                    windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+                );
+            }
+        }
+    }
     if let Err(error) = run() {
         eprintln!("{error}");
         std::process::exit(1);
@@ -16,6 +32,7 @@ fn main() {
 fn run() -> Result<(), String> {
     let mut file = None;
     let mut get = None;
+    let mut query = None;
     let mut search = None;
     let mut pretty = false;
     let mut args = std::env::args().skip(1);
@@ -23,7 +40,7 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Rust JSON Viewer 0.1.0\n\nUsage: rust-json-viewer [FILE | -] [OPTION]\n\n  --get PATH     Print selected JSON (JSONPath subset or JSON Pointer)\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported."
+                    "Rust JSON Viewer 0.1.0\n\nUsage: rust-json-viewer [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported."
                 );
                 return Ok(());
             }
@@ -32,6 +49,7 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             "--get" => get = Some(args.next().ok_or("--get requires a path")?),
+            "--query" => query = Some(args.next().ok_or("--query requires a JSONPath")?),
             "--search" => search = Some(args.next().ok_or("--search requires text")?),
             "--pretty" => pretty = true,
             "-" if file.is_none() => file = Some(PathBuf::from("-")),
@@ -40,11 +58,16 @@ fn run() -> Result<(), String> {
             _ => return Err("Only one input file is supported".into()),
         }
     }
-    if usize::from(get.is_some()) + usize::from(search.is_some()) + usize::from(pretty) > 1 {
-        return Err("Choose one of --get, --search, or --pretty".into());
+    if usize::from(get.is_some())
+        + usize::from(query.is_some())
+        + usize::from(search.is_some())
+        + usize::from(pretty)
+        > 1
+    {
+        return Err("Choose one of --get, --query, --search, or --pretty".into());
     }
     let use_stdin = file.as_ref().is_some_and(|f| f.as_os_str() == "-")
-        || (file.is_none() && !io::stdin().is_terminal());
+        || (file.is_none() && stdin_redirected());
     let text = if use_stdin {
         let mut text = String::new();
         io::stdin()
@@ -54,7 +77,7 @@ fn run() -> Result<(), String> {
     } else {
         None
     };
-    if get.is_some() || search.is_some() || pretty {
+    if get.is_some() || query.is_some() || search.is_some() || pretty {
         let text = match text {
             Some(text) => text,
             None => std::fs::read_to_string(
@@ -69,6 +92,8 @@ fn run() -> Result<(), String> {
                 "{}",
                 serde_json::to_string_pretty(doc.at(doc.find_path(&path)?)).unwrap()
             );
+        } else if let Some(expression) = query {
+            println!("{}", doc.results_json(&doc.query_path(&expression)?));
         } else if let Some(term) = search {
             for id in doc.search(&term, false, false, SearchScope::All)? {
                 println!("{}", doc.nodes[id].path);
@@ -96,4 +121,15 @@ fn run() -> Result<(), String> {
         }),
     )
     .map_err(|e| e.to_string())
+}
+fn stdin_redirected() -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let handle = io::stdin().as_raw_handle();
+        if handle.is_null() || handle as isize == -1 {
+            return false;
+        }
+    }
+    !io::stdin().is_terminal()
 }

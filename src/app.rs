@@ -8,6 +8,12 @@ use std::{
 
 const DEMO: &str = include_str!("../examples/sample.json");
 type LoadResult = Result<(Document, String, Option<PathBuf>), String>;
+struct PathResults {
+    expression: String,
+    ids: Vec<usize>,
+    preview: String,
+    error: Option<String>,
+}
 
 pub struct Viewer {
     doc: Option<Document>,
@@ -27,6 +33,10 @@ pub struct Viewer {
     regex: bool,
     scope: SearchScope,
     query: String,
+    path_results: Option<PathResults>,
+    history: Vec<usize>,
+    history_index: usize,
+    last_g: Option<Instant>,
     error: Option<String>,
     search_error: Option<String>,
     notice: String,
@@ -74,6 +84,10 @@ impl Viewer {
             regex: false,
             scope: SearchScope::All,
             query: "$".into(),
+            path_results: None,
+            history: Vec::new(),
+            history_index: 0,
+            last_g: None,
             error: None,
             search_error: None,
             notice: String::new(),
@@ -138,6 +152,11 @@ impl Viewer {
                         self.matches.clear();
                         self.search_error = None;
                         self.query_duration = None;
+                        self.path_results = None;
+                        self.query = "$".into();
+                        self.history.clear();
+                        self.history_index = 0;
+                        self.last_g = None;
                         self.notice = "Document loaded".into();
                         self.select(0);
                         self.rebuild_rows();
@@ -172,17 +191,72 @@ impl Viewer {
         let Some(doc) = &self.doc else {
             return;
         };
+        if self.history.get(self.history_index) != Some(&id) {
+            if !self.history.is_empty() {
+                self.history.truncate(self.history_index + 1);
+            }
+            self.history.push(id);
+            self.history_index = self.history.len() - 1;
+        }
         self.selected = id;
-        self.query = doc.nodes[id].path.clone();
-        // Limit the inspector to avoid formatting huge subtrees on each selection.
-        self.detail = if doc.nodes[id].end - id <= 2000
-            && doc.bytes <= 1_000_000
-            && doc.nodes[id].searchable.len() <= 100_000
-        {
-            serde_json::to_string_pretty(doc.at(id)).unwrap()
+        self.detail = doc.preview(id);
+    }
+    fn history_move(&mut self, backwards: bool) {
+        if self.history.is_empty() {
+            return;
+        }
+        self.history_index = if backwards {
+            self.history_index.saturating_sub(1)
         } else {
-            "Preview omitted for this large selection. Copy or export to get its full JSON.".into()
+            (self.history_index + 1).min(self.history.len() - 1)
         };
+        // select() recognizes the history cursor, so replay does not add a new entry.
+        self.reveal(self.history[self.history_index]);
+    }
+    fn vim_navigation(&mut self, ctx: &egui::Context) {
+        let texts = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|event| {
+                    if let egui::Event::Text(text) = event {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        for text in texts {
+            match text.as_str() {
+                "g" => {
+                    let now = Instant::now();
+                    if self
+                        .last_g
+                        .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+                    {
+                        self.reveal(0);
+                        self.last_g = None;
+                    } else {
+                        self.last_g = Some(now);
+                    }
+                }
+                "G" => {
+                    self.last_g = None;
+                    if let Some(&id) = self.rows.last() {
+                        self.reveal(id);
+                    }
+                }
+                "[" => {
+                    self.last_g = None;
+                    self.history_move(true);
+                }
+                "]" => {
+                    self.last_g = None;
+                    self.history_move(false);
+                }
+                _ => self.last_g = None,
+            }
+        }
     }
     fn reveal(&mut self, id: usize) {
         if let Some(doc) = &self.doc {
@@ -217,16 +291,37 @@ impl Viewer {
         };
     }
     fn go_to_path(&mut self) {
+        if self.query.trim().is_empty() {
+            self.path_results = None;
+            self.query_duration = None;
+            return;
+        }
         let Some(doc) = &self.doc else {
             return;
         };
         let started = Instant::now();
-        match doc.find_path(&self.query) {
-            Ok(id) => {
+        match doc.query_path(&self.query) {
+            Ok(ids) => {
                 self.error = None;
-                self.reveal(id);
+                let first = ids.first().copied();
+                self.path_results = Some(PathResults {
+                    expression: self.query.clone(),
+                    preview: doc.results_preview(&ids),
+                    ids,
+                    error: None,
+                });
+                if let Some(id) = first {
+                    self.reveal(id);
+                }
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => {
+                self.path_results = Some(PathResults {
+                    expression: self.query.clone(),
+                    ids: Vec::new(),
+                    preview: String::new(),
+                    error: Some(error),
+                })
+            }
         }
         self.query_duration = Some(("Path", started.elapsed()));
     }
@@ -255,15 +350,16 @@ impl Viewer {
         let Some(doc) = &self.doc else {
             return;
         };
+        let json = serde_json::to_string_pretty(doc.at(self.selected)).unwrap();
+        self.export_json(json);
+    }
+    fn export_json(&mut self, json: String) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("JSON", &["json"])
             .set_file_name("selection.json")
             .save_file()
         {
-            match std::fs::write(
-                &path,
-                serde_json::to_string_pretty(doc.at(self.selected)).unwrap(),
-            ) {
+            match std::fs::write(&path, json) {
                 Ok(()) => self.notice = format!("Exported {}", path.display()),
                 Err(error) => self.error = Some(format!("Cannot export: {error}")),
             }
@@ -299,6 +395,7 @@ impl Viewer {
             self.load_file(file, ctx);
         }
         if ctx.wants_keyboard_input() || self.paste_open || self.help {
+            self.last_g = None;
             return;
         }
         let paste = ctx.input(|i| {
@@ -324,6 +421,14 @@ impl Viewer {
         }
         if self.doc.is_none() {
             return;
+        }
+        self.vim_navigation(ctx);
+        if ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Key { key, pressed: true, .. } if *key != Key::G))
+        }) {
+            self.last_g = None;
         }
         let position = self
             .rows
@@ -485,16 +590,30 @@ impl Viewer {
                 ui.colored_label(Color32::LIGHT_RED, error);
             }
             ui.horizontal(|ui| {
-                ui.label("Path");
+                ui.label("JSONPath");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .font(egui::TextStyle::Monospace)
-                        .desired_width((ui.available_width() - 220.0).max(150.0)),
+                        .hint_text("$.users[*].name or $.users[?(@.active)]")
+                        .desired_width((ui.available_width() - 270.0).max(100.0)),
                 );
+                if response.changed() && self.query.trim().is_empty() {
+                    self.path_results = None;
+                    self.query_duration = None;
+                }
                 if ui.button("Go").clicked()
                     || (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
                 {
                     self.go_to_path();
+                }
+                if ui
+                    .button("Reset")
+                    .on_hover_text("Clear JSONPath results and show selected value")
+                    .clicked()
+                {
+                    self.query.clear();
+                    self.path_results = None;
+                    self.query_duration = None;
                 }
                 if ui.button("Expand all").clicked() {
                     self.expanded.fill(true);
@@ -543,6 +662,50 @@ impl Viewer {
                 .resizable(true)
                 .show(ctx, |ui| {
                     ui.add_space(8.0);
+                    if let Some(results) = &self.path_results {
+                        ui.heading("JSONPath results");
+                        ui.label(RichText::new(&results.expression).monospace());
+                        ui.label(format!("{} matches", results.ids.len()));
+                        let mut copy = false;
+                        let mut export = false;
+                        let mut reset = false;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_enabled_ui(results.error.is_none(), |ui| {
+                                copy = ui.button("Copy results").clicked();
+                                export = ui.button("Export results").clicked();
+                            });
+                            reset = ui.button("Selection preview").clicked();
+                        });
+                        ui.separator();
+                        if let Some(error) = &results.error {
+                            ui.colored_label(Color32::LIGHT_RED, error);
+                        } else {
+                            egui::ScrollArea::both()
+                                .id_salt("query_results")
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut results.preview.as_str())
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                });
+                        }
+                        if copy || export {
+                            let json = self.doc.as_ref().unwrap().results_json(&results.ids);
+                            if copy {
+                                ctx.copy_text(json);
+                                self.notice = "JSONPath results copied".into();
+                            } else {
+                                self.export_json(json);
+                            }
+                        }
+                        if reset {
+                            self.path_results = None;
+                            self.query.clear();
+                            self.query_duration = None;
+                        }
+                        return;
+                    }
                     ui.heading("Selection");
                     let node = &self.doc.as_ref().unwrap().nodes[self.selected];
                     ui.label(RichText::new(node.kind).color(kind_color(node.kind)));
@@ -709,7 +872,7 @@ impl Viewer {
         egui::Window::new("Keyboard & paths").open(&mut self.help).show(ctx, |ui| {
             ui.label("Ctrl+O  Open file\nCtrl+V  Open clipboard (outside text fields)\nCtrl+F or /  Search\nF3 / Shift+F3 or n / N  Next / previous match\nArrows or h j k l  Navigate and expand/collapse\nSpace  Toggle node\nHome / End  First / last visible node\nCtrl+C  Copy selected JSON\nCtrl+P  Copy selected path\nF5  Reload source file\nEscape  Leave search field");
             ui.separator();
-            ui.label("Paths: $.users[0].name, .users[0], $[\"special.key\"], /users/0/name\nWildcards and JavaScript expressions are not supported in v0.1.0.");
+            ui.label("JSONPath: $.users[*].name, $..email, $.users[0:5], $.users[?(@.active == true)].name\nAlso supports quoted keys, negative indices and JSON Pointer. Query runs on Go / Enter; Reset restores selection preview.\ngg / G: first / last visible node. [ / ]: navigation history back / forward.");
         });
     }
 }
@@ -769,7 +932,7 @@ mod tests {
     fn ui_frames_render_empty_loaded_and_dialog_states() {
         let ctx = egui::Context::default();
         let mut app = Viewer::empty();
-        for state in 0..4 {
+        for state in 0..6 {
             if state == 1 {
                 app = loaded();
             }
@@ -779,6 +942,15 @@ mod tests {
             if state == 3 {
                 app.help = false;
                 app.paste_open = true;
+            }
+            if state == 4 {
+                app.paste_open = false;
+                app.query = "$.users[*].name".into();
+                app.go_to_path();
+            }
+            if state == 5 {
+                app.query = "$[?".into();
+                app.go_to_path();
             }
             let output = ctx.run(
                 egui::RawInput {
@@ -805,7 +977,7 @@ mod tests {
         assert_eq!(app.doc.as_ref().unwrap().at(app.selected), "张三");
         app.query = "$.missing".into();
         app.go_to_path();
-        assert!(app.error.is_some());
+        assert!(app.path_results.as_ref().unwrap().ids.is_empty());
         assert!(app.query_duration.is_some());
         let (tx, rx) = mpsc::channel();
         app.pending = Some(rx);
@@ -859,5 +1031,73 @@ mod tests {
         for (text, pos) in timings {
             assert!(pos.x > 800.0 && pos.y > 700.0, "{text} is at {pos:?}");
         }
+    }
+    #[test]
+    fn jsonpath_results_survive_selection_and_invalid_queries_clear_old_results() {
+        let mut app = loaded();
+        app.query = "$.users[*].name".into();
+        app.go_to_path();
+        assert_eq!(app.path_results.as_ref().unwrap().ids.len(), 2);
+        assert_eq!(app.query, "$.users[*].name");
+        assert!(app.path_results.as_ref().unwrap().preview.contains("张三"));
+        app.select(0);
+        assert!(app.path_results.is_some());
+        app.query = "$[?".into();
+        app.go_to_path();
+        assert!(app.path_results.as_ref().unwrap().error.is_some());
+        assert!(app.path_results.as_ref().unwrap().ids.is_empty());
+        app.path_results = None;
+        app.select(1);
+        assert_eq!(app.detail, "\"Rust JSON Viewer\"");
+    }
+    #[test]
+    fn history_replays_positions_and_branches_after_new_navigation() {
+        let mut app = loaded();
+        app.reveal(2);
+        app.reveal(3);
+        app.history_move(true);
+        assert_eq!(app.selected, 2);
+        app.history_move(true);
+        assert_eq!(app.selected, 0);
+        app.history_move(true);
+        assert_eq!(app.selected, 0);
+        app.history_move(false);
+        assert_eq!(app.selected, 2);
+        app.reveal(4);
+        app.history_move(false);
+        assert_eq!(app.selected, 4);
+        assert_eq!(app.history, vec![0, 2, 4]);
+    }
+    #[test]
+    fn vim_keys_jump_and_replay_history_without_affecting_text_fields() {
+        let ctx = egui::Context::default();
+        let mut app = loaded();
+        app.expanded.fill(true);
+        app.rebuild_rows();
+        app.reveal(3);
+        let frame = |app: &mut Viewer, text: &str| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Text(text.into())],
+                    ..Default::default()
+                },
+                |ctx| app.keyboard(ctx),
+            );
+        };
+        frame(&mut app, "g");
+        assert_eq!(app.selected, 3);
+        frame(&mut app, "g");
+        assert_eq!(app.selected, 0);
+        frame(&mut app, "G");
+        assert_eq!(app.selected, *app.rows.last().unwrap());
+        frame(&mut app, "[");
+        assert_eq!(app.selected, 0);
+        frame(&mut app, "]");
+        assert_eq!(app.selected, *app.rows.last().unwrap());
+        let selected = app.selected;
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("query_field")));
+        frame(&mut app, "g");
+        frame(&mut app, "g");
+        assert_eq!(app.selected, selected);
     }
 }

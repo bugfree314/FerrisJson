@@ -1,5 +1,10 @@
 use regex::RegexBuilder;
 use serde_json::Value;
+use serde_json_path::JsonPath;
+use std::{
+    collections::HashMap,
+    io::{self, Write},
+};
 
 pub struct Node {
     pub key: String,
@@ -127,11 +132,58 @@ impl Document {
             .expect("indexed pointer")
     }
     pub fn find_path(&self, path: &str) -> Result<usize, String> {
-        let pointer = path_to_pointer(path)?;
-        self.nodes
+        let ids = self.query_path(path)?;
+        match ids.as_slice() {
+            [id] => Ok(*id),
+            [] => Err(format!("Path not found: {path}")),
+            _ => Err("Path selected multiple nodes; use --query to retrieve all results".into()),
+        }
+    }
+    pub fn query_path(&self, expression: &str) -> Result<Vec<usize>, String> {
+        let expression = expression.trim();
+        if expression.starts_with('/') {
+            return Ok(self
+                .nodes
+                .iter()
+                .position(|n| n.pointer == expression)
+                .into_iter()
+                .collect());
+        }
+        let normalized = if expression == "." {
+            "$".into()
+        } else if expression.starts_with('.') || expression.starts_with('[') {
+            format!("${expression}")
+        } else {
+            expression.to_owned()
+        };
+        let query = JsonPath::parse(&normalized).map_err(|e| format!("Invalid JSONPath: {e}"))?;
+        let index: HashMap<&str, usize> = self
+            .nodes
             .iter()
-            .position(|n| n.pointer == pointer)
-            .ok_or_else(|| format!("Path not found: {path}"))
+            .enumerate()
+            .map(|(id, node)| (node.pointer.as_str(), id))
+            .collect();
+        query
+            .query_located(&self.value)
+            .iter()
+            .map(|node| {
+                let pointer = node.location().to_json_pointer();
+                index
+                    .get(pointer.as_str())
+                    .copied()
+                    .ok_or_else(|| "Query result not found in tree".into())
+            })
+            .collect()
+    }
+    pub fn preview(&self, id: usize) -> String {
+        bounded_preview(self.at(id))
+    }
+    pub fn results_json(&self, ids: &[usize]) -> String {
+        serde_json::to_string_pretty(&ids.iter().map(|&id| self.at(id)).collect::<Vec<_>>())
+            .unwrap()
+    }
+    pub fn results_preview(&self, ids: &[usize]) -> String {
+        bounded_preview(&ids.iter().map(|&id| self.at(id)).collect::<Vec<_>>())
     }
     pub fn search(
         &self,
@@ -200,75 +252,44 @@ fn short(text: &str, length: usize) -> String {
     }
     result
 }
-/// RFC 6901 pointers and a small JSONPath subset (no wildcard or expressions).
-pub fn path_to_pointer(input: &str) -> Result<String, String> {
-    let input = input.trim();
-    if input.starts_with('/') {
-        return Ok(input.into());
+// Bound serialization by output bytes, rather than by the size of the whole document.
+fn bounded_preview<T: serde::Serialize>(value: &T) -> String {
+    struct PreviewWriter {
+        bytes: Vec<u8>,
+        truncated: bool,
     }
-    if matches!(input, "" | "$" | ".") {
-        return Ok(String::new());
-    }
-    let input = input.strip_prefix('$').unwrap_or(input);
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-    let mut segments = Vec::new();
-    while i < chars.len() {
-        if chars[i] == '.' {
-            i += 1;
-            let start = i;
-            while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
-                i += 1;
+    impl Write for PreviewWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let remaining = 200_000usize.saturating_sub(self.bytes.len());
+            if buf.len() > remaining {
+                self.bytes.extend_from_slice(&buf[..remaining]);
+                self.truncated = true;
+                return Err(io::Error::other("preview limit"));
             }
-            let key: String = chars[start..i].iter().collect();
-            if !is_identifier(&key) {
-                return Err("Use [\"key\"] for special property names".into());
-            }
-            segments.push(key);
-        } else if chars[i] == '[' {
-            i += 1;
-            if i < chars.len() && chars[i] == '"' {
-                let start = i;
-                i += 1;
-                let mut escaped = false;
-                while i < chars.len() {
-                    let c = chars[i];
-                    i += 1;
-                    if c == '"' && !escaped {
-                        break;
-                    }
-                    escaped = c == '\\' && !escaped;
-                }
-                let quoted: String = chars[start..i].iter().collect();
-                let key: String =
-                    serde_json::from_str(&quoted).map_err(|_| "Invalid quoted key")?;
-                segments.push(key);
-            } else {
-                let start = i;
-                while i < chars.len() && chars[i].is_ascii_digit() {
-                    i += 1;
-                }
-                if start == i {
-                    return Err("Expected an array index or a double-quoted key".into());
-                }
-                let index: String = chars[start..i].iter().collect();
-                if index.len() > 1 && index.starts_with('0') {
-                    return Err("Array index must not have leading zeros".into());
-                }
-                segments.push(index);
-            }
-            if chars.get(i) != Some(&']') {
-                return Err("Expected closing ]".into());
-            }
-            i += 1;
-        } else {
-            return Err("Use $.users[0].name, .users[0], or /users/0/name".into());
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
-    Ok(segments
-        .iter()
-        .map(|s| format!("/{}", s.replace('~', "~0").replace('/', "~1")))
-        .collect())
+    let mut writer = PreviewWriter {
+        bytes: Vec::new(),
+        truncated: false,
+    };
+    let result = serde_json::to_writer_pretty(&mut writer, value);
+    if result.is_err() && !writer.truncated {
+        return "Cannot format preview".into();
+    }
+    let valid_len = match std::str::from_utf8(&writer.bytes) {
+        Ok(_) => writer.bytes.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    let mut text = String::from_utf8(writer.bytes[..valid_len].to_vec()).unwrap();
+    if writer.truncated {
+        text.push_str("\n… Preview truncated. Copy or export for complete JSON.");
+    }
+    text
 }
 #[cfg(test)]
 mod tests {
@@ -282,8 +303,8 @@ mod tests {
         }
         assert_eq!(d.find_path("/a~1b/~0x/0/a.b").unwrap(), 4);
         assert!(d.find_path("$.missing").is_err());
-        for invalid in ["$[01]", "$.a[", "$..x", "$[*]"] {
-            assert!(path_to_pointer(invalid).is_err());
+        for invalid in ["$[01]", "$.a[", "$[?"] {
+            assert!(d.query_path(invalid).is_err());
         }
     }
     #[test]
@@ -329,5 +350,53 @@ mod tests {
         assert!(Document::parse("{bad}").err().unwrap().contains("line"));
         let d = Document::parse("\u{feff}{\"n\":123456789012345678901234567890}").unwrap();
         assert_eq!(d.at(1).to_string(), "123456789012345678901234567890");
+    }
+    #[test]
+    fn jsonpath_queries_support_selectors_filters_and_exact_locations() {
+        let d = Document::parse(r#"{"resultList":[{"ANS":"a","n":1},{"ANS":"b","n":2},{"ANS":"a","n":3},{"ANS":"韩国","n":4}],"a/b":{"x.y":true}}"#).unwrap();
+        let values = |expr: &str| {
+            d.query_path(expr)
+                .unwrap()
+                .iter()
+                .map(|&id| d.at(id).clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            values("$.resultList[3].ANS"),
+            vec![serde_json::json!("韩国")]
+        );
+        assert_eq!(values("$.resultList[*].ANS").len(), 4);
+        assert_eq!(values("$..ANS").len(), 4);
+        assert_eq!(
+            values("$.resultList[-1].ANS"),
+            vec![serde_json::json!("韩国")]
+        );
+        assert_eq!(
+            values("$.resultList[1:3].n"),
+            vec![serde_json::json!(2), serde_json::json!(3)]
+        );
+        assert_eq!(
+            values("$.resultList[?(@.n >= 3)].n"),
+            vec![serde_json::json!(3), serde_json::json!(4)]
+        );
+        assert_eq!(values("$['a/b']['x.y']"), vec![serde_json::json!(true)]);
+        let ids = d.query_path("$.resultList[0,2,0].ANS").unwrap();
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids[0], ids[2]);
+        assert!(d.query_path("$.nothing").unwrap().is_empty());
+        assert!(d.query_path("$[?").is_err());
+        assert!(d.find_path("$.resultList[*]").is_err());
+    }
+    #[test]
+    fn previews_are_bounded_by_selection_not_document_size() {
+        let text = serde_json::json!({"small":"한국어", "large":"한".repeat(400_000)}).to_string();
+        let d = Document::parse(&text).unwrap();
+        assert!(d.bytes > 1_000_000);
+        assert_eq!(d.preview(d.find_path("$.small").unwrap()), "\"한국어\"");
+        let preview = d.preview(d.find_path("$.large").unwrap());
+        assert!(preview.contains("Preview truncated"));
+        assert!(!preview.contains('\u{fffd}'));
+        assert!(preview.len() < 201_000);
+        assert_eq!(d.results_preview(&[]), "[]");
     }
 }
