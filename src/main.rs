@@ -7,6 +7,7 @@
 mod app;
 mod document;
 mod fonts;
+mod palette;
 mod ui;
 mod vim;
 use document::{Document, SearchScope};

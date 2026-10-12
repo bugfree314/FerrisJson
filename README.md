@@ -1,6 +1,6 @@
 # FerrisJson
 
-当前版本：**0.3.1**。
+当前版本：**0.3.2**。
 
 一个使用 **Rust 编写并编译为原生可执行程序**的本地 JSON 查看器，提供树形浏览、JSONPath 查询和 Vim 风格导航。
 
@@ -18,6 +18,7 @@
 - **快捷键速查页**：F1 打开，Esc 关闭，输入框内保持正常文字输入。
 - **输入与输出**：文件选择、拖放、粘贴、标准输入；复制完整 JSON、复制路径、导出选中值或所有查询结果。
 - **多语种与主题**：中日韩及其他常用文字的系统字体回退，深浅色主题，保留对象键顺序和大整数精度。
+- **可自定义配色**：内置 Ferris、Monokai、Solarized、Claude 风格、VS Code 风格，以及 Custom 配色；每套均有深浅两种模式，统一应用到树、值预览与 JSONPath 结果。
 - **耗时显示**：右下角显示最近一次打开文档、搜索或 JSONPath 查询的耗时。
 - **Windows 桌面启动**：不创建命令行窗口；命令行处理可以使用已有终端或管道。
 
@@ -78,6 +79,16 @@ Windows 构建后启动：
 | `/users/0/name` | 使用 JSON Pointer 定位 |
 
 也可省略起始 `$`，例如 `.users[0].name`。JSONPath 采用 [serde_json_path](https://docs.rs/serde_json_path/0.7.2/serde_json_path/) 的 RFC 9535 查询语法，不执行 JavaScript。零匹配显示 `[]`；无效表达式显示错误。
+
+## 配色设置
+
+在顶部配色下拉框选择 **Ferris / Monokai / Solarized / Claude / VS Code / Custom**，使用 **Light / Dark** 切换深浅模式。顶部的方案和模式选择会自动保存，下次启动时恢复。
+
+点击 **Colors** 打开配色编辑器，可独立调整字符串、数字、布尔、null、对象、数组、文字/标点、背景、交替行、选中行及搜索高亮颜色，并查看即时示例。修改内置方案的颜色会生成 **Custom**；深色和浅色的自定义颜色分别保存。**Use as custom** 以当前内置方案作为编辑起点，**Restore Ferris defaults** 恢复默认配色；点击 **Save settings** 保存自定义改动。Esc 可关闭编辑器。
+
+内置配色是针对 JSON 类型设计的风格方案，不是对应产品的官方完整主题。Claude 风格使用暖色纸张、陶土色及柔和点缀；Monokai 为经典风格，不使用 Monokai Pro 主题资源。
+
+设置保存在用户配置目录的 `FerrisJson/colors.json`：Windows 为 `%APPDATA%/FerrisJson/colors.json`，macOS 为 `~/Library/Application Support/FerrisJson/colors.json`，Linux 为 `$XDG_CONFIG_HOME/FerrisJson/colors.json`（未设置时使用 `~/.config`）。读取失败时使用 Ferris 默认方案并显示提示；保存失败时显示错误。
 
 ## 快捷键
 
@@ -152,7 +163,7 @@ cargo clippy --offline --all-targets -- -D warnings
 - 使用 serde_json 默认嵌套深度限制。
 - 选中值与查询结果的预览最多输出约 200 KB，截断时显示提示；复制与导出仍保留完整内容。
 - 多语种字形覆盖取决于系统安装的字体。Windows 使用微软雅黑、Malgun Gothic、游ゴシック及其他后备字体；其他平台尝试常见系统字体或 Noto 字体。系统字体不随项目分发。
-- 主题和面板分隔位置仅在当前会话生效。
+- 配色和深浅模式可保存到用户配置目录；面板分隔位置仅在当前会话生效。
 - 打开耗时包含文件读取、解析、树索引和初始预览准备；查询耗时包含检索与结果定位，不包含文件选择对话框及屏幕绘制。
 
 ## 致谢

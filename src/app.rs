@@ -1,5 +1,6 @@
 use crate::{
     document::{Document, SearchScope},
+    palette::{ColorSettings, Preset, color},
     ui::{json_preview, kind_color},
     vim::{Action, Command, Vim},
 };
@@ -56,6 +57,8 @@ pub struct Viewer {
     scroll_to: bool,
     detail: String,
     dark: bool,
+    colors: ColorSettings,
+    colors_open: bool,
 }
 
 impl Viewer {
@@ -64,9 +67,16 @@ impl Viewer {
         file: Option<PathBuf>,
         text: Option<String>,
     ) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         cc.egui_ctx.set_fonts(crate::fonts::definitions());
         let mut app = Self::empty();
+        match ColorSettings::load() {
+            Ok(settings) => {
+                app.dark = settings.dark;
+                app.colors = settings;
+            }
+            Err(error) => app.error = Some(error),
+        }
+        app.colors.active().apply(&cc.egui_ctx, app.dark);
         if let Some(text) = text {
             app.load_text(text, "Standard input".into(), &cc.egui_ctx);
         } else if let Some(file) = file {
@@ -112,6 +122,14 @@ impl Viewer {
             scroll_to: false,
             detail: String::new(),
             dark: true,
+            colors: ColorSettings::default(),
+            colors_open: false,
+        }
+    }
+    fn save_colors(&mut self) {
+        match self.colors.save() {
+            Ok(()) => self.notice = "Color settings saved".into(),
+            Err(error) => self.error = Some(error),
         }
     }
     fn load_file(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -481,6 +499,7 @@ impl Viewer {
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.help = false;
             self.paste_open = false;
+            self.colors_open = false;
             self.vim.record("Esc");
             if let Some(id) = ctx.memory(|m| m.focused()) {
                 ctx.memory_mut(|m| m.surrender_focus(id));
@@ -492,7 +511,7 @@ impl Viewer {
             self.vim.cancel();
             return;
         }
-        if self.help || self.paste_open {
+        if self.help || self.paste_open || self.colors_open {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::O)) {
@@ -597,7 +616,7 @@ impl Viewer {
         ui.horizontal(|ui| {
             ui.heading("Value preview");
             let node = &self.doc.as_ref().unwrap().nodes[self.selected];
-            ui.colored_label(kind_color(node.kind, self.dark), node.kind);
+            ui.colored_label(kind_color(node.kind, self.colors.active()), node.kind);
         });
         let node = &self.doc.as_ref().unwrap().nodes[self.selected];
         ui.add(egui::Label::new(RichText::new(&node.path).monospace()).truncate())
@@ -614,7 +633,7 @@ impl Viewer {
             }
         });
         ui.separator();
-        json_preview(ui, &self.detail, self.dark, "value_preview");
+        json_preview(ui, &self.detail, self.colors.active(), "value_preview");
     }
     fn results_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.heading("JSONPath results");
@@ -642,7 +661,7 @@ impl Viewer {
         if let Some(error) = &results.error {
             ui.colored_label(Color32::LIGHT_RED, error);
         } else {
-            json_preview(ui, &results.preview, self.dark, "path_results");
+            json_preview(ui, &results.preview, self.colors.active(), "path_results");
         }
         if copy || export {
             let json = self.doc.as_ref().unwrap().results_json(&results.ids);
@@ -668,7 +687,7 @@ impl Viewer {
         }
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new("{ }  FerrisJson")
                         .strong()
@@ -692,11 +711,26 @@ impl Viewer {
                     .clicked()
                 {
                     self.dark = !self.dark;
-                    ctx.set_visuals(if self.dark {
-                        egui::Visuals::dark()
-                    } else {
-                        egui::Visuals::light()
+                    self.colors.dark = self.dark;
+                    self.colors.active().apply(ctx, self.dark);
+                    self.save_colors();
+                }
+                let old_preset = self.colors.preset;
+                egui::ComboBox::from_id_salt("json_palette")
+                    .width(95.0)
+                    .selected_text(self.colors.preset.name())
+                    .show_ui(ui, |ui| {
+                        for preset in Preset::ALL {
+                            ui.selectable_value(&mut self.colors.preset, preset, preset.name());
+                        }
                     });
+                if self.colors.preset != old_preset {
+                    self.colors.active().apply(ctx, self.dark);
+                    self.save_colors();
+                }
+                if ui.button("Colors").clicked() {
+                    self.vim.cancel();
+                    self.colors_open = true;
                 }
                 if ui.button("Help").clicked() {
                     self.help = true;
@@ -964,14 +998,11 @@ impl Viewer {
                     let id = self.rows[row];
                     let node = &self.doc.as_ref().unwrap().nodes[id];
                     let is_match = self.matches.binary_search(&id).is_ok();
+                    let palette = self.colors.active();
                     let fill = if id == self.selected {
-                        if self.dark {
-                            Color32::from_rgb(30, 65, 95)
-                        } else {
-                            Color32::from_rgb(205, 230, 250)
-                        }
+                        color(palette.selection)
                     } else if row % 2 == 0 {
-                        ui.visuals().faint_bg_color
+                        color(palette.stripe)
                     } else {
                         Color32::TRANSPARENT
                     };
@@ -1000,13 +1031,9 @@ impl Viewer {
                             }
                             let mut key = RichText::new(&node.key)
                                 .monospace()
-                                .color(kind_color(node.kind, self.dark));
+                                .color(kind_color(node.kind, self.colors.active()));
                             if is_match {
-                                key = key.background_color(if self.dark {
-                                    Color32::from_rgb(75, 65, 25)
-                                } else {
-                                    Color32::from_rgb(255, 235, 170)
-                                });
+                                key = key.background_color(color(palette.search_match));
                             }
                             let response =
                                 ui.add(egui::Label::new(key).sense(egui::Sense::click()));
@@ -1021,7 +1048,7 @@ impl Viewer {
                                 egui::Label::new(
                                     RichText::new(&node.preview)
                                         .monospace()
-                                        .color(kind_color(node.kind, self.dark)),
+                                        .color(kind_color(node.kind, self.colors.active())),
                                 )
                                 .sense(egui::Sense::click()),
                             );
@@ -1055,7 +1082,18 @@ impl Viewer {
                 self.paste_open = false;
             }
         }
-        crate::ui::cheatsheet(ctx, &mut self.help);
+        crate::ui::cheatsheet(ctx, &mut self.help, self.colors.active());
+        let changed = crate::ui::color_editor(
+            ctx,
+            &mut self.colors_open,
+            &mut self.colors,
+            &mut self.notice,
+            &mut self.error,
+        );
+        if changed {
+            self.dark = self.colors.dark;
+            self.colors.active().apply(ctx, self.dark);
+        }
     }
 }
 fn format_duration(duration: Duration) -> String {

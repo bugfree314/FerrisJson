@@ -1,25 +1,10 @@
+use crate::palette::{ColorSettings, Palette, Preset};
 use eframe::egui::{self, Color32, RichText};
 
-pub fn kind_color(kind: &str, dark: bool) -> Color32 {
-    let rgb = match (kind, dark) {
-        ("string", true) => (115, 205, 150),
-        ("string", false) => (30, 125, 65),
-        ("number", true) => (110, 180, 255),
-        ("number", false) => (25, 100, 185),
-        ("boolean", true) => (205, 150, 255),
-        ("boolean", false) => (130, 65, 175),
-        ("null", true) => (215, 175, 125),
-        ("null", false) => (145, 95, 35),
-        ("object", true) => (110, 205, 215),
-        ("object", false) => (20, 115, 125),
-        ("array", true) => (235, 185, 100),
-        ("array", false) => (150, 100, 20),
-        (_, true) => (180, 185, 195),
-        (_, false) => (85, 90, 100),
-    };
-    Color32::from_rgb(rgb.0, rgb.1, rgb.2)
+pub fn kind_color(kind: &str, palette: Palette) -> Color32 {
+    palette.kind(kind)
 }
-pub fn json_job(text: &str, dark: bool) -> egui::text::LayoutJob {
+pub fn json_job(text: &str, palette: Palette) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -76,7 +61,7 @@ pub fn json_job(text: &str, dark: bool) -> egui::text::LayoutJob {
             0.0,
             egui::TextFormat {
                 font_id: egui::FontId::monospace(13.0),
-                color: kind_color(kind, dark),
+                color: kind_color(kind, palette),
                 ..Default::default()
             },
         );
@@ -93,13 +78,13 @@ fn value_kind(text: &str) -> &'static str {
         _ => "number",
     }
 }
-pub fn json_preview(ui: &mut egui::Ui, mut text: &str, dark: bool, id: &str) {
+pub fn json_preview(ui: &mut egui::Ui, mut text: &str, palette: Palette, id: &str) {
     egui::ScrollArea::both()
         .id_salt(id)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _: f32| {
-                ui.fonts_mut(|fonts| fonts.layout_job(json_job(buffer.as_str(), dark)))
+                ui.fonts_mut(|fonts| fonts.layout_job(json_job(buffer.as_str(), palette)))
             };
             ui.add(
                 egui::TextEdit::multiline(&mut text)
@@ -109,7 +94,7 @@ pub fn json_preview(ui: &mut egui::Ui, mut text: &str, dark: bool, id: &str) {
             );
         });
 }
-pub fn cheatsheet(ctx: &egui::Context, open: &mut bool) {
+pub fn cheatsheet(ctx: &egui::Context, open: &mut bool, palette: Palette) {
     if !*open {
         return;
     }
@@ -139,10 +124,73 @@ pub fn cheatsheet(ctx: &egui::Context, open: &mut bool) {
                 ui.monospace("$.users[*].name   $..email   $.users[?(@.active == true)]");
                 ui.label("Go / Enter runs JSONPath. The lower inspector keeps results; the upper always previews your selection. Drag the divider to resize.");
                 ui.horizontal_wrapped(|ui| { for kind in ["string", "number", "boolean", "null", "object", "array"] {
-                    ui.colored_label(kind_color(kind, ui.visuals().dark_mode), kind);
+                    ui.colored_label(kind_color(kind, palette), kind);
                 }});
             });
         });
+}
+pub fn color_editor(
+    ctx: &egui::Context,
+    open: &mut bool,
+    settings: &mut ColorSettings,
+    notice: &mut String,
+    error: &mut Option<String>,
+) -> bool {
+    if !*open {
+        return false;
+    }
+    let mut changed = false;
+    egui::Window::new("JSON colors").open(open).collapsible(false).default_width(530.0)
+        .max_height((ctx.content_rect().height() - 60.0).max(250.0)).show(ctx, |ui| {
+        ui.heading("Make JSON feel like home");
+        ui.label("Built-in palettes include light and dark variants. Edits apply immediately; Save remembers custom colors.");
+        ui.horizontal(|ui| {
+            let old = settings.preset;
+            egui::ComboBox::from_id_salt("editor_palette").selected_text(settings.preset.name()).show_ui(ui, |ui| {
+                for preset in Preset::ALL { ui.selectable_value(&mut settings.preset, preset, preset.name()); }
+            });
+            changed |= old != settings.preset;
+            changed |= ui.checkbox(&mut settings.dark, "Dark mode").changed();
+        });
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let mut palette = settings.active(); let mut edited = false;
+            ui.add_space(6.0);
+            egui::Grid::new("custom_colors").num_columns(3).spacing([18.0, 5.0]).show(ui, |ui| {
+                for (label, rgb) in [("String", &mut palette.string), ("Number", &mut palette.number),
+                    ("Boolean", &mut palette.boolean), ("Null", &mut palette.null), ("Object", &mut palette.object),
+                    ("Array", &mut palette.array), ("Text / punctuation", &mut palette.punctuation),
+                    ("Background", &mut palette.background), ("Alternating row", &mut palette.stripe),
+                    ("Selected row", &mut palette.selection), ("Search match", &mut palette.search_match)] {
+                    ui.label(label); edited |= ui.color_edit_button_srgb(rgb).changed();
+                    ui.monospace(format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])); ui.end_row();
+                }
+            });
+            if edited {
+                settings.customize();
+                if settings.dark { settings.custom_dark = palette; } else { settings.custom_light = palette; }
+                changed = true;
+            }
+            ui.add_space(10.0);
+            ui.label("Preview (keys follow their values' types)");
+            egui::Frame::new().fill(crate::palette::color(settings.active().background)).inner_margin(10.0).show(ui, |ui| {
+                ui.label(json_job(r#"{"name":"FerrisJson","count":42,"active":true,"optional":null,"object":{},"items":[]}"#, settings.active()));
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Use as custom").clicked() { settings.customize(); changed = true; }
+                if ui.button("Restore Ferris defaults").clicked() {
+                    let dark = settings.dark; *settings = ColorSettings { dark, ..Default::default() }; changed = true;
+                }
+                if ui.button("Save settings").clicked() {
+                    match settings.save() { Ok(()) => { *notice = "Color settings saved".into(); *error = None; }, Err(e) => *error = Some(e) }
+                }
+            });
+            if let Some(error) = error.as_ref() { ui.colored_label(Color32::LIGHT_RED, error); }
+            if let Ok(path) = crate::palette::settings_path() {
+                ui.add(egui::Label::new(format!("Saved to {}", path.display())).wrap());
+            }
+        });
+    });
+    changed
 }
 #[cfg(test)]
 mod tests {
@@ -150,7 +198,8 @@ mod tests {
     #[test]
     fn json_colors_preserve_unicode_and_follow_value_types() {
         let text = r#"{"韩语":"한국어","flag":true,"n":2,"nil":null,"obj":{},"list":[]}"#;
-        let job = json_job(text, true);
+        let palette = Palette::builtin(Preset::Ferris, true);
+        let job = json_job(text, palette);
         assert_eq!(job.text, text);
         for (token, kind) in [
             ("\"flag\"", "boolean"),
@@ -164,8 +213,11 @@ mod tests {
                 .iter()
                 .find(|s| &job.text[s.byte_range.clone()] == token)
                 .unwrap();
-            assert_eq!(section.format.color, kind_color(kind, true));
+            assert_eq!(section.format.color, kind_color(kind, palette));
         }
-        assert_ne!(kind_color("string", false), kind_color("string", true));
+        assert_ne!(
+            kind_color("string", Palette::builtin(Preset::Ferris, false)),
+            kind_color("string", palette)
+        );
     }
 }
