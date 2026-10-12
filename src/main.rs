@@ -1,5 +1,6 @@
 mod app;
 mod document;
+mod fonts;
 use document::{Document, SearchScope};
 use std::{
     io::{self, IsTerminal, Read},

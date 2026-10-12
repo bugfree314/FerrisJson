@@ -3,6 +3,7 @@ use eframe::egui::{self, Color32, Key, RichText};
 use std::{
     path::PathBuf,
     sync::mpsc::{self, Receiver},
+    time::{Duration, Instant},
 };
 
 const DEMO: &str = include_str!("../examples/sample.json");
@@ -13,6 +14,9 @@ pub struct Viewer {
     source: String,
     file: Option<PathBuf>,
     pending: Option<Receiver<LoadResult>>,
+    load_started: Option<Instant>,
+    open_duration: Option<Duration>,
+    query_duration: Option<(&'static str, Duration)>,
     expanded: Vec<bool>,
     selected: usize,
     rows: Vec<usize>,
@@ -42,17 +46,7 @@ impl Viewer {
         text: Option<String>,
     ) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        // Windows fallback for Chinese keys and values; never required to launch.
-        if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/msyh.ttc") {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("cjk".into(), egui::FontData::from_owned(bytes).into());
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts.families.entry(family).or_default().push("cjk".into());
-            }
-            cc.egui_ctx.set_fonts(fonts);
-        }
+        cc.egui_ctx.set_fonts(crate::fonts::definitions());
         let mut app = Self::empty();
         if let Some(text) = text {
             app.load_text(text, "Standard input".into(), &cc.egui_ctx);
@@ -67,6 +61,9 @@ impl Viewer {
             source: "No document".into(),
             file: None,
             pending: None,
+            load_started: None,
+            open_duration: None,
+            query_duration: None,
             expanded: Vec::new(),
             selected: 0,
             rows: Vec::new(),
@@ -93,6 +90,8 @@ impl Viewer {
         if self.pending.is_some() {
             return;
         }
+        self.load_started = Some(Instant::now());
+        self.open_duration = None;
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
         self.error = None;
@@ -110,6 +109,8 @@ impl Viewer {
         if self.pending.is_some() {
             return;
         }
+        self.load_started = Some(Instant::now());
+        self.open_duration = None;
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
         self.error = None;
@@ -136,16 +137,19 @@ impl Viewer {
                         self.term.clear();
                         self.matches.clear();
                         self.search_error = None;
+                        self.query_duration = None;
                         self.notice = "Document loaded".into();
                         self.select(0);
                         self.rebuild_rows();
                     }
                     Err(error) => self.error = Some(error),
                 }
+                self.open_duration = self.load_started.take().map(|start| start.elapsed());
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.pending = None;
                 self.error = Some("Loading worker stopped".into());
+                self.open_duration = self.load_started.take().map(|start| start.elapsed());
             }
             Err(mpsc::TryRecvError::Empty) => (),
         }
@@ -193,6 +197,7 @@ impl Viewer {
         self.scroll_to = true;
     }
     fn search(&mut self) {
+        let started = Instant::now();
         self.matches.clear();
         self.search_error = None;
         self.match_index = 0;
@@ -205,6 +210,25 @@ impl Viewer {
         if let Some(&id) = self.matches.first() {
             self.reveal(id);
         }
+        self.query_duration = if self.doc.is_some() && !self.term.is_empty() {
+            Some(("Search", started.elapsed()))
+        } else {
+            None
+        };
+    }
+    fn go_to_path(&mut self) {
+        let Some(doc) = &self.doc else {
+            return;
+        };
+        let started = Instant::now();
+        match doc.find_path(&self.query) {
+            Ok(id) => {
+                self.error = None;
+                self.reveal(id);
+            }
+            Err(error) => self.error = Some(error),
+        }
+        self.query_duration = Some(("Path", started.elapsed()));
     }
     fn next_match(&mut self, backwards: bool) {
         if self.matches.is_empty() {
@@ -467,17 +491,10 @@ impl Viewer {
                         .font(egui::TextStyle::Monospace)
                         .desired_width((ui.available_width() - 220.0).max(150.0)),
                 );
-                if (ui.button("Go").clicked()
-                    || (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))))
-                    && let Some(doc) = &self.doc
+                if ui.button("Go").clicked()
+                    || (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
                 {
-                    match doc.find_path(&self.query) {
-                        Ok(id) => {
-                            self.error = None;
-                            self.reveal(id);
-                        }
-                        Err(error) => self.error = Some(error),
-                    }
+                    self.go_to_path();
                 }
                 if ui.button("Expand all").clicked() {
                     self.expanded.fill(true);
@@ -492,7 +509,18 @@ impl Viewer {
             ui.add_space(4.0);
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some((label, duration)) = self.query_duration {
+                        ui.label(format!("{label}: {}", format_duration(duration))).on_hover_text("Includes query, node reveal and selection preview; excludes painting.");
+                    }
+                    if self.pending.is_some() {
+                        ui.label("Opening...");
+                    } else if let Some(duration) = self.open_duration {
+                        ui.label(format!("Open: {}", format_duration(duration))).on_hover_text("Includes file read (when applicable), JSON parse, node index and initial view preparation; excludes file picker and painting.");
+                    }
+                    ui.separator();
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 if let Some(doc) = &self.doc {
                     ui.label(format!(
                         "{} nodes  |  {:.1} KB",
@@ -501,9 +529,11 @@ impl Viewer {
                     ));
                     ui.separator();
                 }
-                ui.label(&self.notice);
+                ui.add(egui::Label::new(&self.notice).truncate());
                 ui.separator();
-                ui.label("Ctrl+O Open   Ctrl+F Find   F1 Help");
+                ui.label("F1 Help");
+                    });
+                });
             });
         });
         if self.doc.is_some() {
@@ -692,6 +722,13 @@ fn kind_color(kind: &str) -> Color32 {
         _ => Color32::from_rgb(135, 145, 155),
     }
 }
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() >= 1 {
+        format!("{:.2} s", duration.as_secs_f64())
+    } else {
+        format!("{:.2} ms", duration.as_secs_f64() * 1000.0)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,6 +791,73 @@ mod tests {
                 |ctx| app.draw(ctx),
             );
             assert!(!output.shapes.is_empty());
+        }
+    }
+    #[test]
+    fn operation_timings_cover_search_path_and_loading() {
+        let mut app = loaded();
+        app.term = "email".into();
+        app.search();
+        assert_eq!(app.query_duration.unwrap().0, "Search");
+        app.query = "$.users[1].name".into();
+        app.go_to_path();
+        assert_eq!(app.query_duration.unwrap().0, "Path");
+        assert_eq!(app.doc.as_ref().unwrap().at(app.selected), "张三");
+        app.query = "$.missing".into();
+        app.go_to_path();
+        assert!(app.error.is_some());
+        assert!(app.query_duration.is_some());
+        let (tx, rx) = mpsc::channel();
+        app.pending = Some(rx);
+        app.load_started = Some(Instant::now());
+        tx.send(Ok((Document::parse(DEMO).unwrap(), "test".into(), None)))
+            .unwrap();
+        app.poll();
+        assert!(app.open_duration.is_some());
+        assert!(app.query_duration.is_none());
+        assert!(app.load_started.is_none());
+        assert_eq!(format_duration(Duration::from_micros(1234)), "1.23 ms");
+        assert_eq!(format_duration(Duration::from_millis(1500)), "1.50 s");
+    }
+    #[test]
+    fn timings_render_at_bottom_right() {
+        let ctx = egui::Context::default();
+        let mut app = loaded();
+        app.open_duration = Some(Duration::from_millis(150));
+        app.query_duration = Some(("Search", Duration::from_micros(250)));
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1120.0, 760.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+        let mut timings = Vec::new();
+        fn collect(shape: &egui::Shape, found: &mut Vec<(String, egui::Pos2)>) {
+            match shape {
+                egui::Shape::Text(text)
+                    if text.galley.text().starts_with("Open:")
+                        || text.galley.text().starts_with("Search:") =>
+                {
+                    found.push((text.galley.text().into(), text.pos));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, found);
+                    }
+                }
+                _ => (),
+            }
+        }
+        for shape in output.shapes {
+            collect(&shape.shape, &mut timings);
+        }
+        assert_eq!(timings.len(), 2);
+        for (text, pos) in timings {
+            assert!(pos.x > 800.0 && pos.y > 700.0, "{text} is at {pos:?}");
         }
     }
 }
