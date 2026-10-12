@@ -1,6 +1,8 @@
 # FerrisJson
 
-当前版本：**0.3.3**。
+当前版本：**0.3.4**。
+
+<img src="assets/FerrisJson.png" alt="FerrisJson 图标：花括号中的橙色螃蟹" width="96" height="96">
 
 一个使用 **Rust 编写并编译为原生可执行程序**的本地 JSON 查看器，提供树形浏览、JSONPath 查询和 Vim 风格导航。
 
@@ -21,6 +23,18 @@
 - **可自定义配色**：内置 Ferris、Monokai、Solarized、Claude 风格、VS Code 风格，以及 Custom 配色；每套均有深浅两种模式，统一应用到树、值预览与 JSONPath 结果。
 - **耗时显示**：右下角显示最近一次打开文档、搜索或 JSONPath 查询的耗时。
 - **Windows 桌面启动**：不创建命令行窗口；命令行处理可以使用已有终端或管道。
+
+## 随机生成指定大小的 JSON
+
+生成器包含全部 JSON 数据类型、多语种和转义字符串、嵌套对象及混合数组。随机记录采用流式写入，末尾用少量字符串填充，使文件字节数精确匹配目标大小，无需将整个文件保存在内存中。
+
+```powershell
+cargo run --release --example generate_json -- 37kb random-37kb.json
+cargo run --release --example generate_json -- 1.06GB random-1.06gb.json
+cargo run --release --example generate_json -- 64MiB random-64mib.json 42
+```
+
+大小单位不区分大小写：`KB/MB/GB/TB` 使用 1000 进制，`KiB/MiB/GiB/TiB` 使用 1024 进制；无单位表示字节。支持最多 9 位小数，非整数的字节数四舍五入。文件太小而无法容纳所有类型时会报错，`--help` 显示最小字节数。最后一个可选参数是 `u64` 随机种子，同一种子和大小可复现相同内容；随机数据不用于密码学。输出路径已存在时会报错，避免覆盖文件。
 
 ## 从源码运行
 
@@ -53,6 +67,10 @@ Windows 构建后启动：
 .\target\release\FerrisJson.exe
 .\target\release\FerrisJson.exe examples/sample.json
 ```
+
+图标采用原创的“橙色螃蟹 + JSON 花括号”，窗口使用 PNG，Windows EXE 在构建时嵌入多尺寸 ICO。Windows 构建需要包含资源编译器的 Windows SDK。图标文件位于 `assets/FerrisJson.svg`、`assets/FerrisJson.png` 和 `assets/FerrisJson.ico`；SVG 是可编辑源文件。
+
+图标可通过 SVG 源文件继续编辑，再导出 PNG 和多尺寸 ICO。正常构建直接使用仓库中的图标文件。
 
 ## 桌面操作
 

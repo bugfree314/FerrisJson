@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+<title id="title">FerrisJson</title>
+<desc id="desc">An orange crab framed by JSON braces on a dark rounded square.</desc>
+<rect x="24" y="24" width="464" height="464" rx="104" fill="#182833"/>
+<g fill="none" stroke="#FFF3DE" stroke-width="24" stroke-linecap="round" stroke-linejoin="round">
+<path d="M147 134 C111 134 102 150 102 183 C102 217 110 238 79 256 C110 274 102 295 102 329 C102 362 111 378 147 378"/><path d="M147 134 C111 134 102 150 102 183 C102 217 110 238 79 256 C110 274 102 295 102 329 C102 362 111 378 147 378" transform="translate(512 0) scale(-1 1)"/>
+</g>
+<g fill="none" stroke="#F58442" stroke-width="20" stroke-linecap="round"><path d="M195 296 L168 327"/>
+<path d="M223 308 L210 340"/>
+<path d="M289 308 L302 340"/>
+<path d="M317 296 L344 327"/>
+<path d="M175 255 L149 239"/>
+<path d="M337 255 L363 239"/>
+<path d="M219 231 L214 196"/>
+<path d="M293 231 L298 196"/></g>
+<rect x="164" y="215" width="184" height="104" rx="52" fill="#F58442"/>
+<circle cx="214" cy="196" r="14" fill="#FFF3DE"/><circle cx="214" cy="196" r="6" fill="#182833"/>
+<circle cx="298" cy="196" r="14" fill="#FFF3DE"/><circle cx="298" cy="196" r="6" fill="#182833"/>
+</svg>

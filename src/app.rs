@@ -60,6 +60,7 @@ pub struct Viewer {
     dark: bool,
     colors: ColorSettings,
     colors_open: bool,
+    logo: Option<egui::TextureHandle>,
 }
 
 impl Viewer {
@@ -70,6 +71,18 @@ impl Viewer {
     ) -> Self {
         cc.egui_ctx.set_fonts(crate::fonts::definitions());
         let mut app = Self::empty();
+        if let Ok(icon) =
+            eframe::icon_data::from_png_bytes(include_bytes!("../assets/FerrisJson.png"))
+        {
+            app.logo = Some(cc.egui_ctx.load_texture(
+                "FerrisJson logo",
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width as usize, icon.height as usize],
+                    &icon.rgba,
+                ),
+                egui::TextureOptions::LINEAR,
+            ));
+        }
         match ColorSettings::load() {
             Ok(settings) => {
                 app.dark = settings.dark;
@@ -125,6 +138,7 @@ impl Viewer {
             dark: true,
             colors: ColorSettings::default(),
             colors_open: false,
+            logo: None,
         }
     }
     fn cursor_location(&self) -> Option<(String, String)> {
@@ -736,8 +750,11 @@ impl Viewer {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
+                if let Some(logo) = &self.logo {
+                    ui.image((logo.id(), egui::vec2(24.0, 24.0)));
+                }
                 ui.label(
-                    RichText::new("{ }  FerrisJson")
+                    RichText::new("FerrisJson")
                         .strong()
                         .size(18.0)
                         .color(Color32::from_rgb(96, 180, 250)),

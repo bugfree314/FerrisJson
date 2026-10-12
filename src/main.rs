@@ -113,6 +113,10 @@ fn run() -> Result<(), String> {
     }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/FerrisJson.png"))
+                    .map_err(|e| format!("Cannot load FerrisJson icon: {e}"))?,
+            )
             .with_inner_size([1120.0, 760.0])
             .with_min_inner_size([700.0, 480.0]),
         ..Default::default()
