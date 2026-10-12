@@ -1,8 +1,14 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![allow(
+    non_snake_case,
+    reason = "The binary and crate deliberately use the FerrisJson brand name"
+)]
 
 mod app;
 mod document;
 mod fonts;
+mod ui;
+mod vim;
 use document::{Document, SearchScope};
 use std::{
     io::{self, IsTerminal, Read},
@@ -40,12 +46,13 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Rust JSON Viewer 0.1.0\n\nUsage: rust-json-viewer [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported."
+                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported.",
+                    env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
             }
             "--version" => {
-                println!("rust-json-viewer {}", env!("CARGO_PKG_VERSION"));
+                println!("FerrisJson {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             "--get" => get = Some(args.next().ok_or("--get requires a path")?),
@@ -110,7 +117,7 @@ fn run() -> Result<(), String> {
         ..Default::default()
     };
     eframe::run_native(
-        "Rust JSON Viewer",
+        "FerrisJson",
         options,
         Box::new(move |cc| {
             Ok(Box::new(app::Viewer::new(

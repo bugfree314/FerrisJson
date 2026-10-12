@@ -1,81 +1,141 @@
-# Rust JSON Viewer
+# FerrisJson
 
-使用 Rust + egui/eframe 实现的本地 JSON 桌面查看器，版本 **0.1.0**。
-界面参考 [JSONBolt](https://jsonbolt.com/docs-gui) 的树视图、类型配色、搜索栏和路径栏，键盘操作参考 [fx](https://fx.wtf/how-to/using-fx-as-a-tui-for-json-data)。
+当前版本：**0.3.0**。
 
-## 运行
+一个使用 **Rust 编写并编译为原生可执行程序**的本地 JSON 查看器，提供树形浏览、JSONPath 查询和 Vim 风格导航。
 
-使用 Rust 1.99 验证构建；需要对应平台的编译工具链，Windows 推荐 MSVC 工具链。
+本项目由作者与 **OpenAI Codex 协作开发**，共同完成需求迭代、代码实现、测试与文档编写。
 
-```powershell
-cargo run
-cargo run -- examples/sample.json
-```
-
-构建独立可执行文件：
-
-```powershell
-cargo build --release
-.\target\release\rust-json-viewer.exe
-```
+打开文件或粘贴 JSON，在左侧浏览结构，右侧同时查看选中值和查询结果。数据解析、搜索与查询在本地完成，无需账号。
 
 ## 功能
 
-- 文件选择、拖放、粘贴 JSON，以及命令行文件/标准输入。
-- 对象和数组树形浏览，展开/折叠，类型配色，选中节点详情。
-- 全文检索：忽略大小写或区分大小写、正则表达式、仅键/仅值搜索；覆盖折叠节点，自动展开并跳到结果。
-- JSONPath 查询：使用 [serde_json_path](https://docs.rs/serde_json_path/0.7.2/serde_json_path/) 实现 RFC 9535 查询，支持通配符、递归查找、数组切片、负索引、多个选择器及过滤条件，同时兼容 JSON Pointer。
-- 点击 **Go** 或按 Enter 执行 JSONPath，右侧显示查询结果数组、匹配数量，支持完整复制与导出。执行过查询后，选择树节点会保留查询结果；点击 **Reset**、**Selection preview** 或清空表达式后恢复选中值预览。零匹配显示 `[]`，无效表达式显示错误。
-- Windows 桌面启动不创建命令行窗口。命令行调用会使用已有终端或管道。
-- 复制选中节点的完整 JSON、复制路径、导出选中节点、F5 重新加载文件。
-- 深色/浅色主题；内置示例；错误提示包含 JSON 行列信息。
-- 保留对象键顺序和大整数精度。为 UI 和 JSON 文本设置相同的系统字体回退：Windows 使用微软雅黑、Malgun Gothic、游ゴシック等支持中日韩，并补充拉丁、俄语、希腊语、阿拉伯语、希伯来语、印地语和泰语字形。其他平台尝试加载常见系统字体/Noto 字体，覆盖范围取决于安装的字体；不随程序分发系统字体。
-- 右下角显示最近一次打开 JSON 与查询的耗时：`Open` 包含文件读取（文件输入）、解析、树索引及初始视图准备，`Search` / `Path` 包含检索和结果定位。耗时不包含文件选择对话框及屏幕绘制；小于一秒显示毫秒，否则显示秒。打开时显示 `Opening...`，成功加载新文档后清除旧查询耗时。
+- **树形浏览**：对象、数组展开与折叠，键和值按字符串、数字、布尔、null、对象、数组类型配色。
+- **全文搜索**：支持正反向查找、大小写切换、正则表达式，以及仅搜索键或值；匹配折叠节点时自动展开并定位。
+- **JSONPath 查询**：支持通配符、递归查找、数组切片、负索引、多选择器和过滤条件，同时兼容 JSON Pointer。
+- **双预览区**：右侧上方始终显示选中值，下方保留 JSONPath 结果。两区独立滚动，可拖动上下分隔条和面板左边缘调整大小。
+- **Vim 操作**：数字前缀、`hjkl`、`gg/G`、`n/N`、浏览历史、翻页、展开折叠与复制；状态栏显示待完成的按键和最近执行的命令。
+- **快捷键速查页**：F1 打开，Esc 关闭，输入框内保持正常文字输入。
+- **输入与输出**：文件选择、拖放、粘贴、标准输入；复制完整 JSON、复制路径、导出选中值或所有查询结果。
+- **多语种与主题**：中日韩及其他常用文字的系统字体回退，深浅色主题，保留对象键顺序和大整数精度。
+- **耗时显示**：右下角显示最近一次打开文档、搜索或 JSONPath 查询的耗时。
+- **Windows 桌面启动**：不创建命令行窗口；命令行处理可以使用已有终端或管道。
 
-点击 **Paste JSON** 粘贴并加载；在树视图中也可以直接 Ctrl+V。输入框内 Ctrl+V 仅粘贴文本。
-导出内容是完整的选中 JSON，预览中截断的长字符串不会影响搜索、复制或导出。
+## 从源码运行
+
+开发环境使用 Rust 1.99。Windows 为当前主要验证平台，需要 Rust MSVC 工具链及对应的 C++ 构建工具。
+
+```powershell
+cargo run --bin FerrisJson
+cargo run --bin FerrisJson -- examples/sample.json
+cargo run --bin FerrisJson -- examples/multilingual.json
+```
+
+### 构建产物
+
+Cargo 包名与可执行文件名均为 **FerrisJson**。
+
+```powershell
+cargo build --release --bin FerrisJson
+```
+
+默认输出：
+
+| 平台 | 文件 |
+| --- | --- |
+| Windows | `target/release/FerrisJson.exe` |
+| Linux / macOS | `target/release/FerrisJson` |
+
+Windows 构建后启动：
+
+```powershell
+.\target\release\FerrisJson.exe
+.\target\release\FerrisJson.exe examples/sample.json
+```
+
+## 桌面操作
+
+1. 点击 **Open file**、拖放文件，或点击 **Paste JSON** 粘贴内容。树视图中 Ctrl+V 也可加载剪贴板 JSON。
+2. 点击键或值选择节点；点击箭头、双击容器键名，或使用键盘展开与折叠。
+3. 在搜索栏输入文字，使用 **Aa** 切换大小写、`.*` 切换正则模式、**All / Keys / Values** 限定范围。
+4. 在 **JSONPath** 栏输入表达式，点击 **Go** 或按 Enter 执行；下方预览区显示结果数量和 JSON 数组。
+5. 点击 **Copy JSON / Copy path / Export** 操作选中值；查询区的 **Copy / Export** 操作完整结果数组。
+6. **Reset**、查询区的 **Clear** 或清空表达式会清除查询结果，上方选中值预览继续保留。
+
+输入框里的 Ctrl+V 只粘贴文本。切换树节点不会清除已经执行的 JSONPath 结果。F5 可重新读取当前源文件。
+
+### JSONPath 示例
+
+| 表达式 | 含义 |
+| --- | --- |
+| `$.users[0].name` | 第一个用户的名字 |
+| `$.users[*].name` | 所有用户的名字 |
+| `$..email` | 任意层级中的 email |
+| `$.users[0:5]` | 前五个用户 |
+| `$.users[-1]` | 最后一个用户 |
+| `$.users[?(@.active == true)].name` | active 为 true 的用户名字 |
+| `$["special.keys"]["a/b"]` | 含特殊字符的键 |
+| `/users/0/name` | 使用 JSON Pointer 定位 |
+
+也可省略起始 `$`，例如 `.users[0].name`。JSONPath 采用 [serde_json_path](https://docs.rs/serde_json_path/0.7.2/serde_json_path/) 的 RFC 9535 查询语法，不执行 JavaScript。零匹配显示 `[]`；无效表达式显示错误。
 
 ## 快捷键
 
+Vim 操作仅在树视图中生效。数字表示重复次数，例如 `12j` 向下移动十二个可见节点，`3l` 连续展开或进入三级。
+
 | 按键 | 操作 |
 | --- | --- |
+| `h j k l` / 方向键 | 折叠或回到父节点 / 下一个 / 上一个 / 展开或进入子节点 |
+| 数字 + `h j k l n N` | 重复移动或搜索跳转，次数上限 10,000 |
+| `gg` / `G`、Home / End | 首个 / 最后一个可见节点 |
+| `25gg` / `25G` | 第 25 个可见节点 |
+| `H` / `M` / `L` | 视口上方 / 中间 / 下方节点 |
+| `[` / `]` | 浏览历史后退 / 前进 |
+| `/` / `?` | 向前 / 向后搜索 |
+| `n` / `N` | 沿上次搜索方向 / 反方向继续，支持数字前缀 |
+| Enter | 确认搜索并回到树；JSONPath 输入框内执行查询 |
+| F3 / Shift+F3 | 下一条 / 上一条匹配 |
+| Ctrl+F | 聚焦搜索栏 |
+| Ctrl+D / Ctrl+U | 下 / 上半页 |
+| PageDown / PageUp、Ctrl+E / Ctrl+B | 下 / 上一整页 |
+| Space / `za` | 切换选中容器的展开状态 |
+| `zo` / `zc` | 展开 / 折叠选中容器 |
+| `zR` / `zM` | 展开 / 折叠整个文档 |
+| `yy` / Ctrl+C | 复制完整选中 JSON |
+| `yp` / Ctrl+P | 复制选中路径 |
 | Ctrl+O | 打开文件 |
-| Ctrl+V | 加载剪贴板 JSON（输入框外） |
-| Ctrl+F 或 `/` | 搜索 |
-| F3 / Shift+F3、n / Shift+n | 下一条 / 上一条匹配 |
-| ↑↓ 或 k/j | 选择上一个 / 下一个可见节点 |
-| → 或 l | 展开节点 / 进入第一个子节点 |
-| ← 或 h | 折叠节点 / 返回父节点 |
-| Space | 展开/折叠选中节点 |
-| Home / End | 首个 / 最后一个可见节点 |
-| gg / G | 首个 / 最后一个可见节点（gg 连续按两次，间隔不超过一秒） |
-| [ / ] | 浏览历史中的上一个 / 下一个位置 |
-| Ctrl+C | 复制选中 JSON |
-| Ctrl+P | 复制路径 |
+| Ctrl+V | 加载剪贴板 JSON，输入框外生效 |
 | F5 | 重新加载源文件 |
-| F1 | 帮助 |
-| Escape | 退出搜索输入框焦点 |
+| F1 | 打开 / 关闭快捷键速查页 |
+| Esc | 关闭帮助或粘贴窗口、退出输入框、取消待完成的 Vim 命令 |
+
+Ctrl+F 保留查找功能，整页向下翻动使用 PageDown 或 Ctrl+E。
 
 ## 命令行
 
-不带处理选项时打开桌面窗口；带处理选项时输出到标准输出，错误返回退出码 1。
-四个处理选项互斥。Windows PowerShell 直接调用 GUI 可执行文件时可能不会等待退出；使用管道或 `Start-Process -Wait` 可等待完成。
+不带处理选项时打开桌面窗口。处理选项输出到标准输出，发生错误时退出码为 1；四个处理选项互斥。
 
 ```powershell
-cargo run -- examples/sample.json --get '$.users[0].name'
-cargo run -- examples/sample.json --get '/special.keys/a~1b'
-cargo run -- examples/sample.json --query '$.users[*].name'
-cargo run -- examples/sample.json --query '$.users[?(@.active == true)].name'
-cargo run -- examples/sample.json --query '$..email'
-cargo run -- examples/sample.json --search email
-cargo run -- examples/sample.json --pretty
-Get-Content examples/sample.json -Raw | cargo run -- --get '$.users[1]'
+cargo run --bin FerrisJson -- examples/sample.json --get '$.users[0].name'
+cargo run --bin FerrisJson -- examples/sample.json --query '$.users[*].name'
+cargo run --bin FerrisJson -- examples/sample.json --query '$.users[?(@.active == true)].name'
+cargo run --bin FerrisJson -- examples/sample.json --search email
+cargo run --bin FerrisJson -- examples/sample.json --pretty
+Get-Content examples/sample.json -Raw | cargo run --bin FerrisJson -- --get '$.users[1]'
 ```
 
-`--search` 忽略大小写，检索键及标量值，输出匹配节点路径。`--get` 要求恰好一个匹配并输出该值；`--query` 始终输出所有匹配值组成的 JSON 数组，零匹配输出 `[]`。`--pretty` 输出格式化文档。
-`-` 可显式指定标准输入，`--help` 查看参数，`--version` 查看版本。
+| 参数 | 输出 |
+| --- | --- |
+| `--get PATH` | 恰好一个匹配值的格式化 JSON；零个或多个匹配返回错误 |
+| `--query PATH` | 所有匹配值组成的 JSON 数组；零匹配输出 `[]` |
+| `--search TEXT` | 忽略大小写搜索键和标量值，逐行输出匹配路径 |
+| `--pretty` | 格式化整个 JSON 文档 |
+| `--help` | 参数帮助 |
+| `--version` | 程序版本 |
 
-## 验证
+`-` 可显式指定标准输入。Windows GUI 子系统程序在 PowerShell 中直接调用时可能不会等待退出；用管道或 `Start-Process -Wait` 可等待完成。
+
+## 开发检查
 
 ```powershell
 cargo fmt --check
@@ -83,10 +143,24 @@ cargo test --offline
 cargo clippy --offline --all-targets -- -D warnings
 ```
 
-## v0.1.0 范围
+首次使用 `--offline` 前需要下载依赖。测试覆盖特殊键名、Unicode、大整数、JSONPath、搜索方向、Vim 计数与历史、预览截断，以及界面分隔条等交互。
 
-此版本实现 TODO 的基本查看与检索，并借鉴两款工具的交互，不是完整复刻。
-不提供 fx JavaScript 执行、JSONL、URL 下载或全局热键。JSONPath 支持 RFC 9535 语法；不执行 JavaScript 表达式。
-仅接受一个 UTF-8 JSON 文档，支持 UTF-8 BOM。解析使用 serde_json 默认嵌套深度限制。
-文件在后台读取与解析，整份数据和节点索引保存在内存中，尚未实现超大文件流式解析。
-节点值及查询结果的预览最多输出约 200 KB，超出时明确标记截断；小节点预览不受整个文件大小影响。复制和导出始终保留完整值。主题设置仅在当前会话生效。
+## 当前限制
+
+- 一次读取一个 UTF-8 JSON 文档，支持 UTF-8 BOM；不支持 JSONL、URL 加载或 JavaScript 处理。
+- 文件读取与解析在后台执行，但文档和节点索引完整保存在内存中，尚未实现超大文件流式解析。
+- 使用 serde_json 默认嵌套深度限制。
+- 选中值与查询结果的预览最多输出约 200 KB，截断时显示提示；复制与导出仍保留完整内容。
+- 多语种字形覆盖取决于系统安装的字体。Windows 使用微软雅黑、Malgun Gothic、游ゴシック及其他后备字体；其他平台尝试常见系统字体或 Noto 字体。系统字体不随项目分发。
+- 主题和面板分隔位置仅在当前会话生效。
+- 打开耗时包含文件读取、解析、树索引和初始预览准备；查询耗时包含检索与结果定位，不包含文件选择对话框及屏幕绘制。
+
+## 致谢
+
+界面与交互借鉴 [JSONBolt](https://jsonbolt.com/docs-gui) 和 [fx](https://fx.wtf/how-to/using-fx-as-a-tui-for-json-data)。GUI 使用 egui/eframe，JSON 解析使用 serde_json，查询使用 serde_json_path。
+
+## 许可证
+
+本项目使用 [0BSD（Zero-Clause BSD）](LICENSE)：允许任何目的的使用、复制、修改和分发，包括商业用途，无需保留署名或许可证文本。软件按原样提供，不提供担保。完整条款以 [LICENSE](LICENSE) 为准，见 [OSI 许可证说明](https://opensource.org/license/0bsd)。
+
+第三方依赖及系统字体分别遵循其自身许可证。

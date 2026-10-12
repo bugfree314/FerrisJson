@@ -1,4 +1,8 @@
-use crate::document::{Document, SearchScope};
+use crate::{
+    document::{Document, SearchScope},
+    ui::{json_preview, kind_color},
+    vim::{Action, Command, Vim},
+};
 use eframe::egui::{self, Color32, Key, RichText};
 use std::{
     path::PathBuf,
@@ -36,7 +40,12 @@ pub struct Viewer {
     path_results: Option<PathResults>,
     history: Vec<usize>,
     history_index: usize,
-    last_g: Option<Instant>,
+    vim: Vim,
+    search_reverse: bool,
+    search_origin: usize,
+    inspector_ratio: f32,
+    viewport_first: usize,
+    page_rows: usize,
     error: Option<String>,
     search_error: Option<String>,
     notice: String,
@@ -87,7 +96,12 @@ impl Viewer {
             path_results: None,
             history: Vec::new(),
             history_index: 0,
-            last_g: None,
+            vim: Vim::default(),
+            search_reverse: false,
+            search_origin: 0,
+            inspector_ratio: 0.5,
+            viewport_first: 0,
+            page_rows: 20,
             error: None,
             search_error: None,
             notice: String::new(),
@@ -156,7 +170,7 @@ impl Viewer {
                         self.query = "$".into();
                         self.history.clear();
                         self.history_index = 0;
-                        self.last_g = None;
+                        self.vim.cancel();
                         self.notice = "Document loaded".into();
                         self.select(0);
                         self.rebuild_rows();
@@ -213,13 +227,102 @@ impl Viewer {
         // select() recognizes the history cursor, so replay does not add a new entry.
         self.reveal(self.history[self.history_index]);
     }
+    fn move_rows(&mut self, delta: i32, count: usize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let position = self
+            .rows
+            .iter()
+            .position(|&id| id == self.selected)
+            .unwrap_or(0);
+        let next = (position as i64 + delta as i64 * count as i64)
+            .clamp(0, self.rows.len() as i64 - 1) as usize;
+        self.reveal(self.rows[next]);
+    }
+    fn start_search(&mut self, reverse: bool) {
+        self.search_reverse = reverse;
+        self.search_origin = self.selected;
+        self.focus_search = true;
+    }
+    fn execute_vim(&mut self, command: Command, ctx: &egui::Context) {
+        let count = command.count;
+        match command.action {
+            Action::Search(reverse) => self.start_search(reverse),
+            Action::Copy(path) => self.copy(ctx, path),
+            _ if self.doc.is_none() => (),
+            Action::Move(delta) => self.move_rows(delta, count),
+            Action::Left | Action::Right => {
+                for _ in 0..count {
+                    let doc = self.doc.as_ref().unwrap();
+                    let node = &doc.nodes[self.selected];
+                    if command.action == Action::Left {
+                        if node.container && self.expanded[self.selected] {
+                            self.toggle(self.selected);
+                        } else if let Some(parent) = node.parent {
+                            self.reveal(parent);
+                        } else {
+                            break;
+                        }
+                    } else if node.container && !self.expanded[self.selected] {
+                        self.toggle(self.selected);
+                    } else if node.end > self.selected + 1 {
+                        self.reveal(self.selected + 1);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Action::First | Action::Last => {
+                let pos = if command.explicit_count {
+                    count.saturating_sub(1).min(self.rows.len() - 1)
+                } else if command.action == Action::First {
+                    0
+                } else {
+                    self.rows.len() - 1
+                };
+                self.reveal(self.rows[pos]);
+            }
+            Action::Match(opposite) => self.match_step(self.search_reverse ^ opposite, count),
+            Action::History(backwards) => {
+                for _ in 0..count {
+                    self.history_move(backwards);
+                }
+            }
+            Action::Toggle | Action::Open | Action::Close => {
+                if self.doc.as_ref().unwrap().nodes[self.selected].container {
+                    let want_open = command.action == Action::Open;
+                    if command.action == Action::Toggle || self.expanded[self.selected] != want_open
+                    {
+                        self.toggle(self.selected);
+                    }
+                }
+            }
+            Action::ExpandAll => {
+                self.expanded.fill(true);
+                self.rebuild_rows();
+            }
+            Action::CollapseAll => {
+                self.expanded.fill(false);
+                self.reveal(0);
+            }
+            Action::Screen(which) => {
+                let offset = match which {
+                    'M' => self.page_rows / 2,
+                    'L' => self.page_rows.saturating_sub(1),
+                    _ => 0,
+                };
+                self.reveal(self.rows[(self.viewport_first + offset).min(self.rows.len() - 1)]);
+            }
+        }
+    }
     fn vim_navigation(&mut self, ctx: &egui::Context) {
         let texts = ctx.input(|i| {
             i.events
                 .iter()
-                .filter_map(|event| {
-                    if let egui::Event::Text(text) = event {
-                        Some(text.clone())
+                .filter_map(|e| {
+                    if let egui::Event::Text(t) = e {
+                        Some(t.clone())
                     } else {
                         None
                     }
@@ -227,35 +330,18 @@ impl Viewer {
                 .collect::<Vec<_>>()
         });
         for text in texts {
-            match text.as_str() {
-                "g" => {
-                    let now = Instant::now();
-                    if self
-                        .last_g
-                        .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
-                    {
-                        self.reveal(0);
-                        self.last_g = None;
-                    } else {
-                        self.last_g = Some(now);
-                    }
+            for key in text.chars() {
+                if let Some(command) = self.vim.feed(key) {
+                    self.execute_vim(command, ctx);
                 }
-                "G" => {
-                    self.last_g = None;
-                    if let Some(&id) = self.rows.last() {
-                        self.reveal(id);
-                    }
-                }
-                "[" => {
-                    self.last_g = None;
-                    self.history_move(true);
-                }
-                "]" => {
-                    self.last_g = None;
-                    self.history_move(false);
-                }
-                _ => self.last_g = None,
             }
+        }
+        if self.focus_search {
+            // The trigger belongs to Normal mode, never to the search field.
+            ctx.input_mut(|i| {
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::Text(t) if t == "/" || t == "?"))
+            });
         }
     }
     fn reveal(&mut self, id: usize) {
@@ -281,8 +367,19 @@ impl Viewer {
                 Err(error) => self.search_error = Some(error),
             }
         }
-        if let Some(&id) = self.matches.first() {
-            self.reveal(id);
+        if !self.matches.is_empty() {
+            self.match_index = if self.search_reverse {
+                self.matches
+                    .iter()
+                    .rposition(|&id| id < self.search_origin)
+                    .unwrap_or(self.matches.len() - 1)
+            } else {
+                self.matches
+                    .iter()
+                    .position(|&id| id > self.search_origin)
+                    .unwrap_or(0)
+            };
+            self.reveal(self.matches[self.match_index]);
         }
         self.query_duration = if self.doc.is_some() && !self.term.is_empty() {
             Some(("Search", started.elapsed()))
@@ -326,13 +423,17 @@ impl Viewer {
         self.query_duration = Some(("Path", started.elapsed()));
     }
     fn next_match(&mut self, backwards: bool) {
+        self.match_step(backwards, 1);
+    }
+    fn match_step(&mut self, backwards: bool, count: usize) {
         if self.matches.is_empty() {
             return;
         }
+        let count = count % self.matches.len();
         self.match_index = if backwards {
-            (self.match_index + self.matches.len() - 1) % self.matches.len()
+            (self.match_index + self.matches.len() - count) % self.matches.len()
         } else {
-            (self.match_index + 1) % self.matches.len()
+            (self.match_index + count) % self.matches.len()
         };
         self.reveal(self.matches[self.match_index]);
     }
@@ -377,14 +478,28 @@ impl Viewer {
         self.rebuild_rows();
     }
     fn keyboard(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.help = false;
+            self.paste_open = false;
+            self.vim.record("Esc");
+            if let Some(id) = ctx.memory(|m| m.focused()) {
+                ctx.memory_mut(|m| m.surrender_focus(id));
+            }
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(Key::F1)) {
+            self.help = !self.help;
+            self.vim.cancel();
+            return;
+        }
+        if self.help || self.paste_open {
+            return;
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::O)) {
             self.open(ctx);
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::F)) {
-            self.focus_search = true;
-        }
-        if ctx.input(|i| i.key_pressed(Key::F1)) {
-            self.help = !self.help;
+            self.start_search(false);
         }
         if ctx.input(|i| i.key_pressed(Key::F3)) {
             self.next_match(ctx.input(|i| i.modifiers.shift));
@@ -394,11 +509,11 @@ impl Viewer {
         {
             self.load_file(file, ctx);
         }
-        if ctx.wants_keyboard_input() || self.paste_open || self.help {
-            self.last_g = None;
+        if ctx.wants_keyboard_input() {
+            self.vim.cancel();
             return;
         }
-        let paste = ctx.input(|i| {
+        if let Some(text) = ctx.input(|i| {
             i.events.iter().find_map(|e| {
                 if let egui::Event::Paste(t) = e {
                     Some(t.clone())
@@ -406,8 +521,7 @@ impl Viewer {
                     None
                 }
             })
-        });
-        if let Some(text) = paste {
+        }) {
             self.load_text(text, "Clipboard".into(), ctx);
         }
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
@@ -416,58 +530,59 @@ impl Viewer {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::P)) {
             self.copy(ctx, true);
         }
-        if ctx.input(|i| i.key_pressed(Key::Slash)) {
-            self.focus_search = true;
+        for (key, label, direction, half) in [
+            (Key::D, "Ctrl+d", 1, true),
+            (Key::U, "Ctrl+u", -1, true),
+            (Key::B, "Ctrl+b", -1, false),
+            (Key::E, "Ctrl+e", 1, false),
+        ] {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, key)) {
+                let count = self.vim.take_count(label);
+                self.move_rows(
+                    direction,
+                    count
+                        * if half {
+                            (self.page_rows / 2).max(1)
+                        } else {
+                            self.page_rows
+                        },
+                );
+            }
+        }
+        // Printable normal-mode commands use text events to preserve Shift (N, G, H...).
+        if !ctx.input(|i| i.modifiers.ctrl || i.modifiers.alt || i.modifiers.command) {
+            self.vim_navigation(ctx);
         }
         if self.doc.is_none() {
             return;
         }
-        self.vim_navigation(ctx);
-        if ctx.input(|i| {
-            i.events
-                .iter()
-                .any(|e| matches!(e, egui::Event::Key { key, pressed: true, .. } if *key != Key::G))
-        }) {
-            self.last_g = None;
-        }
-        let position = self
-            .rows
-            .iter()
-            .position(|&id| id == self.selected)
-            .unwrap_or(0);
-        if ctx.input(|i| i.key_pressed(Key::ArrowDown) || i.key_pressed(Key::J)) {
-            self.reveal(self.rows[(position + 1).min(self.rows.len() - 1)]);
-        }
-        if ctx.input(|i| i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::K)) {
-            self.reveal(self.rows[position.saturating_sub(1)]);
-        }
-        if ctx.input(|i| i.key_pressed(Key::Home)) {
-            self.reveal(0);
-        }
-        if ctx.input(|i| i.key_pressed(Key::End)) {
-            self.reveal(*self.rows.last().unwrap());
-        }
-        if ctx.input(|i| i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::L)) {
-            let doc = self.doc.as_ref().unwrap();
-            if doc.nodes[self.selected].container && !self.expanded[self.selected] {
-                self.toggle(self.selected);
-            } else if doc.nodes[self.selected].end > self.selected + 1 {
-                self.reveal(self.selected + 1);
+        for (key, label, action) in [
+            (Key::ArrowDown, "↓", Action::Move(1)),
+            (Key::ArrowUp, "↑", Action::Move(-1)),
+            (Key::ArrowLeft, "←", Action::Left),
+            (Key::ArrowRight, "→", Action::Right),
+            (Key::Home, "Home", Action::First),
+            (Key::End, "End", Action::Last),
+            (Key::Space, "Space", Action::Toggle),
+        ] {
+            if ctx.input(|i| i.key_pressed(key)) {
+                let count = self.vim.take_count(label);
+                self.execute_vim(
+                    Command {
+                        action,
+                        count,
+                        explicit_count: false,
+                    },
+                    ctx,
+                );
             }
         }
-        if ctx.input(|i| i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::H)) {
-            let doc = self.doc.as_ref().unwrap();
-            if doc.nodes[self.selected].container && self.expanded[self.selected] {
-                self.toggle(self.selected);
-            } else if let Some(parent) = doc.nodes[self.selected].parent {
-                self.reveal(parent);
+        for (key, label, direction) in [(Key::PageDown, "PageDown", 1), (Key::PageUp, "PageUp", -1)]
+        {
+            if ctx.input(|i| i.key_pressed(key)) {
+                self.vim.record(label);
+                self.move_rows(direction, self.page_rows);
             }
-        }
-        if ctx.input(|i| i.key_pressed(Key::Space)) {
-            self.toggle(self.selected);
-        }
-        if ctx.input(|i| i.key_pressed(Key::N)) {
-            self.next_match(ctx.input(|i| i.modifiers.shift));
         }
     }
 }
@@ -478,6 +593,72 @@ impl eframe::App for Viewer {
     }
 }
 impl Viewer {
+    fn selection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.heading("Value preview");
+            let node = &self.doc.as_ref().unwrap().nodes[self.selected];
+            ui.colored_label(kind_color(node.kind, self.dark), node.kind);
+        });
+        let node = &self.doc.as_ref().unwrap().nodes[self.selected];
+        ui.add(egui::Label::new(RichText::new(&node.path).monospace()).truncate())
+            .on_hover_text(&node.path);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Copy JSON").clicked() {
+                self.copy(ctx, false);
+            }
+            if ui.button("Copy path").clicked() {
+                self.copy(ctx, true);
+            }
+            if ui.button("Export").clicked() {
+                self.export();
+            }
+        });
+        ui.separator();
+        json_preview(ui, &self.detail, self.dark, "value_preview");
+    }
+    fn results_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("JSONPath results");
+        let Some(results) = &self.path_results else {
+            ui.add_space(12.0);
+            ui.label("Run a JSONPath query to explore matching values.");
+            ui.monospace("$.users[*].name");
+            ui.monospace("$..email");
+            return;
+        };
+        ui.add(egui::Label::new(RichText::new(&results.expression).monospace()).truncate())
+            .on_hover_text(&results.expression);
+        let mut copy = false;
+        let mut export = false;
+        let mut reset = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} matches", results.ids.len()));
+            ui.add_enabled_ui(results.error.is_none(), |ui| {
+                copy = ui.button("Copy").clicked();
+                export = ui.button("Export").clicked();
+            });
+            reset = ui.button("Clear").clicked();
+        });
+        ui.separator();
+        if let Some(error) = &results.error {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        } else {
+            json_preview(ui, &results.preview, self.dark, "path_results");
+        }
+        if copy || export {
+            let json = self.doc.as_ref().unwrap().results_json(&results.ids);
+            if copy {
+                ctx.copy_text(json);
+                self.notice = "JSONPath results copied".into();
+            } else {
+                self.export_json(json);
+            }
+        }
+        if reset {
+            self.path_results = None;
+            self.query.clear();
+            self.query_duration = None;
+        }
+    }
     fn draw(&mut self, ctx: &egui::Context) {
         self.poll();
         self.keyboard(ctx);
@@ -489,7 +670,7 @@ impl Viewer {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("{ }  JSON VIEWER")
+                    RichText::new("{ }  FerrisJson")
                         .strong()
                         .size(18.0)
                         .color(Color32::from_rgb(96, 180, 250)),
@@ -553,7 +734,11 @@ impl Viewer {
                     });
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.term)
-                        .hint_text("Search keys and values...")
+                        .hint_text(if self.search_reverse {
+                            "? Search backward..."
+                        } else {
+                            "/ Search forward..."
+                        })
                         .desired_width((ui.available_width() - 185.0).max(140.0)),
                 );
                 if self.focus_search {
@@ -565,7 +750,7 @@ impl Viewer {
                     response.surrender_focus();
                 }
                 if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    self.next_match(ui.input(|i| i.modifiers.shift));
+                    response.surrender_focus();
                 }
                 if changed {
                     self.search();
@@ -650,6 +835,8 @@ impl Viewer {
                 }
                 ui.add(egui::Label::new(&self.notice).truncate());
                 ui.separator();
+                ui.label(RichText::new(if ctx.wants_keyboard_input() { "INPUT" } else { "NORMAL" }).monospace().strong());
+                ui.label(RichText::new(self.vim.display()).monospace().color(Color32::from_rgb(100, 180, 235)));
                 ui.label("F1 Help");
                     });
                 });
@@ -657,78 +844,70 @@ impl Viewer {
         });
         if self.doc.is_some() {
             egui::SidePanel::right("inspector")
-                .default_width(300.0)
-                .width_range(200.0..=600.0)
+                .default_width(360.0)
+                .width_range(220.0..=700.0)
                 .resizable(true)
                 .show(ctx, |ui| {
-                    ui.add_space(8.0);
-                    if let Some(results) = &self.path_results {
-                        ui.heading("JSONPath results");
-                        ui.label(RichText::new(&results.expression).monospace());
-                        ui.label(format!("{} matches", results.ids.len()));
-                        let mut copy = false;
-                        let mut export = false;
-                        let mut reset = false;
-                        ui.horizontal_wrapped(|ui| {
-                            ui.add_enabled_ui(results.error.is_none(), |ui| {
-                                copy = ui.button("Copy results").clicked();
-                                export = ui.button("Export results").clicked();
-                            });
-                            reset = ui.button("Selection preview").clicked();
-                        });
-                        ui.separator();
-                        if let Some(error) = &results.error {
-                            ui.colored_label(Color32::LIGHT_RED, error);
-                        } else {
-                            egui::ScrollArea::both()
-                                .id_salt("query_results")
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut results.preview.as_str())
-                                            .font(egui::TextStyle::Monospace)
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                });
-                        }
-                        if copy || export {
-                            let json = self.doc.as_ref().unwrap().results_json(&results.ids);
-                            if copy {
-                                ctx.copy_text(json);
-                                self.notice = "JSONPath results copied".into();
-                            } else {
-                                self.export_json(json);
-                            }
-                        }
-                        if reset {
-                            self.path_results = None;
-                            self.query.clear();
-                            self.query_duration = None;
-                        }
-                        return;
+                    let rect = ui.available_rect_before_wrap();
+                    let divider_height = 10.0;
+                    let usable = (rect.height() - divider_height).max(1.0);
+                    let min = (80.0 / usable).min(0.45);
+                    self.inspector_ratio = self.inspector_ratio.clamp(min, 1.0 - min);
+                    let split_y = rect.top() + usable * self.inspector_ratio;
+                    let top = egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), split_y));
+                    let divider = egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), split_y),
+                        egui::pos2(rect.right(), split_y + divider_height),
+                    );
+                    let bottom = egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), split_y + divider_height),
+                        rect.max,
+                    );
+                    ui.allocate_rect(rect, egui::Sense::hover());
+                    let response = ui
+                        .interact(
+                            divider,
+                            ui.id().with("vertical-divider"),
+                            egui::Sense::drag(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                    if response.dragged()
+                        && let Some(pos) = response.interact_pointer_pos()
+                    {
+                        self.inspector_ratio =
+                            ((pos.y - rect.top()) / usable).clamp(min, 1.0 - min);
+                        ctx.request_repaint();
                     }
-                    ui.heading("Selection");
-                    let node = &self.doc.as_ref().unwrap().nodes[self.selected];
-                    ui.label(RichText::new(node.kind).color(kind_color(node.kind)));
-                    ui.label(RichText::new(&node.path).monospace());
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Copy JSON").clicked() {
-                            self.copy(ctx, false);
-                        }
-                        if ui.button("Copy path").clicked() {
-                            self.copy(ctx, true);
-                        }
-                        if ui.button("Export").clicked() {
-                            self.export();
-                        }
-                    });
-                    ui.separator();
-                    egui::ScrollArea::both().id_salt("detail").show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.detail.as_str())
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY),
+                    ui.painter().hline(
+                        divider.x_range(),
+                        divider.center().y,
+                        ui.visuals().widgets.noninteractive.bg_stroke,
+                    );
+                    for x in [-8.0, 0.0, 8.0] {
+                        ui.painter().circle_filled(
+                            divider.center() + egui::vec2(x, 0.0),
+                            1.5,
+                            ui.visuals().text_color(),
                         );
-                    });
+                    }
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(top)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                        |ui| {
+                            ui.set_clip_rect(top);
+                            self.selection_panel(ui, ctx);
+                        },
+                    );
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(bottom)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                        |ui| {
+                            ui.set_clip_rect(bottom);
+                            self.results_panel(ui, ctx);
+                        },
+                    );
                 });
         }
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -765,6 +944,7 @@ impl Viewer {
             ui.separator();
             let row_height = 25.0;
             let row_stride = row_height + ui.spacing().item_spacing.y;
+            self.page_rows = (ui.available_height() / row_stride).floor().max(1.0) as usize;
             let mut area = egui::ScrollArea::both()
                 .id_salt("tree")
                 .auto_shrink([false, false]);
@@ -779,6 +959,7 @@ impl Viewer {
             let mut select = None;
             let mut toggle = None;
             area.show_rows(ui, row_height, self.rows.len(), |ui, range| {
+                self.viewport_first = range.start;
                 for row in range {
                     let id = self.rows[row];
                     let node = &self.doc.as_ref().unwrap().nodes[id];
@@ -817,11 +998,16 @@ impl Viewer {
                             } else {
                                 ui.add_space(26.0);
                             }
-                            let key = RichText::new(&node.key).monospace().color(if is_match {
-                                Color32::from_rgb(220, 160, 50)
-                            } else {
-                                ui.visuals().text_color()
-                            });
+                            let mut key = RichText::new(&node.key)
+                                .monospace()
+                                .color(kind_color(node.kind, self.dark));
+                            if is_match {
+                                key = key.background_color(if self.dark {
+                                    Color32::from_rgb(75, 65, 25)
+                                } else {
+                                    Color32::from_rgb(255, 235, 170)
+                                });
+                            }
                             let response =
                                 ui.add(egui::Label::new(key).sense(egui::Sense::click()));
                             if response.clicked() {
@@ -835,7 +1021,7 @@ impl Viewer {
                                 egui::Label::new(
                                     RichText::new(&node.preview)
                                         .monospace()
-                                        .color(kind_color(node.kind)),
+                                        .color(kind_color(node.kind, self.dark)),
                                 )
                                 .sense(egui::Sense::click()),
                             );
@@ -869,20 +1055,7 @@ impl Viewer {
                 self.paste_open = false;
             }
         }
-        egui::Window::new("Keyboard & paths").open(&mut self.help).show(ctx, |ui| {
-            ui.label("Ctrl+O  Open file\nCtrl+V  Open clipboard (outside text fields)\nCtrl+F or /  Search\nF3 / Shift+F3 or n / N  Next / previous match\nArrows or h j k l  Navigate and expand/collapse\nSpace  Toggle node\nHome / End  First / last visible node\nCtrl+C  Copy selected JSON\nCtrl+P  Copy selected path\nF5  Reload source file\nEscape  Leave search field");
-            ui.separator();
-            ui.label("JSONPath: $.users[*].name, $..email, $.users[0:5], $.users[?(@.active == true)].name\nAlso supports quoted keys, negative indices and JSON Pointer. Query runs on Go / Enter; Reset restores selection preview.\ngg / G: first / last visible node. [ / ]: navigation history back / forward.");
-        });
-    }
-}
-fn kind_color(kind: &str) -> Color32 {
-    match kind {
-        "string" => Color32::from_rgb(85, 170, 120),
-        "number" => Color32::from_rgb(80, 155, 225),
-        "boolean" => Color32::from_rgb(175, 120, 220),
-        "null" => Color32::from_rgb(170, 145, 115),
-        _ => Color32::from_rgb(135, 145, 155),
+        crate::ui::cheatsheet(ctx, &mut self.help);
     }
 }
 fn format_duration(duration: Duration) -> String {
@@ -1048,7 +1221,7 @@ mod tests {
         assert!(app.path_results.as_ref().unwrap().ids.is_empty());
         app.path_results = None;
         app.select(1);
-        assert_eq!(app.detail, "\"Rust JSON Viewer\"");
+        assert_eq!(app.detail, "\"FerrisJson\"");
     }
     #[test]
     fn history_replays_positions_and_branches_after_new_navigation() {
@@ -1099,5 +1272,146 @@ mod tests {
         frame(&mut app, "g");
         frame(&mut app, "g");
         assert_eq!(app.selected, selected);
+    }
+    #[test]
+    fn counted_movement_and_reverse_search_follow_vim_direction() {
+        let ctx = egui::Context::default();
+        let mut app = loaded();
+        app.expanded.fill(true);
+        app.rebuild_rows();
+        let feed = |app: &mut Viewer, text: &str| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Text(text.into())],
+                    ..Default::default()
+                },
+                |ctx| app.keyboard(ctx),
+            );
+        };
+        feed(&mut app, "5j");
+        assert_eq!(app.selected, app.rows[5]);
+        assert_eq!(app.vim.display(), "5j");
+        feed(&mut app, "2k");
+        assert_eq!(app.selected, app.rows[3]);
+        feed(&mut app, "4G");
+        assert_eq!(app.selected, app.rows[3]);
+        app.term = "email".into();
+        app.start_search(true);
+        app.search();
+        let first = app.selected;
+        assert_eq!(first, *app.matches.last().unwrap());
+        app.execute_vim(
+            Command {
+                action: Action::Match(false),
+                count: 1,
+                explicit_count: false,
+            },
+            &ctx,
+        );
+        assert_eq!(app.selected, app.matches[0]);
+        app.execute_vim(
+            Command {
+                action: Action::Match(true),
+                count: 1,
+                explicit_count: false,
+            },
+            &ctx,
+        );
+        assert_eq!(app.selected, first);
+        app.execute_vim(
+            Command {
+                action: Action::Match(false),
+                count: 2,
+                explicit_count: true,
+            },
+            &ctx,
+        );
+        assert_eq!(app.selected, first);
+    }
+    #[test]
+    fn search_triggers_do_not_become_search_text_and_escape_closes_help() {
+        let ctx = egui::Context::default();
+        let mut app = loaded();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Text("?".into())],
+                ..Default::default()
+            },
+            |ctx| {
+                app.keyboard(ctx);
+                assert!(app.search_reverse && app.focus_search);
+                assert!(!ctx.input(|i| {
+                    i.events
+                        .iter()
+                        .any(|e| matches!(e, egui::Event::Text(t) if t == "?"))
+                }));
+            },
+        );
+        app.help = true;
+        app.vim.feed('3');
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| app.keyboard(ctx),
+        );
+        assert!(!app.help);
+        assert!(app.vim.pending.is_empty());
+    }
+    #[test]
+    fn inspector_keeps_both_previews_visible_and_divider_is_draggable() {
+        let ctx = egui::Context::default();
+        let mut app = loaded();
+        app.query = "$.users[*].name".into();
+        app.go_to_path();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1120.0, 760.0));
+        let mut run = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            )
+        };
+        let output = run(vec![]);
+        let mut positions = Vec::new();
+        for shape in &output.shapes {
+            if let egui::Shape::Text(text) = &shape.shape
+                && matches!(text.galley.text(), "Value preview" | "JSONPath results")
+            {
+                positions.push((text.galley.text().to_owned(), text.pos));
+            }
+        }
+        assert_eq!(positions.len(), 2);
+        assert!(positions[0].1.y < positions[1].1.y);
+        // The lower header starts just below the divider; drag its center upward.
+        let divider = egui::pos2(1000.0, positions[1].1.y - 5.0);
+        run(vec![
+            egui::Event::PointerMoved(divider),
+            egui::Event::PointerButton {
+                pos: divider,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let target = divider - egui::vec2(0.0, 80.0);
+        run(vec![egui::Event::PointerMoved(target)]);
+        run(vec![egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(app.inspector_ratio < 0.5);
     }
 }
