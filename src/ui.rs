@@ -78,21 +78,30 @@ fn value_kind(text: &str) -> &'static str {
         _ => "number",
     }
 }
-pub fn json_preview(ui: &mut egui::Ui, mut text: &str, palette: Palette, id: &str) {
-    egui::ScrollArea::both()
-        .id_salt(id)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _: f32| {
-                ui.fonts_mut(|fonts| fonts.layout_job(json_job(buffer.as_str(), palette)))
-            };
-            ui.add(
-                egui::TextEdit::multiline(&mut text)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY)
-                    .layouter(&mut layouter),
-            );
-        });
+fn preview_job(text: &str, palette: Palette, wrap: bool, width: f32) -> egui::text::LayoutJob {
+    let mut job = json_job(text, palette);
+    job.wrap.max_width = if wrap { width.max(1.0) } else { f32::INFINITY };
+    job.wrap.break_anywhere = wrap;
+    job
+}
+pub fn json_preview(ui: &mut egui::Ui, mut text: &str, palette: Palette, id: &str, wrap: bool) {
+    let area = if wrap {
+        egui::ScrollArea::vertical()
+    } else {
+        egui::ScrollArea::both()
+    };
+    area.id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
+        let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
+            let job = preview_job(buffer.as_str(), palette, wrap, wrap_width);
+            ui.fonts_mut(|fonts| fonts.layout_job(job))
+        };
+        ui.add(
+            egui::TextEdit::multiline(&mut text)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY)
+                .layouter(&mut layouter),
+        );
+    });
 }
 pub fn cheatsheet(ctx: &egui::Context, open: &mut bool, palette: Palette) {
     if !*open {
@@ -178,7 +187,10 @@ pub fn color_editor(
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Use as custom").clicked() { settings.customize(); changed = true; }
                 if ui.button("Restore Ferris defaults").clicked() {
-                    let dark = settings.dark; *settings = ColorSettings { dark, ..Default::default() }; changed = true;
+                    let dark = settings.dark;
+                    let wrap_values = settings.wrap_values;
+                    let wrap_results = settings.wrap_results;
+                    *settings = ColorSettings { dark, wrap_values, wrap_results, ..Default::default() }; changed = true;
                 }
                 if ui.button("Save settings").clicked() {
                     match settings.save() { Ok(()) => { *notice = "Color settings saved".into(); *error = None; }, Err(e) => *error = Some(e) }
@@ -219,5 +231,23 @@ mod tests {
             kind_color("string", Palette::builtin(Preset::Ferris, false)),
             kind_color("string", palette)
         );
+    }
+    #[test]
+    fn wrapping_long_urls_fits_preview_width_without_changing_value() {
+        let ctx = egui::Context::default();
+        let text = format!("\"https://example.com/{}\"", "longpath".repeat(40));
+        let palette = Palette::builtin(Preset::Ferris, true);
+        let _ = ctx.run(Default::default(), |ctx| {
+            ctx.fonts_mut(|fonts| {
+                let wrapped = fonts.layout_job(preview_job(&text, palette, true, 120.0));
+                let unwrapped = fonts.layout_job(preview_job(&text, palette, false, 120.0));
+                assert!(wrapped.rows.len() > 1);
+                assert!(wrapped.rect.width() <= 121.0);
+                assert_eq!(unwrapped.rows.len(), 1);
+                assert!(unwrapped.rect.width() > 120.0);
+                assert_eq!(wrapped.job.text, text);
+                assert_eq!(unwrapped.job.text, text);
+            })
+        });
     }
 }

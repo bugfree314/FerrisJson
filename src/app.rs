@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
 const DEMO: &str = include_str!("../examples/sample.json");
 type LoadResult = Result<(Document, String, Option<PathBuf>), String>;
 struct PathResults {
@@ -125,6 +126,25 @@ impl Viewer {
             colors: ColorSettings::default(),
             colors_open: false,
         }
+    }
+    fn cursor_location(&self) -> Option<(String, String)> {
+        let doc = self.doc.as_ref()?;
+        // Visible IDs stay sorted; avoid scanning the whole document on every frame.
+        let row = self.rows.binary_search(&self.selected).ok()? + 1;
+        let total = self.rows.len();
+        let progress = if total <= 1 {
+            "All".into()
+        } else if row == 1 {
+            "Top".into()
+        } else if row == total {
+            "Bot".into()
+        } else {
+            format!("{}%", (row as f64 / total as f64 * 100.0).floor() as usize)
+        };
+        Some((
+            format!("Ln {row}/{total} {progress}"),
+            doc.nodes[self.selected].path.clone(),
+        ))
     }
     fn save_colors(&mut self) {
         match self.colors.save() {
@@ -613,10 +633,17 @@ impl eframe::App for Viewer {
 }
 impl Viewer {
     fn selection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.heading("Value preview");
             let node = &self.doc.as_ref().unwrap().nodes[self.selected];
             ui.colored_label(kind_color(node.kind, self.colors.active()), node.kind);
+            if ui
+                .checkbox(&mut self.colors.wrap_values, "Wrap")
+                .on_hover_text("Automatically wrap long values")
+                .changed()
+            {
+                self.save_colors();
+            }
         });
         let node = &self.doc.as_ref().unwrap().nodes[self.selected];
         ui.add(egui::Label::new(RichText::new(&node.path).monospace()).truncate())
@@ -633,10 +660,25 @@ impl Viewer {
             }
         });
         ui.separator();
-        json_preview(ui, &self.detail, self.colors.active(), "value_preview");
+        json_preview(
+            ui,
+            &self.detail,
+            self.colors.active(),
+            "value_preview",
+            self.colors.wrap_values,
+        );
     }
     fn results_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("JSONPath results");
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("JSONPath results");
+            if ui
+                .checkbox(&mut self.colors.wrap_results, "Wrap")
+                .on_hover_text("Automatically wrap query results")
+                .changed()
+            {
+                self.save_colors();
+            }
+        });
         let Some(results) = &self.path_results else {
             ui.add_space(12.0);
             ui.label("Run a JSONPath query to explore matching values.");
@@ -661,7 +703,13 @@ impl Viewer {
         if let Some(error) = &results.error {
             ui.colored_label(Color32::LIGHT_RED, error);
         } else {
-            json_preview(ui, &results.preview, self.colors.active(), "path_results");
+            json_preview(
+                ui,
+                &results.preview,
+                self.colors.active(),
+                "path_results",
+                self.colors.wrap_results,
+            );
         }
         if copy || export {
             let json = self.doc.as_ref().unwrap().results_json(&results.ids);
@@ -703,42 +751,40 @@ impl Viewer {
                         self.paste_open = true;
                     }
                 });
-                if ui.button("Sample").clicked() {
-                    self.load_text(DEMO.into(), "sample.json".into(), ctx);
-                }
-                if ui
-                    .button(if self.dark { "Light" } else { "Dark" })
-                    .clicked()
-                {
-                    self.dark = !self.dark;
-                    self.colors.dark = self.dark;
-                    self.colors.active().apply(ctx, self.dark);
-                    self.save_colors();
-                }
-                let old_preset = self.colors.preset;
-                egui::ComboBox::from_id_salt("json_palette")
-                    .width(95.0)
-                    .selected_text(self.colors.preset.name())
-                    .show_ui(ui, |ui| {
-                        for preset in Preset::ALL {
-                            ui.selectable_value(&mut self.colors.preset, preset, preset.name());
-                        }
-                    });
-                if self.colors.preset != old_preset {
-                    self.colors.active().apply(ctx, self.dark);
-                    self.save_colors();
-                }
-                if ui.button("Colors").clicked() {
-                    self.vim.cancel();
-                    self.colors_open = true;
-                }
                 if ui.button("Help").clicked() {
                     self.help = true;
                 }
                 if self.pending.is_some() {
                     ui.spinner();
-                    ui.label("Loading...");
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Colors").clicked() {
+                        self.vim.cancel();
+                        self.colors_open = true;
+                    }
+                    let old_preset = self.colors.preset;
+                    egui::ComboBox::from_id_salt("json_palette")
+                        .width(95.0)
+                        .selected_text(self.colors.preset.name())
+                        .show_ui(ui, |ui| {
+                            for preset in Preset::ALL {
+                                ui.selectable_value(&mut self.colors.preset, preset, preset.name());
+                            }
+                        });
+                    if self.colors.preset != old_preset {
+                        self.colors.active().apply(ctx, self.dark);
+                        self.save_colors();
+                    }
+                    if ui
+                        .button(if self.dark { "Light" } else { "Dark" })
+                        .clicked()
+                    {
+                        self.dark = !self.dark;
+                        self.colors.dark = self.dark;
+                        self.colors.active().apply(ctx, self.dark);
+                        self.save_colors();
+                    }
+                });
             });
             ui.add_space(6.0);
             ui.separator();
@@ -859,19 +905,17 @@ impl Viewer {
                     }
                     ui.separator();
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                if let Some(doc) = &self.doc {
-                    ui.label(format!(
-                        "{} nodes  |  {:.1} KB",
-                        doc.nodes.len(),
-                        doc.bytes as f64 / 1024.0
-                    ));
-                    ui.separator();
-                }
-                ui.add(egui::Label::new(&self.notice).truncate());
-                ui.separator();
-                ui.label(RichText::new(if ctx.wants_keyboard_input() { "INPUT" } else { "NORMAL" }).monospace().strong());
-                ui.label(RichText::new(self.vim.display()).monospace().color(Color32::from_rgb(100, 180, 235)));
-                ui.label("F1 Help");
+                        ui.label(RichText::new(if ctx.wants_keyboard_input() { "INPUT" } else { "NORMAL" }).monospace().strong());
+                        ui.label(RichText::new(self.vim.display()).monospace().color(Color32::from_rgb(100, 180, 235)));
+                        if let Some(doc) = &self.doc {
+                            ui.label(format!("{} nodes", doc.nodes.len())).on_hover_text(format!("{:.1} KB", doc.bytes as f64 / 1024.0));
+                        }
+                        if let Some((position, path)) = self.cursor_location() {
+                            ui.label(RichText::new(position).monospace()).on_hover_text("Current visible tree row / total visible rows");
+                            let width = (ui.available_width() * 0.6).min(360.0);
+                            ui.add_sized([width, 18.0], egui::Label::new(RichText::new(&path).monospace()).truncate()).on_hover_text(path);
+                        }
+                        ui.add(egui::Label::new(&self.notice).truncate());
                     });
                 });
             });
@@ -967,9 +1011,6 @@ impl Viewer {
                     ui.add_space(20.0);
                     if ui.button("Open JSON file").clicked() {
                         self.open(ctx);
-                    }
-                    if ui.button("Try sample document").clicked() {
-                        self.load_text(DEMO.into(), "sample.json".into(), ctx);
                     }
                 });
                 return;
@@ -1451,5 +1492,25 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         }]);
         assert!(app.inspector_ratio < 0.5);
+    }
+    #[test]
+    fn cursor_location_tracks_visible_rows_and_json_path() {
+        let mut app = loaded();
+        assert_eq!(
+            app.cursor_location().unwrap(),
+            ("Ln 1/1 All".into(), "$".into())
+        );
+        app.expanded.fill(true);
+        app.rebuild_rows();
+        assert!(app.cursor_location().unwrap().0.ends_with("Top"));
+        let middle = app.rows[app.rows.len() / 2];
+        app.reveal(middle);
+        let (position, path) = app.cursor_location().unwrap();
+        assert!(position.ends_with('%'));
+        assert_eq!(path, app.doc.as_ref().unwrap().nodes[middle].path);
+        app.reveal(*app.rows.last().unwrap());
+        assert!(app.cursor_location().unwrap().0.ends_with("Bot"));
+        app.toggle(0);
+        assert_eq!(app.cursor_location().unwrap().0, "Ln 1/1 All");
     }
 }

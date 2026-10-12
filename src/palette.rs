@@ -142,6 +142,8 @@ impl Palette {
 pub struct ColorSettings {
     pub preset: Preset,
     pub dark: bool,
+    pub wrap_values: bool,
+    pub wrap_results: bool,
     pub custom_dark: Palette,
     pub custom_light: Palette,
 }
@@ -150,6 +152,8 @@ impl Default for ColorSettings {
         Self {
             preset: Preset::Ferris,
             dark: true,
+            wrap_values: true,
+            wrap_results: true,
             custom_dark: Palette::builtin(Preset::Ferris, true),
             custom_light: Palette::builtin(Preset::Ferris, false),
         }
@@ -232,6 +236,7 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(copy.custom_dark.string, [1, 2, 3]);
         assert_eq!(copy.preset, Preset::Custom);
+        assert!(copy.wrap_values && copy.wrap_results);
         assert!(serde_json::from_str::<ColorSettings>(r#"{"preset":"Unknown"}"#).is_err());
         assert_eq!(
             serde_json::from_str::<ColorSettings>("{}").unwrap().preset,

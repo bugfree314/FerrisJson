@@ -1,6 +1,6 @@
 {
   "project": "FerrisJson",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "一个简洁的 JSON 查看器",
   "users": [
     { "id": 1, "name": "Alice", "email": "alice@example.com", "active": true },
