@@ -1,0 +1,13 @@
+{
+  "project": "Rust JSON Viewer",
+  "version": "0.1.0",
+  "description": "一个简洁的 JSON 查看器",
+  "users": [
+    { "id": 1, "name": "Alice", "email": "alice@example.com", "active": true },
+    { "id": 2, "name": "张三", "email": "zhang@example.com", "active": false }
+  ],
+  "settings": { "theme": "dark", "features": ["tree", "search", "path", "export"], "optional": null },
+  "special.keys": { "a/b": "Supports JSON Pointer escaping", "~key": 123456789012345678901234567890 },
+  "emptyObject": {},
+  "emptyArray": []
+}
