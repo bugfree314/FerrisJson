@@ -352,10 +352,95 @@ impl Document {
         self.node_ref(self.find_path(path)?)
     }
     pub fn preview_ref(&self, reference: NodeRef) -> Result<String, String> {
-        Ok(self.preview(self.resolve(reference)?))
+        let id = self.resolve(reference)?;
+        crate::engine::file_source::check_cancelled().map_err(|e| e.to_string())?;
+        let preview = self.preview(id);
+        crate::engine::file_source::check_cancelled().map_err(|e| e.to_string())?;
+        Ok(preview)
     }
     pub fn path_ref(&self, reference: NodeRef) -> Result<String, String> {
         Ok(self.path(self.resolve(reference)?))
+    }
+    /// A bounded display string; copying/exporting paths still uses path_ref.
+    pub fn display_path_ref(&self, reference: NodeRef) -> Result<String, String> {
+        let id = self.resolve(reference)?;
+        const LIMIT: usize = 16 * 1024;
+        let _lease = self
+            .budget
+            .reserve(Resource::Memory, LIMIT + 3, "display path")?;
+        struct Buffer {
+            bytes: Vec<u8>,
+            truncated: bool,
+        }
+        impl Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                crate::engine::file_source::check_cancelled()?;
+                let remaining = LIMIT.saturating_sub(self.bytes.len());
+                self.bytes
+                    .extend_from_slice(&bytes[..remaining.min(bytes.len())]);
+                if bytes.len() > remaining {
+                    self.truncated = true;
+                    return Err(io::Error::other("display path limit"));
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut buffer = Buffer {
+            bytes: Vec::with_capacity(LIMIT + 3),
+            truncated: false,
+        };
+        buffer.write_all(b"$").map_err(|e| e.to_string())?;
+        for child in self.ancestors(id) {
+            let node = &self.nodes[child];
+            let result = if matches!(self.nodes[node.parent().unwrap()].kind, Kind::Array) {
+                write!(&mut buffer, "[{}]", node.segment)
+            } else {
+                let key = &self.keys[node.segment as usize];
+                let mut characters = key.chars();
+                let mut identifier = characters
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+                if identifier {
+                    for (index, character) in characters.enumerate() {
+                        if index % 1024 == 0 {
+                            crate::engine::file_source::check_cancelled()
+                                .map_err(|e| e.to_string())?;
+                        }
+                        if !character.is_ascii_alphanumeric() && character != '_' {
+                            identifier = false;
+                            break;
+                        }
+                    }
+                }
+                if identifier {
+                    buffer
+                        .write_all(b".")
+                        .and_then(|_| buffer.write_all(key.as_bytes()))
+                } else {
+                    buffer
+                        .write_all(b"[")
+                        .and_then(|_| write_escaped_preview_string(&mut buffer, key))
+                        .and_then(|_| buffer.write_all(b"]"))
+                }
+            };
+            if let Err(error) = result {
+                if !buffer.truncated {
+                    return Err(error.to_string());
+                }
+                break;
+            }
+        }
+        let valid = std::str::from_utf8(&buffer.bytes)
+            .map_or_else(|e| e.valid_up_to(), |_| buffer.bytes.len());
+        buffer.bytes.truncate(valid);
+        let mut path = String::from_utf8(buffer.bytes).unwrap();
+        if buffer.truncated {
+            path.push('…');
+        }
+        Ok(path)
     }
     /// Pages preserve source/display order, not the internal sorted lookup table.
     pub fn children_page(
@@ -605,7 +690,12 @@ impl Document {
                 serde_json::to_writer_pretty(writer, value.as_ref())
             });
         }
-        bounded_preview(&self.budget, |writer| self.write_node(writer, id))
+        bounded_preview(&self.budget, |writer| match &self.storage {
+            Storage::Memory(_) => {
+                write_memory_preview(writer, self.memory_at(id), 0).map_err(serde_json::Error::io)
+            }
+            Storage::Indexed(_) => self.write_node(writer, id),
+        })
     }
     #[cfg(test)]
     pub fn results_json(&self, ids: &[u32]) -> String {
@@ -614,7 +704,24 @@ impl Document {
         String::from_utf8(bytes).unwrap()
     }
     pub fn results_preview(&self, ids: &[u32]) -> String {
-        bounded_preview(&self.budget, |writer| self.write_results(writer, ids))
+        bounded_preview(&self.budget, |writer| {
+            if matches!(self.storage, Storage::Memory(_)) {
+                (|| {
+                    writer.write_all(b"[")?;
+                    for (ordinal, &id) in ids.iter().enumerate() {
+                        writer.write_all(if ordinal == 0 { b"\n  " } else { b",\n  " })?;
+                        write_memory_preview(writer, self.memory_at(id as usize), 1)?;
+                    }
+                    if !ids.is_empty() {
+                        writer.write_all(b"\n")?;
+                    }
+                    writer.write_all(b"]")
+                })()
+                .map_err(serde_json::Error::io)
+            } else {
+                self.write_results(writer, ids)
+            }
+        })
     }
     pub fn write_node(&self, mut writer: impl Write, id: usize) -> serde_json::Result<()> {
         match &self.storage {
@@ -839,6 +946,62 @@ fn short(text: &str, length: usize) -> String {
     result
 }
 // Bound serialization by output bytes, rather than by the size of the whole document.
+// Preview-only formatting: serde's string formatter may scan an entire giant
+// scalar before its first write. Escape bounded UTF-8 slices instead.
+fn write_escaped_preview_string(output: &mut dyn Write, mut text: &str) -> io::Result<()> {
+    output.write_all(b"\"")?;
+    while !text.is_empty() {
+        crate::engine::file_source::check_cancelled()?;
+        let mut end = text.len().min(4096);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let escaped = serde_json::to_vec(&text[..end]).map_err(io::Error::other)?;
+        output.write_all(&escaped[1..escaped.len() - 1])?;
+        text = &text[end..];
+    }
+    output.write_all(b"\"")
+}
+fn write_memory_preview(output: &mut dyn Write, value: &Value, depth: usize) -> io::Result<()> {
+    fn indent(output: &mut dyn Write, depth: usize) -> io::Result<()> {
+        output.write_all(&[b' '; 512][..depth * 2])
+    }
+    crate::engine::file_source::check_cancelled()?;
+    match value {
+        Value::String(text) => write_escaped_preview_string(output, text),
+        Value::Number(number) => output.write_all(number.as_str().as_bytes()),
+        Value::Bool(value) => output.write_all(if *value { b"true" } else { b"false" }),
+        Value::Null => output.write_all(b"null"),
+        Value::Array(array) => {
+            output.write_all(b"[")?;
+            for (index, value) in array.iter().enumerate() {
+                output.write_all(if index == 0 { b"\n" } else { b",\n" })?;
+                indent(output, depth + 1)?;
+                write_memory_preview(output, value, depth + 1)?;
+            }
+            if !array.is_empty() {
+                output.write_all(b"\n")?;
+                indent(output, depth)?;
+            }
+            output.write_all(b"]")
+        }
+        Value::Object(object) => {
+            output.write_all(b"{")?;
+            for (index, (key, value)) in object.iter().enumerate() {
+                output.write_all(if index == 0 { b"\n" } else { b",\n" })?;
+                indent(output, depth + 1)?;
+                write_escaped_preview_string(output, key)?;
+                output.write_all(b": ")?;
+                write_memory_preview(output, value, depth + 1)?;
+            }
+            if !object.is_empty() {
+                output.write_all(b"\n")?;
+                indent(output, depth)?;
+            }
+            output.write_all(b"}")
+        }
+    }
+}
 fn bounded_preview(
     budget: &BudgetManager,
     serialize: impl FnOnce(&mut dyn Write) -> serde_json::Result<()>,
@@ -857,6 +1020,7 @@ fn bounded_preview(
     }
     impl Write for PreviewWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            crate::engine::file_source::check_cancelled()?;
             let remaining = 200_000usize.saturating_sub(self.bytes.len());
             if buf.len() > remaining {
                 self.bytes.extend_from_slice(&buf[..remaining]);
@@ -893,6 +1057,63 @@ fn bounded_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incremental_memory_previews_match_serde_format_and_stop_on_cancellation() {
+        let long = "한🙂\n\"\\".repeat(1500);
+        let value =
+            serde_json::json!({"string":long,"nested":[true,false,null,{},[],{"a":1.25}],"n":123});
+        let doc = Document::parse(&value.to_string()).unwrap();
+        assert_eq!(
+            doc.preview(0),
+            serde_json::to_string_pretty(&value).unwrap()
+        );
+        let refs = doc.query_path("$.*").unwrap();
+        let values: Vec<_> = refs.iter().map(|&id| doc.memory_at(id as usize)).collect();
+        assert_eq!(
+            doc.results_preview(&refs),
+            serde_json::to_string_pretty(&values).unwrap()
+        );
+        struct Stop {
+            writes: usize,
+            flag: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Write for Stop {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                if self.writes == 3 {
+                    self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut output = Stop {
+            writes: 0,
+            flag: Arc::clone(&flag),
+        };
+        crate::engine::file_source::with_io_context(
+            crate::engine::file_source::Priority::Interactive,
+            crate::engine::file_source::Cancellation::Flag(flag),
+            || {
+                assert!(write_memory_preview(&mut output, &Value::String(long), 0).is_err());
+            },
+        );
+        assert_eq!(output.writes, 3);
+    }
+    #[test]
+    fn display_paths_are_bounded_without_truncating_copy_paths() {
+        let key = "한\n".repeat(10_000);
+        let encoded = serde_json::to_string(&key).unwrap();
+        let doc = Document::parse(&format!("{{{encoded}:1}}")).unwrap();
+        let reference = doc.node_ref(1).unwrap();
+        let display = doc.display_path_ref(reference).unwrap();
+        assert!(display.len() <= 16 * 1024 + 3);
+        assert!(display.ends_with('…'));
+        assert_eq!(doc.path_ref(reference).unwrap(), format!("$[{encoded}]"));
+    }
     #[test]
     fn visible_ids_reuse_capacity_and_release_large_collapsed_arrays() {
         let doc = Document::parse(&serde_json::json!(vec![0; 10_000]).to_string()).unwrap();

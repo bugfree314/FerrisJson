@@ -1,5 +1,6 @@
 //! Shared engine boundaries. The legacy backends remain complete-index adapters.
 pub mod budget;
+pub mod file_source;
 pub mod ids;
 pub mod session;
 

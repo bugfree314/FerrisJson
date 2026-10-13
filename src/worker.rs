@@ -1,6 +1,7 @@
 //! One active operation and one replaceable pending request per worker.
 use crate::document::{Document, NodeIds, SearchScope};
 use crate::engine::budget::{Reservation, Resource};
+use crate::engine::file_source::{Cancellation, Priority, with_io_context};
 use crate::engine::session::{SessionId, TaskId};
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -76,36 +77,40 @@ impl Worker {
                     continue;
                 }
                 let started = Instant::now();
-                let result = match request.operation {
-                    Operation::Search {
-                        term,
-                        case,
-                        regex,
-                        scope,
-                    } => request
-                        .doc
-                        .search_cancellable(&term, case, regex, scope, cancelled)
-                        .map(Output::Search),
-                    Operation::Query(expression) => {
-                        // The library evaluates a whole query without a cancellation hook.
-                        // Suppress stale work before formatting; pending queries are coalesced.
-                        request
+                let result = with_io_context(
+                    Priority::User,
+                    Cancellation::Generation(Arc::clone(&epoch), request.generation),
+                    || match request.operation {
+                        Operation::Search {
+                            term,
+                            case,
+                            regex,
+                            scope,
+                        } => request
                             .doc
-                            .query_path_cancellable(&expression, cancelled)
-                            .map(|ids| {
-                                let preview = if cancelled() {
-                                    String::new()
-                                } else {
-                                    request.doc.results_preview(&ids)
-                                };
-                                Output::Query {
-                                    expression,
-                                    ids,
-                                    preview,
-                                }
-                            })
-                    }
-                };
+                            .search_cancellable(&term, case, regex, scope, cancelled)
+                            .map(Output::Search),
+                        Operation::Query(expression) => {
+                            // The library evaluates a whole query without a cancellation hook.
+                            // Suppress stale work before formatting; pending queries are coalesced.
+                            request
+                                .doc
+                                .query_path_cancellable(&expression, cancelled)
+                                .map(|ids| {
+                                    let preview = if cancelled() {
+                                        String::new()
+                                    } else {
+                                        request.doc.results_preview(&ids)
+                                    };
+                                    Output::Query {
+                                        expression,
+                                        ids,
+                                        preview,
+                                    }
+                                })
+                        }
+                    },
+                );
                 // A result-channel send can block. Never retain a document while
                 // waiting to deliver IDs/preview, especially during low-memory loading.
                 let task = TaskId {
@@ -125,8 +130,19 @@ impl Worker {
                 };
                 // Bound retained results. Only the worker can wait; the UI polls
                 // without blocking and closing the receiver wakes a waiting send.
-                if tx.send(completion).is_err() {
-                    return;
+                let mut completion = completion;
+                loop {
+                    if cancelled() {
+                        break;
+                    }
+                    match tx.try_send(completion) {
+                        Ok(()) => break,
+                        Err(mpsc::TrySendError::Disconnected(_)) => return,
+                        Err(mpsc::TrySendError::Full(value)) => {
+                            completion = value;
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
                 }
                 ctx.request_repaint();
             }

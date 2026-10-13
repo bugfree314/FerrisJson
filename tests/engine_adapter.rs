@@ -182,3 +182,53 @@ fn quota_failures_are_explicit_and_do_not_leak_or_replace_output() {
     drop(doc);
     assert_eq!(manager.usage().memory, 0);
 }
+
+#[test]
+fn indexed_parallel_previews_use_the_snapshot_after_original_replacement() {
+    use FerrisJson::engine::file_source::{Cancellation, Priority, with_io_context};
+    let input =
+        Input::new(r#"{"one":"한국어","two":[1,2,3],"huge":123456789012345678901234567890}"#);
+    let manager = budget();
+    let doc = Arc::new(
+        Document::open_indexed_with_budget(
+            &input.0,
+            || false,
+            &LoadProgress::default(),
+            manager.clone(),
+        )
+        .unwrap(),
+    );
+    let one = doc.locate("$.one").unwrap();
+    let two = doc.locate("$.two").unwrap();
+    fs::write(&input.0, r#"{"replaced":true}"#).unwrap();
+    let jobs: Vec<_> = (0..8)
+        .map(|index| {
+            let doc = Arc::clone(&doc);
+            std::thread::spawn(move || {
+                with_io_context(
+                    Priority::Interactive,
+                    Cancellation::Flag(Arc::new(AtomicBool::new(false))),
+                    || {
+                        let (reference, expected) = if index % 2 == 0 {
+                            (one, "\"한국어\"")
+                        } else {
+                            (two, "[\n  1,\n  2,\n  3\n]")
+                        };
+                        assert_eq!(doc.preview_ref(reference).unwrap(), expected);
+                    },
+                )
+            })
+        })
+        .collect();
+    for job in jobs {
+        job.join().unwrap();
+    }
+    with_io_context(
+        Priority::Interactive,
+        Cancellation::Flag(Arc::new(AtomicBool::new(true))),
+        || assert!(doc.preview_ref(one).is_err()),
+    );
+    drop(doc);
+    assert_eq!(manager.usage().disk, 0);
+    assert_eq!(manager.usage().memory, 0);
+}

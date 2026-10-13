@@ -38,6 +38,17 @@ impl RowCache {
         self.order = VecDeque::new();
         self.bytes = 0;
     }
+    pub fn get(&mut self, id: usize) -> Option<&(String, String)> {
+        if !self.entries.contains_key(&id) {
+            return None;
+        }
+        self.order.retain(|&key| key != id);
+        self.order.push_back(id);
+        self.entries.get(&id)
+    }
+    pub fn insert(&mut self, id: usize, labels: (String, String)) {
+        let _ = self.labels(id, || labels);
+    }
     pub fn labels(
         &mut self,
         id: usize,

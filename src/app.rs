@@ -1,4 +1,6 @@
 use crate::engine::budget::{Reservation, Resource};
+use crate::engine::file_source::{Cancellation, Priority, with_io_context};
+use crate::preview_worker::{Output as PreviewOutput, PreviewWorker, ROW_BATCH};
 use crate::{
     document::{Document, LoadProgress, NodeIds, SearchScope},
     export::{self, COPY_LIMIT, CopyError, Selection},
@@ -9,6 +11,7 @@ use crate::{
     worker::{Operation, Output, Worker},
 };
 use eframe::egui::{self, Color32, Key, RichText};
+use std::borrow::Cow;
 use std::{
     path::PathBuf,
     sync::{
@@ -35,6 +38,8 @@ struct CopyRequest {
 
 pub struct Viewer {
     doc: Option<Arc<Document>>,
+    preview_worker: Option<PreviewWorker>,
+    requested_rows: Vec<usize>,
     search_worker: Option<Worker>,
     path_worker: Option<Worker>,
     search_due: Option<Instant>,
@@ -134,6 +139,8 @@ impl Viewer {
     fn empty() -> Self {
         Self {
             doc: None,
+            preview_worker: None,
+            requested_rows: Vec::new(),
             search_worker: None,
             path_worker: None,
             search_due: None,
@@ -237,13 +244,23 @@ impl Viewer {
             if !wait_for_old_document(old, &waiting, &cancelled, &ctx) {
                 return;
             }
-            let result = if indexed {
-                Document::open_indexed(&path, || cancelled.load(Ordering::Relaxed), &progress)
-            } else {
-                std::fs::read_to_string(&path)
-                    .map_err(|e| format!("Cannot open {}: {e}", path.display()))
-                    .and_then(Document::parse_owned)
-            }
+            let result = with_io_context(
+                Priority::Background,
+                Cancellation::Flag(Arc::clone(&cancelled)),
+                || {
+                    if indexed {
+                        Document::open_indexed(
+                            &path,
+                            || cancelled.load(Ordering::Relaxed),
+                            &progress,
+                        )
+                    } else {
+                        std::fs::read_to_string(&path)
+                            .map_err(|e| format!("Cannot open {}: {e}", path.display()))
+                            .and_then(Document::parse_owned)
+                    }
+                },
+            )
             .map(|doc| (doc, path.display().to_string(), Some(path)));
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -452,8 +469,18 @@ impl Viewer {
             self.history_index = self.history.len() - 1;
         }
         if self.selected != id || self.detail.is_empty() {
-            self.detail = doc.preview(id);
-            self.selected_path = doc.path(id);
+            if let Some(worker) = &mut self.preview_worker {
+                self.detail = "Loading preview...".into();
+                self.selected_path = "Loading path...".into();
+                if let Err(error) = worker.select(Arc::clone(doc), doc.node_ref(id).unwrap()) {
+                    self.detail = error;
+                    self.selected_path = "Path unavailable".into();
+                }
+            } else {
+                // Context-free callers use the same engine synchronously.
+                self.detail = doc.preview(id);
+                self.selected_path = doc.path(id);
+            }
         }
         self.selected = id;
     }
@@ -617,6 +644,10 @@ impl Viewer {
     }
     fn cancel_operations(&mut self) {
         self.search_due = None;
+        self.requested_rows.clear();
+        if let Some(worker) = &mut self.preview_worker {
+            worker.cancel();
+        }
         if let Some(worker) = &mut self.search_worker {
             worker.cancel();
         }
@@ -783,6 +814,44 @@ impl Viewer {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
+    fn poll_previews(&mut self) {
+        while let Some(completed) = self.preview_worker.as_mut().and_then(PreviewWorker::poll) {
+            if self
+                .doc
+                .as_ref()
+                .is_none_or(|doc| doc.session_id() != completed.task.session)
+            {
+                continue;
+            }
+            match completed.result {
+                Ok(PreviewOutput::Selection {
+                    reference,
+                    preview,
+                    path,
+                }) => {
+                    if reference.address as usize == self.selected {
+                        self.detail = preview;
+                        self.selected_path = path;
+                    }
+                }
+                Ok(PreviewOutput::Rows(rows)) => {
+                    self.requested_rows.clear();
+                    for row in rows {
+                        self.row_labels.insert(row.id, (row.key, row.preview));
+                    }
+                }
+                Err(error) => {
+                    if completed.selection {
+                        self.detail = error;
+                        self.selected_path = "Path unavailable".into();
+                    } else {
+                        self.requested_rows.clear();
+                        self.error = Some(error);
+                    }
+                }
+            }
+        }
+    }
     fn next_match(&mut self, backwards: bool) {
         self.match_step(backwards, 1);
     }
@@ -800,8 +869,8 @@ impl Viewer {
     }
     fn copy(&mut self, ctx: &egui::Context, path: bool) {
         if path {
-            if self.doc.is_some() {
-                ctx.copy_text(self.selected_path.clone());
+            if let Some(doc) = &self.doc {
+                ctx.copy_text(doc.path(self.selected));
                 self.notice = "Path copied".into();
             }
         } else if let Some(doc) = &self.doc {
@@ -846,11 +915,23 @@ impl Viewer {
         self.pending_export = Some(rx);
         self.notice = "Exporting JSON...".into();
         self.export_thread = Some(std::thread::spawn(move || {
-            let result =
-                export::atomic_write_with_budget(&path, &cancelled, doc.budget(), |writer| {
-                    selection.write(&doc, writer)
-                })
-                .map(|()| path);
+            let result = with_io_context(
+                Priority::User,
+                Cancellation::Flag(Arc::clone(&cancelled)),
+                || {
+                    export::atomic_write_with_budget(&path, &cancelled, doc.budget(), |writer| {
+                        selection.write(&doc, writer)
+                    })
+                },
+            )
+            .map_err(|error| {
+                if cancelled.load(Ordering::Relaxed) {
+                    "Export cancelled".into()
+                } else {
+                    error
+                }
+            })
+            .map(|()| path);
             drop(selection);
             drop(doc);
             let _ = tx.send(result);
@@ -1112,6 +1193,17 @@ impl Viewer {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        if self.preview_worker.is_none() {
+            self.preview_worker = Some(PreviewWorker::new(ctx.clone()));
+        }
+        self.poll_previews();
+        if self
+            .preview_worker
+            .as_ref()
+            .is_some_and(|worker| worker.selection_busy || worker.rows_busy)
+        {
+            ctx.request_repaint_after(Duration::from_millis(25));
+        }
         self.search_worker
             .get_or_insert_with(|| Worker::new(ctx.clone()));
         self.path_worker
@@ -1425,6 +1517,7 @@ impl Viewer {
                     );
                 });
         }
+        let mut missing_rows = Vec::with_capacity(ROW_BATCH);
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(error) = self.error.clone() {
                 ui.horizontal_wrapped(|ui| {
@@ -1479,9 +1572,14 @@ impl Viewer {
                     let id = self.rows[row] as usize;
                     let doc = self.doc.as_ref().unwrap();
                     let node = &doc.node_info(id);
-                    let labels = self
-                        .row_labels
-                        .labels(id, || (doc.key(id).into_owned(), doc.row_preview(id)));
+                    let labels = if let Some(labels) = self.row_labels.get(id) {
+                        Cow::Borrowed(labels)
+                    } else {
+                        if missing_rows.len() < ROW_BATCH {
+                            missing_rows.push(id);
+                        }
+                        Cow::Owned((doc.key(id).chars().take(160).collect(), "Loading...".into()))
+                    };
                     let (row_key, row_preview) = labels.as_ref();
                     let is_match = self.matches.binary_search(&(id as u32)).is_ok();
                     let palette = self.colors.active();
@@ -1552,6 +1650,25 @@ impl Viewer {
                 self.toggle(id);
             }
         });
+        if missing_rows.is_empty() && !self.requested_rows.is_empty() {
+            if let Some(worker) = &mut self.preview_worker {
+                worker.cancel_rows();
+            }
+            self.requested_rows.clear();
+        }
+        if !missing_rows.is_empty()
+            && missing_rows != self.requested_rows
+            && let (Some(doc), Some(worker)) = (&self.doc, &mut self.preview_worker)
+        {
+            let references = missing_rows
+                .iter()
+                .map(|&id| doc.node_ref(id).unwrap())
+                .collect();
+            match worker.rows(Arc::clone(doc), references) {
+                Ok(()) => self.requested_rows = missing_rows,
+                Err(error) => self.error = Some(error),
+            }
+        }
         if self.paste_open {
             let mut open = true;
             let mut load = false;
@@ -1623,8 +1740,11 @@ impl Drop for Viewer {
     fn drop(&mut self) {
         self.loading_cancelled.store(true, Ordering::Relaxed);
         self.export_cancelled.store(true, Ordering::Relaxed);
+        self.cancel_operations();
+        // The export owns its temporary-file cleanup. Do not wait on an OS I/O
+        // syscall on the UI thread during window close.
         if let Some(thread) = self.export_thread.take() {
-            let _ = thread.join();
+            crate::shutdown::defer(thread);
         }
     }
 }
@@ -1806,6 +1926,92 @@ mod tests {
             assert!(Instant::now() < deadline, "operations did not finish");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+    #[test]
+    fn indexed_cache_misses_do_not_read_files_on_the_ui_thread() {
+        let path =
+            std::env::temp_dir().join(format!("FerrisJson-S2-widget-{}.tmp", std::process::id()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let input = Cleanup(path);
+        std::fs::write(&input.0, r#"{"value":"on disk"}"#).unwrap();
+        let mut app = Viewer::empty();
+        let ctx = egui::Context::default();
+        let doc =
+            Arc::new(Document::open_indexed(&input.0, || false, &LoadProgress::default()).unwrap());
+        app.expanded = vec![true; doc.node_count()];
+        app.doc = Some(doc);
+        app.preview_worker = Some(PreviewWorker::new(ctx.clone()));
+        app.select(0);
+        app.rebuild_rows();
+        with_io_context(
+            Priority::Interactive,
+            Cancellation::Flag(Arc::new(AtomicBool::new(true))),
+            || {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1120.0, 760.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                );
+            },
+        );
+        // The draw only submitted requests; synchronous row reading would cache an error here.
+        assert!(app.row_labels.get(1).is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .preview_worker
+            .as_ref()
+            .is_some_and(|worker| worker.selection_busy || worker.rows_busy)
+        {
+            app.poll_previews();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.row_labels.get(1).unwrap().1, "\"on disk\"");
+        assert!(!app.detail.contains("cancelled"));
+    }
+    #[test]
+    fn selections_are_asynchronous_and_latest_selection_wins() {
+        let mut app = loaded();
+        app.preview_worker = Some(PreviewWorker::new(egui::Context::default()));
+        let first = app
+            .doc
+            .as_ref()
+            .unwrap()
+            .find_path("$.users[0].name")
+            .unwrap();
+        let last = app
+            .doc
+            .as_ref()
+            .unwrap()
+            .find_path("$.users[1].name")
+            .unwrap();
+        app.select(first);
+        assert_eq!(app.detail, "Loading preview...");
+        app.select(last);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.preview_worker.as_ref().unwrap().selection_busy {
+            app.poll_previews();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.detail, "\"张三\"");
+        assert_eq!(app.selected_path, "$.users[1].name");
+        app.select(first);
+        app.cancel_operations();
+        app.doc = Some(Arc::new(Document::parse("null").unwrap()));
+        app.detail = "new document".into();
+        app.poll_previews();
+        assert_eq!(app.detail, "new document");
     }
     #[test]
     fn background_operations_update_navigation_and_loading_invalidates_old_results() {

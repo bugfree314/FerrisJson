@@ -151,7 +151,10 @@ pub fn atomic_write_with_budget(
                             .ok_or_else(|| io::Error::other("Export size overflow"))?,
                     )
                     .map_err(io::Error::other)?;
-                self.output.write_all(chunk)?;
+                crate::engine::file_source::with_io_slot(
+                    &|| self.cancelled.load(Ordering::Relaxed),
+                    || self.output.write_all(chunk),
+                )?;
             }
             Ok(bytes.len())
         }
@@ -159,7 +162,10 @@ pub fn atomic_write_with_budget(
             if self.cancelled.load(Ordering::Relaxed) {
                 return Err(io::Error::other("Export cancelled"));
             }
-            self.output.flush()
+            crate::engine::file_source::with_io_slot(
+                &|| self.cancelled.load(Ordering::Relaxed),
+                || self.output.flush(),
+            )
         }
     }
     if cancelled.load(Ordering::Relaxed) {
@@ -169,16 +175,26 @@ pub fn atomic_write_with_budget(
     let mut disk = budget.reserve(Resource::Disk, 0, "export temporary file")?;
     let (file, mut temp) = temporary(target).map_err(|e| e.to_string())?;
     let mut output = BufWriter::with_capacity(64 * 1024, file);
-    {
+    let written = (|| {
         let mut writer = CancelWriter {
             output: &mut output,
             cancelled,
             disk: &mut disk,
         };
         serialize(&mut writer).map_err(|e| e.to_string())?;
-        writer.flush().map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())
+    })();
+    if let Err(error) = written {
+        // Do not flush an unwritten buffer from BufWriter::drop after cancellation.
+        let (file, buffer) = output.into_parts();
+        drop(buffer);
+        drop(file);
+        return Err(error);
     }
-    output.get_ref().sync_all().map_err(|e| e.to_string())?;
+    crate::engine::file_source::with_io_slot(&|| cancelled.load(Ordering::Relaxed), || {
+        output.get_ref().sync_all()
+    })
+    .map_err(|e| e.to_string())?;
     drop(output);
     if cancelled.load(Ordering::Relaxed) {
         return Err("Export cancelled".into());

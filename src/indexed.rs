@@ -1,6 +1,7 @@
 //! Validated file-range backend. No memory mapping and no whole-document Value.
 use crate::engine::{
     budget::{BudgetManager, Reservation, Resource, reserve_vec},
+    file_source::{FileSource, lock_cancellable, with_io_slot},
     session::SessionId,
 };
 
@@ -9,8 +10,8 @@ use regex::RegexBuilder;
 use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    fs::{self, OpenOptions},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -52,7 +53,7 @@ impl LoadProgress {
     }
 }
 struct Snapshot {
-    file: Mutex<Option<File>>,
+    file: FileSource,
     path: Option<PathBuf>,
     len: u64,
     _disk: Reservation,
@@ -60,10 +61,7 @@ struct Snapshot {
 }
 impl Drop for Snapshot {
     fn drop(&mut self) {
-        self.file
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        self.file.close();
         if let Some(path) = &self.path {
             let _ = fs::remove_file(path);
         }
@@ -124,17 +122,17 @@ impl Snapshot {
             match options.open(&path) {
                 Ok(file) => {
                     result = Some(Self {
-                        file: Mutex::new(Some(file)),
+                        file: FileSource::new(file),
                         path: Some(path),
                         len: 0,
                         _disk: disk.take().unwrap(),
                         budget: budget.clone(),
                     });
                     #[cfg(unix)]
-                    if let Some(snapshot) = &mut result {
-                        if fs::remove_file(snapshot.path.as_ref().unwrap()).is_ok() {
-                            snapshot.path = None;
-                        }
+                    if let Some(snapshot) = &mut result
+                        && fs::remove_file(snapshot.path.as_ref().unwrap()).is_ok()
+                    {
+                        snapshot.path = None;
                     }
                     break;
                 }
@@ -148,7 +146,8 @@ impl Snapshot {
             if cancelled() {
                 return Err("Loading cancelled".into());
             }
-            let count = input.read(&mut buffer).map_err(|e| e.to_string())?;
+            let count =
+                with_io_slot(cancelled, || input.read(&mut buffer)).map_err(|e| e.to_string())?;
             if count == 0 {
                 break;
             }
@@ -160,14 +159,10 @@ impl Snapshot {
                         .ok_or("Snapshot size overflow")?,
                 ),
             )?;
-            snapshot
-                .file
-                .get_mut()
-                .unwrap()
-                .as_mut()
-                .unwrap()
-                .write_all(&buffer[..count])
-                .map_err(|e| e.to_string())?;
+            with_io_slot(cancelled, || {
+                snapshot.file.file_mut().write_all(&buffer[..count])
+            })
+            .map_err(|e| e.to_string())?;
             snapshot.len += count as u64;
             progress.done.store(snapshot.len, Ordering::Relaxed);
         }
@@ -179,10 +174,10 @@ impl Snapshot {
             return Err("Source changed while copying; reopen the file".into());
         }
         #[cfg(unix)]
-        if let Some(path) = &snapshot.path {
-            if fs::remove_file(path).is_ok() {
-                snapshot.path = None;
-            }
+        if let Some(path) = &snapshot.path
+            && fs::remove_file(path).is_ok()
+        {
+            snapshot.path = None;
         }
         Ok(snapshot)
     }
@@ -193,18 +188,11 @@ impl Snapshot {
         {
             return Err(io::Error::other("Snapshot range out of bounds"));
         }
-        let mut guard = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("Snapshot lock poisoned"))?;
-        let file = guard
-            .as_mut()
-            .ok_or_else(|| io::Error::other("Snapshot closed"))?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(bytes)
+        self.file.read_exact_at(offset, bytes)
     }
 }
 struct Reader<'a> {
+    cancelled: Option<&'a dyn Fn() -> bool>,
     source: &'a Snapshot,
     buffer: Vec<u8>,
     _buffer_reservation: Reservation,
@@ -220,6 +208,7 @@ impl<'a> Reader<'a> {
             .budget
             .reserve(Resource::Memory, BLOCK, "reader buffer")?;
         Ok(Self {
+            cancelled: None,
             source,
             _buffer_reservation: lease,
             buffer: vec![0; BLOCK],
@@ -229,6 +218,10 @@ impl<'a> Reader<'a> {
             line: 1,
             column: 0,
         })
+    }
+    fn with_cancellation(mut self, cancelled: &'a dyn Fn() -> bool) -> Self {
+        self.cancelled = Some(cancelled);
+        self
     }
     fn error(&self, message: &str) -> String {
         format!(
@@ -246,7 +239,12 @@ impl<'a> Reader<'a> {
             self.start = self.pos / BLOCK as u64 * BLOCK as u64;
             self.count = (self.source.len - self.start).min(BLOCK as u64) as usize;
             self.source
-                .read(self.start, &mut self.buffer[..self.count])
+                .file
+                .read_exact_at_cancellable(
+                    self.start,
+                    &mut self.buffer[..self.count],
+                    self.cancelled.unwrap_or(&|| false),
+                )
                 .map_err(|e| e.to_string())?;
         }
         Ok(Some(self.buffer[(self.pos - self.start) as usize]))
@@ -430,7 +428,7 @@ impl Store {
             return Err("Subtree exceeds the bounded parse limit (256 KiB / 16,384 nodes); use range preview or export".into());
         }
         {
-            let mut cache = self.cache.lock().map_err(|_| "Subtree cache poisoned")?;
+            let mut cache = lock_cancellable(&self.cache).map_err(|e| e.to_string())?;
             if let Some((value, _)) = cache.entries.get(&id) {
                 let value = Arc::clone(value);
                 cache.order.retain(|&old| old != id);
@@ -460,7 +458,7 @@ impl Store {
             value,
             _reservation: reservation,
         });
-        let mut cache = self.cache.lock().map_err(|_| "Subtree cache poisoned")?;
+        let mut cache = lock_cancellable(&self.cache).map_err(|e| e.to_string())?;
         if let Some((old, _)) = cache.entries.get(&id) {
             return Ok(Arc::clone(old));
         }
@@ -630,7 +628,7 @@ impl Store {
             }
         }
         let array_keys = regex || term.bytes().all(|byte| byte.is_ascii_digit());
-        let mut reader = Reader::new(&self.source)?;
+        let mut reader = Reader::new(&self.source)?.with_cancellation(&cancelled);
         let mut ids = NodeIds::new(&doc.budget);
         for (id, node) in doc.nodes.iter().enumerate() {
             if id % 1024 == 0 && cancelled() {
@@ -1012,7 +1010,7 @@ pub(super) fn open_with_budget(
         "scanner workspace",
     )?;
     let mut parser = Parser {
-        reader: Reader::new(&source)?,
+        reader: Reader::new(&source)?.with_cancellation(&cancelled),
         cancelled: &cancelled,
         progress,
         nodes: Vec::new(),

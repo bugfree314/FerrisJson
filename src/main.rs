@@ -8,7 +8,9 @@ mod app;
 use FerrisJson::{document, engine, export, loading};
 mod fonts;
 mod palette;
+mod preview_worker;
 mod row_cache;
+mod shutdown;
 mod ui;
 mod vim;
 mod worker;
@@ -144,7 +146,7 @@ fn run() -> Result<(), String> {
             .with_min_inner_size([700.0, 480.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "FerrisJson",
         options,
         Box::new(move |cc| {
@@ -155,8 +157,9 @@ fn run() -> Result<(), String> {
                 indexed,
             )))
         }),
-    )
-    .map_err(|e| e.to_string())
+    );
+    shutdown::finish();
+    result.map_err(|e| e.to_string())
 }
 fn stdin_redirected() -> bool {
     #[cfg(windows)]
