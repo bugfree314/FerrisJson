@@ -52,10 +52,10 @@ impl LoadProgress {
         )
     }
 }
-struct Snapshot {
+pub(crate) struct Snapshot {
     file: FileSource,
     path: Option<PathBuf>,
-    len: u64,
+    pub(crate) len: u64,
     _disk: Reservation,
     budget: BudgetManager,
 }
@@ -68,7 +68,7 @@ impl Drop for Snapshot {
     }
 }
 impl Snapshot {
-    fn copy(
+    pub(crate) fn copy(
         path: &Path,
         cancelled: &impl Fn() -> bool,
         progress: &LoadProgress,
@@ -181,29 +181,43 @@ impl Snapshot {
         }
         Ok(snapshot)
     }
-    fn read(&self, offset: u64, bytes: &mut [u8]) -> io::Result<()> {
+    pub(crate) fn read(&self, offset: u64, bytes: &mut [u8]) -> io::Result<()> {
+        self.check_range(offset, bytes.len())?;
+        self.file.read_exact_at(offset, bytes)
+    }
+    pub(crate) fn read_cancellable(
+        &self,
+        offset: u64,
+        bytes: &mut [u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        self.check_range(offset, bytes.len())?;
+        self.file
+            .read_exact_at_cancellable(offset, bytes, cancelled)
+    }
+    fn check_range(&self, offset: u64, length: usize) -> io::Result<()> {
         if offset
-            .checked_add(bytes.len() as u64)
+            .checked_add(length as u64)
             .is_none_or(|end| end > self.len)
         {
             return Err(io::Error::other("Snapshot range out of bounds"));
         }
-        self.file.read_exact_at(offset, bytes)
+        Ok(())
     }
 }
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     cancelled: Option<&'a dyn Fn() -> bool>,
     source: &'a Snapshot,
     buffer: Vec<u8>,
     _buffer_reservation: Reservation,
     start: u64,
     count: usize,
-    pos: u64,
+    pub(crate) pos: u64,
     line: u64,
     column: u64,
 }
 impl<'a> Reader<'a> {
-    fn new(source: &'a Snapshot) -> Result<Self, String> {
+    pub(crate) fn new(source: &'a Snapshot) -> Result<Self, String> {
         let lease = source
             .budget
             .reserve(Resource::Memory, BLOCK, "reader buffer")?;
@@ -219,11 +233,11 @@ impl<'a> Reader<'a> {
             column: 0,
         })
     }
-    fn with_cancellation(mut self, cancelled: &'a dyn Fn() -> bool) -> Self {
+    pub(crate) fn with_cancellation(mut self, cancelled: &'a dyn Fn() -> bool) -> Self {
         self.cancelled = Some(cancelled);
         self
     }
-    fn error(&self, message: &str) -> String {
+    pub(crate) fn error(&self, message: &str) -> String {
         format!(
             "Invalid JSON: {message} at line {} column {} (byte {})",
             self.line,
@@ -231,7 +245,7 @@ impl<'a> Reader<'a> {
             self.pos
         )
     }
-    fn peek(&mut self) -> Result<Option<u8>, String> {
+    pub(crate) fn peek(&mut self) -> Result<Option<u8>, String> {
         if self.pos >= self.source.len {
             return Ok(None);
         }
@@ -249,7 +263,7 @@ impl<'a> Reader<'a> {
         }
         Ok(Some(self.buffer[(self.pos - self.start) as usize]))
     }
-    fn next(&mut self) -> Result<u8, String> {
+    pub(crate) fn next(&mut self) -> Result<u8, String> {
         let byte = self
             .peek()?
             .ok_or_else(|| self.error("unexpected end of input"))?;
@@ -262,7 +276,7 @@ impl<'a> Reader<'a> {
         }
         Ok(byte)
     }
-    fn expect(&mut self, expected: u8) -> Result<(), String> {
+    pub(crate) fn expect(&mut self, expected: u8) -> Result<(), String> {
         if self.peek()? != Some(expected) {
             return Err(self.error("unexpected token"));
         }
@@ -281,7 +295,7 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
     // Reads one decoded character after an opening quote. None consumes the closing quote.
-    fn character(&mut self) -> Result<Option<char>, String> {
+    pub(crate) fn character(&mut self) -> Result<Option<char>, String> {
         let byte = self.next()?;
         let character = match byte {
             b'"' => return Ok(None),

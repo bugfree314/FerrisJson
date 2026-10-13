@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 #[path = "indexed.rs"]
-mod indexed;
+pub(crate) mod indexed;
 pub use indexed::LoadProgress;
 pub use indexed::Subtree;
 

@@ -6,3 +6,6 @@ pub mod session;
 
 /// S1 sessions use the existing complete-index document as their adapter.
 pub use crate::document::Document as Session;
+
+/// Experimental S3 disk-backed sparse scanner; not used by the GUI.
+pub mod sparse;

@@ -602,3 +602,106 @@ macOS/arm64、Rust 1.99，本次已通过 75 项自动测试：34 库、34 主�
 Windows/Linux/Intel Mac 实机与 GUI 人工点击、滚动、切换、关闭/导出清理未验收。普通剪贴板复制仍沿用原有同步接口，可能读取/序列化文件数据；本次异步迁移范围是浏览预览、路径和行摘要。当前选择和滚动仍可能受到完整行数组重建、egui 分词/排版等 CPU 工作影响；本次没有采样 GUI 帧时间。完整索引、完整结果集合及内存后端不可中断的 JSONPath 求值仍保留，固定内存稀疏导航和增量结果分别属于 S3/S5/S6/S7。S0 保持暂停，没有新的 RSS、加速比、锁等待或取消 P95 数据，不能宣称已达成 256 MiB/首屏/交互目标。
 
 0.6.0 版本更新后，`cargo check --offline --locked --all-targets`、`cargo fmt --check` 及暂存/工作区差异检查通过，Cargo.toml/Cargo.lock 版本一致。此次仅调整版本和文档，功能代码与上述已验证的 S2 实现一致，因此未重复完整测试；0.6.0 Release App 尚未重新打包，不将 0.5.2 工作区的 App 构建记录改写为 0.6.0 构建。本次按用户要求创建本地 0.6.0 提交及同名 tag，不推送；样本、测试及基准 JSON 不纳入提交。
+
+## 22. S3 — 固定内存扫描与稀疏索引 CLI 原型
+
+2026-10-13，基于 **0.6.0 / `db863ac`**。实现及下述完整测试、六组样本验收时包版本为 0.6.0；2026-10-14 经用户确认同步版本及项目文档，提交为 0.6.1（本次版本提交），不改写此前测量版本。用户将 S3 的扫描验收改为 **50 MB → 100 MB → 500 MB**（十进制 MB）；原先的 1–10 GB 目标不作为本次验收。S0 保持明确暂停；本次只做 S3 正确性和资源配额验收，没有耗时对照、RSS、GUI 帧时间或加速比测量。
+
+### 22.1 实现与原理
+
+新增 `src/engine/sparse/` 和独立 `examples/sparse_index.rs`，GUI、默认 CLI 和两个旧后端不切换到原型。复用旧 Indexed 的私有快照、64 KiB Reader、UTF-8/转义/代理对规则以及 S2 定位读取与可取消 I/O 准入，避免再加载完整文本或 Value。新增的数字扫描保持原有严格语法及任意精度数字的原文范围，不将数字转换为浮点数。
+
+扫描器以受预算约束的显式栈保存最多 127 层容器，不通过递归调用持有整棵树。数组标量扫描结束即丢弃工作状态；只把容器目录和稀疏检查点写入临时索引。数组在累计 1024 个元素或距离上一检查点约 1 MiB 时，于下一个合法元素起点记录检查点。一个巨大元素仍需完整扫描，字节阈值不能强行切断值。定位从前方检查点恢复扫描，只解析目标附近的范围；容器通过源偏移查询磁盘目录。
+
+对象字段目录也落盘：固定 65,536 个磁盘哈希桶，碰撞链及字段顺序链都存储在磁盘，不建立无限驻留的键表或去重 HashMap。键只保留快照原文范围，流式解码后计算哈希；哈希匹配仍按解码字符比较，因此 `"z"` 与 `"\u007a"` 视作同一键。重复出现时原位置和顺序链保留，只更新字段值范围；未完成的对象不发布。旧值对应的容器记录可能留在临时索引中，计入磁盘配额。
+
+临时格式使用显式小端编码：80 字节头部（magic、格式/语义版本、完成状态、源长度和根元信息），每桶 16 字节，每条容器/检查点/字段记录 104 字节，包含校验值。记录偏移、源范围、类型、链顺序和会话校验阻止错误引用；校验用于发现损坏，不是密码学身份认证。只有完整严格校验并写入完成头后才返回 SparseIndex。该文件不能跨进程复用，持久 manifest、恢复和强源身份验证属于 S4。
+
+公共原型支持 JSON Pointer、字段查找、按序子节点页（每页 1–256 项）和原文范围流式输出。节点带会话身份，跨会话引用拒绝；页面分配由持有者计费。路径/单个查找键限 16 KiB，超长键仍可扫描、去重及按字段序号访问。`--raw` 输出原始范围，容器中的重复键和原始格式保留；不替代旧后端的规范化复制/导出，也不宣称支持 JSONPath。
+
+扫描缓冲、显式栈、页面和工作区进入共享内存账本，快照、索引桶和追加记录进入磁盘账本；配额不足或取消明确报错，失败与会话关闭释放额度及临时文件。Unix 临时文件创建后解除路径，Windows 使用独占句柄和 DELETE_ON_CLOSE。系统调用已阻塞时仍无法强制抢占。
+
+### 22.2 实际自动验证
+
+macOS/arm64、Rust 1.99.0，执行时为 0.6.0 S3 工作区。全部目标 **89 项测试**通过（48 库、34 主程序、4 集成、3 生成器），新增 14 项 S3 测试；严格 Clippy（`-D warnings`）、格式检查通过，Release `sparse_index` example 构建成功；另通过 5 项 CLI 检查（文档中的原文输出、特殊 Pointer、非法 Pointer、内存/磁盘配额失败退出）。新增覆盖：
+
+- 数组首/中/末及跨检查点分页、嵌套容器、空容器和标量根。
+- 与旧内存/Indexed 后端比较特殊键、Unicode、重复键、首次字段顺序及大整数；另以种子 42 的 64 个小型嵌套输入逐节点核对旧内存后端。
+- 密集标量不建立逐元素记录；10,000 个唯一字段、超过 1 MiB 的键及重复键、2 MiB 字符串、跨 64 KiB UTF-8/代理对。
+- 尾部错误、截断、非法转义/UTF-8/数字，127 层支持及更深结构的明确资源错误。
+- 扫描/导航取消、内存/磁盘不足和索引增长超限，页面引用计费、源替换后快照一致性、过期会话及损坏头部/记录/顺序链。
+
+以下六次 CLI 扫描与定位均成功，采用同一个 **1 MiB（1,048,576 字节）受管理内存上限、1 GiB 磁盘上限**；每个进程重新构建快照/索引，验证根元素总数和首/中/末元素的完整原文内容，关闭后账本内存与磁盘归零。每个组合只运行一次，是正确性/配额验收，不是统计性能基准；OS 缓存未控制。大样本与生成规则核对，旧后端语义对照使用上述小型可解析输入。
+
+| 结构 | 文件字节数 | 元素数 | 临时索引字节数 | 受管理内存峰值（字节） | 受管理磁盘峰值（字节） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 定长字符串数组 | 50,000,000 | 49,999 | 1,053,856 | 86,240 | 51,053,856 |
+| 定长字符串数组 | 100,000,000 | 99,999 | 1,058,952 | 86,240 | 101,058,952 |
+| 定长字符串数组 | 500,000,000 | 499,999 | 1,099,616 | 86,240 | 501,099,616 |
+| 密集数字数组 | 50,000,000 | 6,388,888 | 1,697,720 | 86,240 | 51,697,720 |
+| 密集数字数组 | 100,000,000 | 12,345,678 | 2,302,688 | 86,240 | 102,302,688 |
+| 密集数字数组 | 500,000,000 | 56,790,123 | 6,816,600 | 86,240 | 506,816,600 |
+
+受管理峰值是 BudgetManager 的应用分配账本，不是总进程内存：线程栈、allocator、标准库/CLI 参数与输出缓冲、OS 页缓存等不等同于已精确计量。该结果不外推到全部结构或 GUI，也不与历史 Windows 工作集数据直接比较。宽对象和密集容器的磁盘索引可能随字段/容器数显著增长，超配额时失败；不能按这两种数组的索引大小预测所有文件。
+
+### 22.3 本地复现
+
+验收时本地生成器使用固定内容（脚本未纳入本次提交，下方提供等价生成命令）：数字为从 0 开始的连续整数；字符串为序号、空格及 x 填充，原文值为 999 字节；末尾 JSON 空白补齐精确文件大小。不依赖随机数。样本及 `.log` 只保存在被忽略的 `target/s3-acceptance/`，不提交 JSON。
+
+```sh
+python3 - <<'PYGEN'
+from pathlib import Path
+out = Path("target/s3-acceptance")
+out.mkdir(parents=True, exist_ok=True)
+for shape in ["strings", "numbers"]:
+    for mb in [50, 100, 500]:
+        size = mb * 1_000_000
+        with (out / f"{shape}-{mb}mb.json").open("wb", buffering=1024*1024) as f:
+            f.write(b"[")
+            count = 0
+            if shape == "strings":
+                count = (size - 1) // 1000
+                for i in range(count):
+                    prefix = f"{i} ".encode()
+                    f.write((b"," if i else b"") + b'"' + prefix + b"x"*(997-len(prefix)) + b'"')
+            else:
+                while True:
+                    chunk = ("," if count else "") + ",".join(str(i) for i in range(count, count+10_000))
+                    if f.tell() + len(chunk) + 1 > size: break
+                    f.write(chunk.encode()); count += 10_000
+                while True:
+                    value = ("," if count else "") + str(count)
+                    if f.tell() + len(value) + 1 > size: break
+                    f.write(value.encode()); count += 1
+            f.write(b"]")
+            remaining = size - f.tell()
+            while remaining:
+                n = min(remaining, 64*1024)
+                f.write(b" "*n); remaining -= n
+PYGEN
+cargo build --release --offline --locked --example sparse_index
+# 对每种结构按 50、100、500 MB 递增运行；用上表对应元素数替换 N。
+target/release/examples/sparse_index target/s3-acceptance/strings-50mb.json --memory-mib 1 --disk-mib 1024 --expect-count 49999 --check-array
+target/release/examples/sparse_index target/s3-acceptance/numbers-500mb.json --memory-mib 1 --disk-mib 1024 --expect-count 56790123 --check-array
+# 定位单个值并流式输出原文；JSON Pointer 也支持嵌套字段。
+target/release/examples/sparse_index target/s3-acceptance/numbers-50mb.json --memory-mib 1 --pointer /6388887 --raw
+cargo test --offline --locked --all-targets
+cargo clippy --offline --locked --all-targets -- -D warnings
+```
+
+样本 SHA-256（对应本次验收输入，不改写历史样本版本）：
+
+| 样本 | SHA-256 |
+| --- | --- |
+| strings-50mb | `9e40b4ee0ee5695a4d1a1f185e19db1027f49a359e5227f340d0e6f9137ca0ee` |
+| strings-100mb | `c9205d1860fdf931f02b5e2dbe72081f007b2bcc43353280d03b3f0c9d515a83` |
+| strings-500mb | `a377a9c6260dddbb18db2db290bf0b7435f0dcdc8ebdf4eeaee1c6e6329fc18f` |
+| numbers-50mb | `994dd90072c7264b9c416a204dcd46fb4b815b10b8fc17108b05e0d1fe50dad0` |
+| numbers-100mb | `9512e68848002796816ec05f9e68fbb229cb02c0594c374a6808a853a6e490ba` |
+| numbers-500mb | `523895e74ed4df27f9f0ebca3c00bdfd19d687b58778bc36c5b8f4e8842c7c9d` |
+
+### 22.4 剩余限制与下一阶段
+
+本次完成用户调整范围内的 CLI 自动门槛。Windows/Linux/Intel Mac 实机未验收，GUI 未迁移，1–10 GB 未执行；S0 暂停不变。索引仅为临时私有格式，尚无持久复用/恢复、渐进首屏、搜索、JSONPath 执行或可淘汰的 L2 热页缓存。数组检查点链和对象按序页面的起始游标定位仍可能线性读取目录；磁盘哈希碰撞多时查找退化，取消可终止但不承诺固定定位延迟。下一阶段为 S4 渐进打开及持久缓存，S5–S7 再迁移 GUI 树、搜索和查询。本次提交为 0.6.1，不创建新标签、不推送，未重新打包 App。
+
+2026-10-14 提交前重新执行 89 项全目标测试、严格 Clippy、格式及差异检查通过（测试与 Clippy 执行时版本仍为 0.6.0）；更新为 0.6.1 后，`cargo check --offline --locked --all-targets`、格式及差异检查通过，Cargo.toml/Cargo.lock 版本一致。版本更新未改动功能或依赖，未重复六组样本验收，不新增性能测量，也未重新构建 Release App。
