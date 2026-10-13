@@ -1,8 +1,8 @@
-# FerrisJson 0.4.0 大文件优化：实现步骤与原理
+# FerrisJson 大文件优化记录：0.4.0–0.4.1
 
 本文记录已经实现的第一阶段优化：在保留完整 `serde_json::Value` 和现有查询语义的前提下，压缩附加索引、减少字符串复制及临时分配，并将检索移出界面线程。
 
-记录日期：2026-10-12。实现与版本提交为 `c9f0415`（0.4.0）；对照版本为 `455403f`（0.3.5）。未来的大文件按需解析方案见 [todo.md](../todo.md)，不属于本文已经实现的功能。
+更新日期：2026-10-13，当前版本 0.4.1。第 1–13 节保留 2026-10-12 的第一阶段记录：实现与版本提交为 `c9f0415`（0.4.0），对照版本为 `455403f`（0.3.5）。第 14 节记录 0.4.1 的源文本释放和 Windows 内存基准；原始测量时包版本仍为 0.4.0，报告中的版本号保留原值，不改写历史样本。未来的大文件按需解析方案见 [todo.md](../todo.md)，不属于本文已经实现的功能。
 
 ## 1. 原实现为什么慢、为什么占内存
 
@@ -273,3 +273,57 @@ cargo run --release --locked --example package
 - 复制与导出仍可能创建完整格式化 String；树行缓存也只限制条目数。
 
 下一阶段应评估原文件字节范围索引、按需子树解析、具有字节预算的缓存，以及与这种存储模型兼容的查询后端。具体待办和验收条件统一维护在 [todo.md](../todo.md)。
+
+## 14. 0.4.1 — 释放源文本与 Windows 内存基准（2026-10-13）
+
+本增量只实施内存基准入口和提前释放源文本。`Document::parse_owned(String)` 先保存原始字节数，沿用 serde_json 和 UTF-8 BOM 处理，得到完整 Value 后显式 `drop(text)`，随后调用 `from_value` 统计节点并构建索引。文件、粘贴/剪贴板、标准输入和 CLI 加载均使用该入口。完整 Value 不借用输入文本，所以释放源文本不影响后续导航、搜索、查询和导出。
+
+历史 0.4.0 的流程在建索引期间同时持有源文本、Value 和索引；现在源文本只与解析阶段的 Value 重叠。读取和解析阶段仍需要完整源文本，本改动不等同于流式解析。旧文档在新文档加载期间的重叠、粘贴框保存的文本及剪贴板副本不在本次优化范围内。
+
+### 14.1 复现
+
+在仓库根目录执行（Windows PowerShell 或 PowerShell 7）：
+
+```powershell
+./scripts/measure-memory.ps1 -File examples/sample.json -Runs 3 -Output target/memory-benchmark-small.json
+./scripts/measure-memory.ps1 -File random_300MiB.json -Runs 3 -Output target/memory-benchmark-300MiB.json
+```
+
+如果没有原始大文件，可先用现有流式生成器创建固定种子的另一份输入，然后将其作为新的基准数据集；其结果不能与不同 SHA-256 的原文件直接视为同输入比较：
+
+```powershell
+cargo run --release --offline --locked --example generate_json -- 300MiB target/benchmark-seed42.json 42
+./scripts/measure-memory.ps1 -File target/benchmark-seed42.json -Runs 3 -Output target/memory-benchmark-seed42.json
+```
+
+脚本构建 Release example，每次启动独立子进程，交替运行 `retain` 和 `release`，默认各三次。两种模式使用同一份代码、解析器和索引构造；`retain` 显式保持源文本到索引完成，模拟旧 GUI 加载时的生命周期，随后也释放文本；`release` 在索引前释放文本，模拟新生命周期。这是控制变量对照，不是分别编译历史提交和当前 GUI 的测量。
+
+报告记录文件字节数、SHA-256、节点数、节点结构体大小/容量、平台、架构、Rust 版本、处理器标识、逻辑处理器数、基准所在 Git 基础提交，以及读取、解析、源文本释放、统计节点与建索引、初始预览的耗时。新版入口还报告 nodes 与 children 两个数组的容量字节总数；它不包含 Value、键表、分配器和 GUI，不能当作总内存。
+
+Windows 内存来自当前进程的 `GetProcessMemoryInfo`：工作集、峰值工作集、私有提交量和峰值进程提交量。按阶段保存快照，并报告加载完成后及进程峰值的三次中位数/最小值/最大值。峰值由系统进程计数器提供，不依赖定时采样是否抓到瞬时峰值。Windows 工作集口径不应直接与历史 macOS RSS 数字比较。非 Windows 的 Rust example 可输出耗时，但内存字段明确标记不可用；PowerShell 汇总脚本只支持 Windows。
+
+总耗时包括阶段内存计数器调用、源文本释放和初始预览，统计节点与建索引暂为合并阶段。操作系统文件缓存不清空，首次样本不宣称是冷打开。测量对象是文档引擎，不包含 GUI、字体、展开状态/可见行、文档切换、搜索、JSONPath 或导出；这些仍在 TODO 的完整 P0 基准范围内。加载完成后的快照是文档仍存活时的即时工作集，不是长期空闲后的采样。
+
+### 14.2 本机结果
+
+平台为 Windows/x86_64，Rust 1.99.0，Release，AMD64 Family 25 Model 116 Stepping 1 / AuthenticAMD，16 个逻辑处理器。使用原工作区 `random_300MiB.json`：314,572,800 字节，21,409,599 节点，SHA-256 `FBDF8FEC8D25BA0C33245DB9AC6DBCD59F2D2B84B22728E30BA136C939BF9599`。原始生成种子未知，文件本身未修改或加入 Git。
+
+以下结果来自单独运行的一组三次对照；前一轮与编译重叠的试跑不作为正式结果。两种模式的 nodes 数组均为 1,370,214,336 字节，仅结构数组就已占据大量空间。
+
+| 指标（三次中位数） | retain：索引后释放 | release：索引前释放 |
+| --- | ---: | ---: |
+| 峰值工作集 | 5,752.90 MiB | 5,453.89 MiB |
+| 加载完成后工作集 | 5,453.82 MiB | 5,453.89 MiB |
+| 峰值进程提交量 | 5,930.16 MiB | 5,630.74 MiB |
+| 文件读取 | 83.62 ms | 82.30 ms |
+| Value 解析 | 3,956.47 ms | 3,979.34 ms |
+| 统计节点与建索引 | 1,494.29 ms | 1,527.67 ms |
+| 初始根节点预览 | 1.19 ms | 0.95 ms |
+| 引擎加载总耗时 | 5,523.68 ms | 5,600.80 ms |
+| 总耗时最小–最大 | 5,515.23–5,660.48 ms | 5,575.48–5,674.24 ms |
+
+峰值工作集减少约 **299.01 MiB（5.20%）**，峰值提交量减少约 299.41 MiB。稳定文档存储没有改变，所以加载完成后的占用基本相同。总耗时中位数增加约 1.4%，两组范围有重叠，本次没有证据证明打开速度提升。
+
+小样例已完成三次对照，规模较小，内存差异只有计数器/分配噪声，不据此计算百分比收益。原始大文件样本保存在 [memory-300MiB-windows.json](benchmarks/memory-300MiB-windows.json)，小样例样本保存在 [memory-small-windows.json](benchmarks/memory-small-windows.json)。大文件报告生成后，example 只补充了结构数组容量字段，已有耗时/内存采样逻辑未改变，因此该旧报告只含节点数组容量。
+
+验证：`cargo fmt --check`、`cargo test --offline --locked --all-targets`（32 项主程序、3 项生成器、11 项 example 引用的文档测试）、Clippy 全部目标及 Windows Release 主程序构建通过。Release CLI 另检查了文件读取、Unicode JSONPath、大整数、BOM、标准输入和无效 JSON 的退出码/位置错误。自动测试覆盖特殊路径、对象顺序、查询/搜索及加载失效旧结果。完整 GUI 大文件内存和人工交互验收仍需另测。

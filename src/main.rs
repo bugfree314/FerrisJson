@@ -95,7 +95,7 @@ fn run() -> Result<(), String> {
             )
             .map_err(|e| format!("Cannot open file: {e}"))?,
         };
-        let doc = Document::parse(&text)?;
+        let doc = Document::parse_owned(text)?;
         if let Some(path) = get {
             println!(
                 "{}",

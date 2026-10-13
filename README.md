@@ -1,6 +1,6 @@
 # FerrisJson
 
-当前版本：**0.4.0**。
+当前版本：**0.4.1**。
 
 <img src="assets/FerrisJson.png" alt="FerrisJson 图标：花括号中的橙色螃蟹" width="96" height="96">
 
@@ -11,6 +11,8 @@
 打开文件或粘贴 JSON，在左侧浏览结构，右侧同时查看选中值和查询结果。数据解析、搜索与查询在本地完成，无需账号。
 
 ## 功能
+
+0.4.1 在解析后、建索引前释放源文本，降低大文件加载峰值，并新增可重复的 Windows 文档引擎内存基准。300 MiB / 约 2,141 万节点文件的三次对照中，峰值工作集约从 5,753 MiB 降至 5,454 MiB（减少 299 MiB / 5.2%）；加载完成后的占用基本不变，未测出打开速度提升。这是文档引擎测量，不包含完整 GUI。详细结果见 [优化记录](docs/performance-optimization.md)，版本历史和后续计划见 [TODO](todo.md)。
 
 - **树形浏览**：对象、数组展开与折叠，键和值按字符串、数字、布尔、null、对象、数组类型配色。
 - **全文搜索**：支持正反向查找、大小写切换、正则表达式，以及仅搜索键或值；匹配折叠节点时自动展开并定位。输入停止 200 ms 后在后台检索，Enter 可立即执行；新搜索会取消旧搜索。
@@ -194,6 +196,16 @@ cargo clippy --offline --all-targets -- -D warnings
 ```
 
 首次使用 `--offline` 前需要下载依赖。测试覆盖特殊键名、Unicode、大整数、JSONPath、搜索方向、Vim 计数与历史、预览截断、后台任务替换与取消、搜索防抖，以及界面分隔条等交互。
+
+Windows 文档引擎内存基准（Release、每种模式独立进程运行三次）：
+
+```powershell
+./scripts/measure-memory.ps1 -File random_300MiB.json -Runs 3
+```
+
+报告默认写入 `target/memory-benchmark.json`，包含阶段耗时、峰值/加载完成后的工作集和私有内存、中位数及最小/最大值。`retain` 模拟旧加载流程，`release` 在解析后释放源文本再建索引。测量范围和复现说明见 [大文件优化说明](docs/performance-optimization.md)。
+
+每次带版本号的提交必须同步更新 Cargo.toml、Cargo.lock、README、优化记录和 TODO，注明实际变化、验证结果、测量范围及剩余事项；项目协作规则见 [AGENTS.md](AGENTS.md)。
 
 ## 当前限制
 

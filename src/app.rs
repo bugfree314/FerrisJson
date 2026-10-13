@@ -196,7 +196,7 @@ impl Viewer {
         std::thread::spawn(move || {
             let result = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Cannot open {}: {e}", path.display()))
-                .and_then(|text| Document::parse(&text))
+                .and_then(Document::parse_owned)
                 .map(|doc| (doc, path.display().to_string(), Some(path)));
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -213,7 +213,7 @@ impl Viewer {
         self.error = None;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Document::parse(&text).map(|doc| (doc, source, None)));
+            let _ = tx.send(Document::parse_owned(text).map(|doc| (doc, source, None)));
             ctx.request_repaint();
         });
     }

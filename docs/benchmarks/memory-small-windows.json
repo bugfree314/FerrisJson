@@ -1,0 +1,502 @@
+{
+  "processor": "AMD64 Family 25 Model 116 Stepping 1, AuthenticAMD",
+  "cache_policy": "OS cache uncontrolled; fresh child process per sample; alternating mode order",
+  "samples": [
+    {
+      "file": "C:\\Users\\datea\\Desktop\\rust-json-viewer\\examples\\sample.json",
+      "mode": "retain",
+      "bytes": 542,
+      "nodes": 28,
+      "node_size": 64,
+      "node_capacity_bytes": 1792,
+      "structure_capacity_bytes": 2008,
+      "os": "windows",
+      "arch": "x86_64",
+      "package_version": "0.4.0",
+      "debug_assertions": false,
+      "read_ms": 0.2337,
+      "parse_ms": 0.0242,
+      "release_ms": 0.0025,
+      "count_and_index_ms": 0.018600000000000002,
+      "preview_ms": 0.007700000000000001,
+      "total_ms": 0.29619999999999996,
+      "memory": {
+        "initial": {
+          "resident_bytes": 4366336,
+          "peak_resident_bytes": 4366336,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 708608
+        },
+        "after_read": {
+          "resident_bytes": 4493312,
+          "peak_resident_bytes": 4493312,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 708608
+        },
+        "after_parse": {
+          "resident_bytes": 4517888,
+          "peak_resident_bytes": 4517888,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 708608
+        },
+        "before_index": {
+          "resident_bytes": 4521984,
+          "peak_resident_bytes": 4521984,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 708608
+        },
+        "after_index": {
+          "resident_bytes": 4542464,
+          "peak_resident_bytes": 4542464,
+          "private_bytes": 700416,
+          "peak_commit_bytes": 708608
+        },
+        "after_source_drop": {
+          "resident_bytes": 4542464,
+          "peak_resident_bytes": 4542464,
+          "private_bytes": 700416,
+          "peak_commit_bytes": 708608
+        },
+        "ready": {
+          "resident_bytes": 4575232,
+          "peak_resident_bytes": 4575232,
+          "private_bytes": 712704,
+          "peak_commit_bytes": 712704
+        }
+      },
+      "run": 1
+    },
+    {
+      "file": "C:\\Users\\datea\\Desktop\\rust-json-viewer\\examples\\sample.json",
+      "mode": "release",
+      "bytes": 542,
+      "nodes": 28,
+      "node_size": 64,
+      "node_capacity_bytes": 1792,
+      "structure_capacity_bytes": 2008,
+      "os": "windows",
+      "arch": "x86_64",
+      "package_version": "0.4.0",
+      "debug_assertions": false,
+      "read_ms": 0.1656,
+      "parse_ms": 0.017900000000000003,
+      "release_ms": 9.999999999999999E-05,
+      "count_and_index_ms": 0.015099999999999999,
+      "preview_ms": 0.01,
+      "total_ms": 0.21680000000000002,
+      "memory": {
+        "initial": {
+          "resident_bytes": 4366336,
+          "peak_resident_bytes": 4366336,
+          "private_bytes": 688128,
+          "peak_commit_bytes": 700416
+        },
+        "after_read": {
+          "resident_bytes": 4493312,
+          "peak_resident_bytes": 4493312,
+          "private_bytes": 688128,
+          "peak_commit_bytes": 700416
+        },
+        "after_parse": {
+          "resident_bytes": 4517888,
+          "peak_resident_bytes": 4517888,
+          "private_bytes": 688128,
+          "peak_commit_bytes": 700416
+        },
+        "before_index": {
+          "resident_bytes": 4517888,
+          "peak_resident_bytes": 4517888,
+          "private_bytes": 688128,
+          "peak_commit_bytes": 700416
+        },
+        "after_index": {
+          "resident_bytes": 4538368,
+          "peak_resident_bytes": 4538368,
+          "private_bytes": 692224,
+          "peak_commit_bytes": 700416
+        },
+        "after_source_drop": {
+          "resident_bytes": 4538368,
+          "peak_resident_bytes": 4538368,
+          "private_bytes": 692224,
+          "peak_commit_bytes": 700416
+        },
+        "ready": {
+          "resident_bytes": 4575232,
+          "peak_resident_bytes": 4575232,
+          "private_bytes": 704512,
+          "peak_commit_bytes": 704512
+        }
+      },
+      "run": 1
+    },
+    {
+      "file": "C:\\Users\\datea\\Desktop\\rust-json-viewer\\examples\\sample.json",
+      "mode": "release",
+      "bytes": 542,
+      "nodes": 28,
+      "node_size": 64,
+      "node_capacity_bytes": 1792,
+      "structure_capacity_bytes": 2008,
+      "os": "windows",
+      "arch": "x86_64",
+      "package_version": "0.4.0",
+      "debug_assertions": false,
+      "read_ms": 0.156,
+      "parse_ms": 0.0162,
+      "release_ms": 9.999999999999999E-05,
+      "count_and_index_ms": 0.0141,
+      "preview_ms": 0.0063,
+      "total_ms": 0.2004,
+      "memory": {
+        "initial": {
+          "resident_bytes": 4370432,
+          "peak_resident_bytes": 4370432,
+          "private_bytes": 704512,
+          "peak_commit_bytes": 716800
+        },
+        "after_read": {
+          "resident_bytes": 4497408,
+          "peak_resident_bytes": 4497408,
+          "private_bytes": 704512,
+          "peak_commit_bytes": 716800
+        },
+        "after_parse": {
+          "resident_bytes": 4521984,
+          "peak_resident_bytes": 4521984,
+          "private_bytes": 704512,
+          "peak_commit_bytes": 716800
+        },
+        "before_index": {
+          "resident_bytes": 4521984,
+          "peak_resident_bytes": 4521984,
+          "private_bytes": 704512,
+          "peak_commit_bytes": 716800
+        },
+        "after_index": {
+          "resident_bytes": 4542464,
+          "peak_resident_bytes": 4542464,
+          "private_bytes": 708608,
+          "peak_commit_bytes": 716800
+        },
+        "after_source_drop": {
+          "resident_bytes": 4542464,
+          "peak_resident_bytes": 4542464,
+          "private_bytes": 708608,
+          "peak_commit_bytes": 716800
+        },
+        "ready": {
+          "resident_bytes": 4579328,
+          "peak_resident_bytes": 4579328,
+          "private_bytes": 720896,
+          "peak_commit_bytes": 720896
+        }
+      },
+      "run": 2
+    },
+    {
+      "file": "C:\\Users\\datea\\Desktop\\rust-json-viewer\\examples\\sample.json",
+      "mode": "retain",
+      "bytes": 542,
+      "nodes": 28,
+      "node_size": 64,
+      "node_capacity_bytes": 1792,
+      "structure_capacity_bytes": 2008,
+      "os": "windows",
+      "arch": "x86_64",
+      "package_version": "0.4.0",
+      "debug_assertions": false,
+      "read_ms": 0.1653,
+      "parse_ms": 0.0185,
+      "release_ms": 0.0011,
+      "count_and_index_ms": 0.0153,
+      "preview_ms": 0.0047,
+      "total_ms": 0.21509999999999999,
+      "memory": {
+        "initial": {
+          "resident_bytes": 4362240,
+          "peak_resident_bytes": 4362240,
+          "private_bytes": 692224,
+          "peak_commit_bytes": 704512
+        },
+        "after_read": {
+          "resident_bytes": 4489216,
+          "peak_resident_bytes": 4489216,
+          "private_bytes": 692224,
+          "peak_commit_bytes": 704512
+        },
+        "after_parse": {
+          "resident_bytes": 4513792,
+          "peak_resident_bytes": 4513792,
+          "private_bytes": 692224,
+          "peak_commit_bytes": 704512
+        },
+        "before_index": {
+          "resident_bytes": 4517888,
+          "peak_resident_bytes": 4517888,
+          "private_bytes": 692224,
+          "peak_commit_bytes": 704512
+        },
+        "after_index": {
+          "resident_bytes": 4538368,
+          "peak_resident_bytes": 4538368,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 704512
+        },
+        "after_source_drop": {
+          "resident_bytes": 4538368,
+          "peak_resident_bytes": 4538368,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 704512
+        },
+        "ready": {
+          "resident_bytes": 4571136,
+          "peak_resident_bytes": 4571136,
+          "private_bytes": 708608,
+          "peak_commit_bytes": 708608
+        }
+      },
+      "run": 2
+    },
+    {
+      "file": "C:\\Users\\datea\\Desktop\\rust-json-viewer\\examples\\sample.json",
+      "mode": "retain",
+      "bytes": 542,
+      "nodes": 28,
+      "node_size": 64,
+      "node_capacity_bytes": 1792,
+      "structure_capacity_bytes": 2008,
+      "os": "windows",
+      "arch": "x86_64",
+      "package_version": "0.4.0",
+      "debug_assertions": false,
+      "read_ms": 0.1332,
+      "parse_ms": 0.0166,
+      "release_ms": 0.0011,
+      "count_and_index_ms": 0.0135,
+      "preview_ms": 0.0047,
+      "total_ms": 0.1785,
+      "memory": {
+        "initial": {
+          "resident_bytes": 4362240,
+          "peak_resident_bytes": 4362240,
+          "private_bytes": 692224,
+          "peak_commit_bytes": 704512
+        },
+        "after_read": {
+          "resident_bytes": 4489216,
+          "peak_resident_bytes": 4489216,
+          "private_bytes": 692224,
+          "peak_commit_bytes": 704512
+        },
+        "after_parse": {
+          "resident_bytes": 4513792,
+          "peak_resident_bytes": 4513792,
+          "private_bytes": 692224,
+          "peak_commit_bytes": 704512
+        },
+        "before_index": {
+          "resident_bytes": 4517888,
+          "peak_resident_bytes": 4517888,
+          "private_bytes": 692224,
+          "peak_commit_bytes": 704512
+        },
+        "after_index": {
+          "resident_bytes": 4538368,
+          "peak_resident_bytes": 4538368,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 704512
+        },
+        "after_source_drop": {
+          "resident_bytes": 4538368,
+          "peak_resident_bytes": 4538368,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 704512
+        },
+        "ready": {
+          "resident_bytes": 4571136,
+          "peak_resident_bytes": 4571136,
+          "private_bytes": 708608,
+          "peak_commit_bytes": 708608
+        }
+      },
+      "run": 3
+    },
+    {
+      "file": "C:\\Users\\datea\\Desktop\\rust-json-viewer\\examples\\sample.json",
+      "mode": "release",
+      "bytes": 542,
+      "nodes": 28,
+      "node_size": 64,
+      "node_capacity_bytes": 1792,
+      "structure_capacity_bytes": 2008,
+      "os": "windows",
+      "arch": "x86_64",
+      "package_version": "0.4.0",
+      "debug_assertions": false,
+      "read_ms": 0.13329999999999997,
+      "parse_ms": 0.0172,
+      "release_ms": 9.999999999999999E-05,
+      "count_and_index_ms": 0.0094,
+      "preview_ms": 0.008,
+      "total_ms": 0.175,
+      "memory": {
+        "initial": {
+          "resident_bytes": 4370432,
+          "peak_resident_bytes": 4370432,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 708608
+        },
+        "after_read": {
+          "resident_bytes": 4497408,
+          "peak_resident_bytes": 4497408,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 708608
+        },
+        "after_parse": {
+          "resident_bytes": 4521984,
+          "peak_resident_bytes": 4521984,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 708608
+        },
+        "before_index": {
+          "resident_bytes": 4521984,
+          "peak_resident_bytes": 4521984,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 708608
+        },
+        "after_index": {
+          "resident_bytes": 4538368,
+          "peak_resident_bytes": 4538368,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 708608
+        },
+        "after_source_drop": {
+          "resident_bytes": 4538368,
+          "peak_resident_bytes": 4538368,
+          "private_bytes": 696320,
+          "peak_commit_bytes": 708608
+        },
+        "ready": {
+          "resident_bytes": 4575232,
+          "peak_resident_bytes": 4575232,
+          "private_bytes": 708608,
+          "peak_commit_bytes": 708608
+        }
+      },
+      "run": 3
+    }
+  ],
+  "measured_at": "2026-10-13T09:51:40.8081162+08:00",
+  "logical_processors": "16",
+  "summary": {
+    "retain": {
+      "read_ms": {
+        "min": 0.1332,
+        "median": 0.1653,
+        "max": 0.2337
+      },
+      "preview_ms": {
+        "min": 0.0047,
+        "median": 0.0047,
+        "max": 0.007700000000000001
+      },
+      "parse_ms": {
+        "min": 0.0166,
+        "median": 0.0185,
+        "max": 0.0242
+      },
+      "release_ms": {
+        "min": 0.0011,
+        "median": 0.0011,
+        "max": 0.0025
+      },
+      "count_and_index_ms": {
+        "min": 0.0135,
+        "median": 0.0153,
+        "max": 0.018600000000000002
+      },
+      "ready_resident_bytes": {
+        "min": 4571136,
+        "median": 4571136,
+        "max": 4575232
+      },
+      "ready_private_bytes": {
+        "min": 708608,
+        "median": 708608,
+        "max": 712704
+      },
+      "peak_resident_bytes": {
+        "min": 4571136,
+        "median": 4571136,
+        "max": 4575232
+      },
+      "total_ms": {
+        "min": 0.1785,
+        "median": 0.21509999999999999,
+        "max": 0.29619999999999996
+      },
+      "peak_commit_bytes": {
+        "min": 708608,
+        "median": 708608,
+        "max": 712704
+      }
+    },
+    "release": {
+      "read_ms": {
+        "min": 0.13329999999999997,
+        "median": 0.156,
+        "max": 0.1656
+      },
+      "preview_ms": {
+        "min": 0.0063,
+        "median": 0.008,
+        "max": 0.01
+      },
+      "parse_ms": {
+        "min": 0.0162,
+        "median": 0.0172,
+        "max": 0.017900000000000003
+      },
+      "release_ms": {
+        "min": 9.999999999999999E-05,
+        "median": 9.999999999999999E-05,
+        "max": 9.999999999999999E-05
+      },
+      "count_and_index_ms": {
+        "min": 0.0094,
+        "median": 0.0141,
+        "max": 0.015099999999999999
+      },
+      "ready_resident_bytes": {
+        "min": 4575232,
+        "median": 4575232,
+        "max": 4579328
+      },
+      "ready_private_bytes": {
+        "min": 704512,
+        "median": 708608,
+        "max": 720896
+      },
+      "peak_resident_bytes": {
+        "min": 4575232,
+        "median": 4575232,
+        "max": 4579328
+      },
+      "total_ms": {
+        "min": 0.175,
+        "median": 0.2004,
+        "max": 0.21680000000000002
+      },
+      "peak_commit_bytes": {
+        "min": 704512,
+        "median": 708608,
+        "max": 720896
+      }
+    }
+  },
+  "input_sha256": "CA071E9C6107EE73E6F962C3D3BAED9BA37EDA037D051B704644B90600A416D6",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "scope": "Document engine only; excludes GUI, fonts, tree rows, search, query, export and document switching",
+  "git_revision": "1b8740a1ef2b578714a687295567e9212913b616"
+}

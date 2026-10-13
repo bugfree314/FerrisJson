@@ -136,9 +136,19 @@ fn node_count(value: &Value) -> usize {
     }
 }
 impl Document {
+    #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_owned(text.to_owned())
+    }
+    /// Consume input so its allocation is released before the full index is built.
+    pub fn parse_owned(text: String) -> Result<Self, String> {
+        let bytes = text.len();
         let value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
             .map_err(|e| format!("Invalid JSON: {e}"))?;
+        drop(text);
+        Ok(Self::from_value(value, bytes))
+    }
+    pub fn from_value(value: Value, bytes: usize) -> Self {
         // Counting avoids geometric capacity growth for the two large index arrays.
         let count = node_count(&value);
         let mut index = IndexBuilder {
@@ -148,14 +158,19 @@ impl Document {
             key_ids: HashMap::new(),
         };
         index.index(&value, 0, None, 0);
-        Ok(Self {
+        Self {
             value,
             nodes: index.nodes,
-            bytes: text.len(),
+            bytes,
             children: index.children,
             keys: index.keys,
             key_ids: index.key_ids,
-        })
+        }
+    }
+    #[allow(dead_code, reason = "Used by the standalone memory benchmark")]
+    pub fn structure_capacity_bytes(&self) -> usize {
+        self.nodes.capacity() * std::mem::size_of::<Node>()
+            + self.children.capacity() * std::mem::size_of::<usize>()
     }
     pub fn at(&self, id: usize) -> &Value {
         let node = &self.nodes[id];
