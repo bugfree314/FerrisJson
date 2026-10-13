@@ -582,7 +582,7 @@ impl Viewer {
         self.matches = Vec::new();
         self.search_error = None;
         self.query_duration = None;
-        if self.term.is_empty() {
+        if self.term.is_empty() || !self.colors.live_search {
             self.search_due = None;
         } else {
             self.search_due = Some(Instant::now() + Duration::from_millis(200));
@@ -1143,10 +1143,17 @@ impl Viewer {
             ui.add_space(6.0);
             ui.separator();
             ui.horizontal(|ui| {
+                let live_changed = ui.checkbox(&mut self.colors.live_search, "Live search")
+                    .on_hover_text("Search after typing pauses for 200 ms. When off, press Enter to search.")
+                    .changed();
+                if live_changed {
+                    self.save_colors();
+                }
                 let mut changed = ui
                     .toggle_value(&mut self.case, "Aa")
                     .on_hover_text("Case sensitive")
                     .changed();
+                changed |= live_changed;
                 changed |= ui
                     .toggle_value(&mut self.regex, ".*")
                     .on_hover_text("Regular expression")
@@ -1783,12 +1790,18 @@ mod tests {
     #[test]
     fn search_input_is_debounced_and_clearing_cancels_pending_work() {
         let mut app = loaded();
+        app.colors.live_search = true;
         let ctx = egui::Context::default();
         app.search_worker = Some(Worker::new(ctx.clone()));
         app.term = "email".into();
         app.schedule_search(&ctx);
         assert!(app.search_due.unwrap() > Instant::now());
         assert!(!app.search_worker.as_ref().unwrap().busy);
+        app.colors.live_search = false;
+        app.schedule_search(&ctx);
+        assert!(app.search_due.is_none());
+        assert!(!app.search_worker.as_ref().unwrap().busy);
+        app.colors.live_search = true;
         app.term.clear();
         app.schedule_search(&ctx);
         assert!(app.search_due.is_none());
@@ -1798,6 +1811,27 @@ mod tests {
         app.search_due = Some(Instant::now());
         wait_operations(&mut app, &ctx);
         assert_eq!(app.matches.len(), 2);
+    }
+    #[test]
+    fn manual_search_waits_for_execution_and_edits_cancel_old_results() {
+        let mut app = loaded();
+        let ctx = egui::Context::default();
+        app.search_worker = Some(Worker::new(ctx.clone()));
+        assert!(!app.colors.live_search);
+        app.term = "email".into();
+        app.scope = SearchScope::Keys;
+        app.schedule_search(&ctx);
+        wait_operations(&mut app, &ctx);
+        assert!(app.matches.is_empty());
+        assert!(app.query_duration.is_none());
+        app.search();
+        wait_operations(&mut app, &ctx);
+        assert_eq!(app.matches.len(), 2);
+        app.term = "name".into();
+        app.schedule_search(&ctx);
+        wait_operations(&mut app, &ctx);
+        assert!(app.matches.is_empty());
+        assert!(app.query_duration.is_none());
     }
     #[test]
     fn search_reveals_match_and_collapsing_preserves_visible_selection() {

@@ -146,6 +146,7 @@ pub struct ColorSettings {
     pub wrap_results: bool,
     pub low_memory_load: bool,
     pub indexed_files: bool,
+    pub live_search: bool,
     pub custom_dark: Palette,
     pub custom_light: Palette,
 }
@@ -158,6 +159,7 @@ impl Default for ColorSettings {
             wrap_results: true,
             low_memory_load: false,
             indexed_files: false,
+            live_search: false,
             custom_dark: Palette::builtin(Preset::Ferris, true),
             custom_light: Palette::builtin(Preset::Ferris, false),
         }
@@ -227,6 +229,7 @@ mod tests {
             preset: Preset::Solarized,
             low_memory_load: true,
             indexed_files: true,
+            live_search: true,
             ..Default::default()
         };
         let dark = settings.active();
@@ -245,6 +248,12 @@ mod tests {
         assert!(copy.wrap_values && copy.wrap_results);
         assert!(copy.low_memory_load);
         assert!(copy.indexed_files);
+        assert!(copy.live_search);
+        assert!(
+            !serde_json::from_str::<ColorSettings>("{}")
+                .unwrap()
+                .live_search
+        );
         assert!(
             !serde_json::from_str::<ColorSettings>("{}")
                 .unwrap()

@@ -192,7 +192,8 @@ pub fn color_editor(
                     let wrap_results = settings.wrap_results;
                     let low_memory_load = settings.low_memory_load;
                     let indexed_files = settings.indexed_files;
-                    *settings = ColorSettings { dark, wrap_values, wrap_results, low_memory_load, indexed_files, ..Default::default() }; changed = true;
+                    let live_search = settings.live_search;
+                    *settings = ColorSettings { dark, wrap_values, wrap_results, low_memory_load, indexed_files, live_search, ..Default::default() }; changed = true;
                 }
                 if ui.button("Save settings").clicked() {
                     match settings.save() { Ok(()) => { *notice = "Color settings saved".into(); *error = None; }, Err(e) => *error = Some(e) }
