@@ -1015,6 +1015,23 @@ impl Viewer {
             self.vim.cancel();
             return;
         }
+        if !ctx.input(|i| i.modifiers.ctrl || i.modifiers.alt || i.modifiers.command)
+            && ctx.input_mut(|i| {
+                let pressed = i
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if t == "."));
+                if pressed {
+                    i.events
+                        .retain(|e| !matches!(e, egui::Event::Text(t) if t == "."));
+                }
+                pressed
+            })
+        {
+            self.vim.record(".");
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("query_field")));
+            return;
+        }
         if let Some(text) = ctx.input_mut(|i| {
             i.events.iter_mut().find_map(|e| {
                 if let egui::Event::Paste(t) = e {
@@ -1377,6 +1394,7 @@ impl Viewer {
                 }
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
+                        .id(egui::Id::new("query_field"))
                         .font(egui::TextStyle::Monospace)
                         .hint_text("$.users[*].name or $.users[?(@.active)]")
                         .desired_width((ui.available_width() - 270.0).max(100.0)),
@@ -2346,6 +2364,43 @@ mod tests {
             &ctx,
         );
         assert_eq!(app.selected, first);
+    }
+    #[test]
+    fn dot_focuses_jsonpath_without_inserting_and_preserves_normal_typing() {
+        let ctx = egui::Context::default();
+        let mut app = loaded();
+        app.query = "$.users".into();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1120.0, 760.0));
+        let frame = |app: &mut Viewer, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+        };
+        frame(&mut app, vec![]);
+        app.vim.feed('3');
+        frame(&mut app, vec![egui::Event::Text(".".into())]);
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(egui::Id::new("query_field"))
+        );
+        assert_eq!(app.query, "$.users");
+        assert!(app.vim.pending.is_empty());
+        // Once focused, the same character must go through TextEdit normally.
+        frame(&mut app, vec![egui::Event::Text(".".into())]);
+        assert_eq!(app.query.matches('.').count(), 2);
+        assert_eq!(app.query.len(), "$.users".len() + 1);
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("query_field")));
+        app.help = true;
+        frame(&mut app, vec![egui::Event::Text(".".into())]);
+        assert_ne!(
+            ctx.memory(|m| m.focused()),
+            Some(egui::Id::new("query_field"))
+        );
     }
     #[test]
     fn search_triggers_do_not_become_search_text_and_escape_closes_help() {

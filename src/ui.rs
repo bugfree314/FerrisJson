@@ -130,6 +130,7 @@ pub fn cheatsheet(ctx: &egui::Context, open: &mut bool, palette: Palette) {
                     }); ui.add_space(8.0);
                 }
                 ui.label(RichText::new("JSONPath").strong());
+                ui.label("Press . outside text fields to focus JSONPath. The shortcut does not insert a dot.");
                 ui.monospace("$.users[*].name   $..email   $.users[?(@.active == true)]");
                 ui.label("Go / Enter runs JSONPath. The lower inspector keeps results; the upper always previews your selection. Drag the divider to resize.");
                 ui.horizontal_wrapped(|ui| { for kind in ["string", "number", "boolean", "null", "object", "array"] {
