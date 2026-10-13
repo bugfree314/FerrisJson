@@ -190,7 +190,8 @@ pub fn color_editor(
                     let dark = settings.dark;
                     let wrap_values = settings.wrap_values;
                     let wrap_results = settings.wrap_results;
-                    *settings = ColorSettings { dark, wrap_values, wrap_results, ..Default::default() }; changed = true;
+                    let low_memory_load = settings.low_memory_load;
+                    *settings = ColorSettings { dark, wrap_values, wrap_results, low_memory_load, ..Default::default() }; changed = true;
                 }
                 if ui.button("Save settings").clicked() {
                     match settings.save() { Ok(()) => { *notice = "Color settings saved".into(); *error = None; }, Err(e) => *error = Some(e) }

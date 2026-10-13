@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$File,
     [ValidateRange(3, 100)][int]$Runs = 3,
+    [ValidateSet("open", "switch", "tree")][string]$Scenario = "open",
     [string]$Output = "target/memory-benchmark.json"
 )
 $ErrorActionPreference = "Stop"
@@ -13,9 +14,15 @@ if ($LASTEXITCODE -ne 0) { throw "Benchmark build failed" }
 $binaryName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "memory_bench.exe" } else { "memory_bench" }
 $binary = Join-Path "target/release/examples" $binaryName
 $samples = @()
+$modePair = switch ($Scenario) {
+    "switch" { @("switch-normal", "switch-low") }
+    "tree" { @("tree") }
+    default { @("retain", "release") }
+}
 for ($iteration = 0; $iteration -lt $Runs; $iteration++) {
     # Alternate order to reduce systematic file-cache/order bias; no cache flush is attempted.
-    $modes = if ($iteration % 2 -eq 0) { @("retain", "release") } else { @("release", "retain") }
+    $modes = @($modePair)
+    if ($iteration % 2 -ne 0) { [array]::Reverse($modes) }
     foreach ($mode in $modes) {
         Write-Host "Run $($iteration + 1)/$Runs : $mode"
         $result = & $binary $inputFile $mode
@@ -33,19 +40,17 @@ function Get-Stats($values) {
     @{ median = $median; min = $ordered[0]; max = $ordered[-1] }
 }
 $summary = @{}
-foreach ($mode in @("retain", "release")) {
+foreach ($mode in $modePair) {
     $group = @($samples | Where-Object mode -eq $mode)
     $summary[$mode] = @{
-        total_ms = Get-Stats @($group | ForEach-Object total_ms)
-        read_ms = Get-Stats @($group | ForEach-Object read_ms)
-        parse_ms = Get-Stats @($group | ForEach-Object parse_ms)
-        release_ms = Get-Stats @($group | ForEach-Object release_ms)
-        count_and_index_ms = Get-Stats @($group | ForEach-Object count_and_index_ms)
-        preview_ms = Get-Stats @($group | ForEach-Object preview_ms)
         peak_resident_bytes = Get-Stats @($group | ForEach-Object { $_.memory.ready.peak_resident_bytes })
         ready_resident_bytes = Get-Stats @($group | ForEach-Object { $_.memory.ready.resident_bytes })
         peak_commit_bytes = Get-Stats @($group | ForEach-Object { $_.memory.ready.peak_commit_bytes })
         ready_private_bytes = Get-Stats @($group | ForEach-Object { $_.memory.ready.private_bytes })
+    }
+    foreach ($field in @("total_ms", "read_ms", "parse_ms", "release_ms", "count_and_index_ms", "preview_ms", "previous_load_ms", "previous_release_ms", "new_load_ms", "switch_ms", "rows_ms", "search_all_ms")) {
+        $values = @($group | ForEach-Object { $_.$field } | Where-Object { $null -ne $_ })
+        if ($values.Count -gt 0) { $summary[$mode][$field] = Get-Stats $values }
     }
 }
 $report = @{
@@ -54,9 +59,15 @@ $report = @{
     processor = $env:PROCESSOR_IDENTIFIER
     logical_processors = $env:NUMBER_OF_PROCESSORS
     git_revision = (& git rev-parse HEAD | Out-String).Trim()
+    working_tree_modified = [bool](& git status --porcelain --untracked-files=no | Out-String).Trim()
+    scenario = $Scenario
     input_sha256 = (Get-FileHash -LiteralPath $inputFile -Algorithm SHA256).Hash
     cache_policy = "OS cache uncontrolled; fresh child process per sample; alternating mode order"
-    scope = "Document engine only; excludes GUI, fonts, tree rows, search, query, export and document switching"
+    scope = switch ($Scenario) {
+        "switch" { "Document switching engine; same file loaded twice; no active queries or GUI" }
+        "tree" { "Engine with all nodes expanded and regex .* matching all nodes; excludes GUI/JSONPath" }
+        default { "Document engine only; excludes GUI, fonts, tree rows, search, query, export and document switching" }
+    }
     summary = $summary
     samples = $samples
 }

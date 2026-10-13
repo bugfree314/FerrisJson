@@ -2,10 +2,87 @@
 #[allow(dead_code)]
 #[path = "../src/document.rs"]
 mod document;
+#[path = "../src/loading.rs"]
+mod loading;
 
-use document::Document;
+use document::{Document, SearchScope};
 use serde_json::json;
-use std::{hint::black_box, time::Instant};
+use std::{hint::black_box, sync::Arc, time::Instant};
+
+fn switch(file: String, mode: String) -> Result<(), String> {
+    let total = Instant::now();
+    let started = Instant::now();
+    let old = Arc::new(Document::parse_owned(
+        std::fs::read_to_string(&file).map_err(|e| e.to_string())?,
+    )?);
+    let previous_load_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let previous_ready = memory();
+    let switch_started = Instant::now();
+    let started = Instant::now();
+    let retained = if mode == "switch-low" {
+        loading::release_previous(Some(old), || false, |_| {});
+        None
+    } else {
+        Some(old)
+    };
+    let previous_release_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let before_new = memory();
+    let started = Instant::now();
+    let new = Document::parse_owned(std::fs::read_to_string(&file).map_err(|e| e.to_string())?)?;
+    let new_load_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let after_new = memory();
+    black_box(&retained);
+    drop(retained);
+    black_box(new.preview(0));
+    println!(
+        "{}",
+        json!({
+            "file": file, "mode": mode, "bytes": new.bytes, "nodes": new.nodes.len(),
+            "node_size": std::mem::size_of::<document::Node>(),
+            "structure_capacity_bytes": new.structure_capacity_bytes(),
+            "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
+            "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
+            "previous_load_ms": previous_load_ms, "previous_release_ms": previous_release_ms,
+            "new_load_ms": new_load_ms, "switch_ms": switch_started.elapsed().as_secs_f64() * 1000.0,
+            "total_ms": total.elapsed().as_secs_f64() * 1000.0,
+            "memory": {"previous_ready": previous_ready, "before_new": before_new,
+                "after_new": after_new, "ready": memory()}
+        })
+    );
+    Ok(())
+}
+
+fn tree(file: String) -> Result<(), String> {
+    let total = Instant::now();
+    let doc = Document::parse_owned(std::fs::read_to_string(&file).map_err(|e| e.to_string())?)?;
+    let document_ready = memory();
+    let expanded = vec![true; doc.nodes.len()];
+    let started = Instant::now();
+    let rows = doc.visible(&expanded);
+    let rows_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let after_rows = memory();
+    let started = Instant::now();
+    let matches = doc.search(".*", false, true, SearchScope::All)?;
+    let search_all_ms = started.elapsed().as_secs_f64() * 1000.0;
+    black_box((&expanded, &rows, &matches));
+    println!(
+        "{}",
+        json!({
+            "file": file, "mode": "tree", "bytes": doc.bytes, "nodes": doc.nodes.len(),
+            "node_size": std::mem::size_of::<document::Node>(),
+            "structure_capacity_bytes": doc.structure_capacity_bytes(),
+            "rows": rows.len(), "row_capacity_bytes": rows.capacity() * std::mem::size_of::<usize>(),
+            "matches": matches.len(), "match_capacity_bytes": matches.capacity() * std::mem::size_of::<usize>(),
+            "expanded_capacity_bytes": expanded.capacity() * std::mem::size_of::<bool>(),
+            "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
+            "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
+            "rows_ms": rows_ms, "search_all_ms": search_all_ms,
+            "total_ms": total.elapsed().as_secs_f64() * 1000.0,
+            "memory": {"document_ready": document_ready, "after_rows": after_rows, "ready": memory()}
+        })
+    );
+    Ok(())
+}
 
 #[cfg(windows)]
 fn memory() -> serde_json::Value {
@@ -63,8 +140,18 @@ fn run() -> Result<(), String> {
         .next()
         .ok_or("Usage: memory_bench FILE retain|release")?;
     let mode = args.next().ok_or("Specify retain or release")?;
-    if !matches!(mode.as_str(), "retain" | "release") || args.next().is_some() {
-        return Err("Usage: memory_bench FILE retain|release".into());
+    if !matches!(
+        mode.as_str(),
+        "retain" | "release" | "switch-normal" | "switch-low" | "tree"
+    ) || args.next().is_some()
+    {
+        return Err("Usage: memory_bench FILE retain|release|switch-normal|switch-low|tree".into());
+    }
+    if mode.starts_with("switch-") {
+        return switch(file, mode);
+    }
+    if mode == "tree" {
+        return tree(file);
     }
     let initial = memory();
     let total = Instant::now();
@@ -89,7 +176,7 @@ fn run() -> Result<(), String> {
     let release_ms = started.elapsed().as_secs_f64() * 1000.0;
     let before_index = memory();
     let started = Instant::now();
-    let doc = Document::from_value(value, bytes);
+    let doc = Document::from_value(value, bytes)?;
     let index_ms = started.elapsed().as_secs_f64() * 1000.0;
     let after_index = memory();
     // Keep baseline source alive through index construction, as the old GUI loader did.
@@ -107,7 +194,9 @@ fn run() -> Result<(), String> {
             "file": file, "mode": mode, "bytes": bytes,
             "nodes": doc.nodes.len(), "node_size": std::mem::size_of::<document::Node>(),
             "node_capacity_bytes": doc.nodes.capacity() * std::mem::size_of::<document::Node>(),
-        "structure_capacity_bytes": doc.structure_capacity_bytes(),
+            "structure_capacity_bytes": doc.structure_capacity_bytes(),
+            "full_expand_rows_payload_bytes": doc.nodes.len() * std::mem::size_of::<usize>(),
+            "expanded_flags_bytes": doc.nodes.len() * std::mem::size_of::<bool>(),
             "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
             "read_ms": read_ms, "parse_ms": parse_ms, "release_ms": release_ms,

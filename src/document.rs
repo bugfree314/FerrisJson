@@ -42,15 +42,21 @@ impl Kind {
 
 // Preorder node IDs remain stable. Strings and complete paths are never stored per node.
 pub struct Node {
-    pub parent: Option<usize>,
-    pub depth: usize,
-    pub end: usize,
-    segment: usize,
-    child_start: usize,
-    child_count: usize,
+    parent: u32,
+    pub depth: u32,
+    end: u32,
+    segment: u32,
+    child_start: u32,
+    child_count: u32,
     kind: Kind,
 }
 impl Node {
+    pub fn parent(&self) -> Option<usize> {
+        (self.parent != u32::MAX).then_some(self.parent as usize)
+    }
+    pub fn end(&self) -> usize {
+        self.end as usize
+    }
     pub fn kind(&self) -> &'static str {
         self.kind.name()
     }
@@ -62,24 +68,24 @@ pub struct Document {
     pub value: Value,
     pub nodes: Vec<Node>,
     pub bytes: usize,
-    children: Vec<usize>,
+    children: Vec<u32>,
     keys: Vec<Arc<str>>,
-    key_ids: HashMap<Arc<str>, usize>,
+    key_ids: HashMap<Arc<str>, u32>,
 }
 struct IndexBuilder {
     nodes: Vec<Node>,
-    children: Vec<usize>,
+    children: Vec<u32>,
     keys: Vec<Arc<str>>,
-    key_ids: HashMap<Arc<str>, usize>,
+    key_ids: HashMap<Arc<str>, u32>,
 }
 impl IndexBuilder {
     fn index(
         &mut self,
         value: &Value,
-        segment: usize,
-        parent: Option<usize>,
-        depth: usize,
-    ) -> usize {
+        segment: u32,
+        parent: u32,
+        depth: u32,
+    ) -> Result<u32, String> {
         let id = self.nodes.len();
         let count = match value {
             Value::Object(v) => v.len(),
@@ -91,10 +97,10 @@ impl IndexBuilder {
         self.nodes.push(Node {
             parent,
             depth,
-            end: id + 1,
+            end: compact(id + 1)?,
             segment,
-            child_start: start,
-            child_count: count,
+            child_start: compact(start)?,
+            child_count: compact(count)?,
             kind: Kind::of(value),
         });
         match value {
@@ -103,36 +109,47 @@ impl IndexBuilder {
                     let segment = if let Some(&index) = self.key_ids.get(key.as_str()) {
                         index
                     } else {
-                        let index = self.keys.len();
+                        let index = compact(self.keys.len())?;
                         let key: Arc<str> = Arc::from(key.as_str());
                         self.key_ids.insert(Arc::clone(&key), index);
                         self.keys.push(key);
                         index
                     };
-                    let child_id = self.index(child, segment, Some(id), depth + 1);
+                    let child_id = self.index(child, segment, compact(id)?, depth + 1)?;
                     self.children[start + ordinal] = child_id;
                 }
                 // Lookup order is independent of display order, which stays in preorder.
                 self.children[start..start + count]
-                    .sort_unstable_by_key(|&child| self.nodes[child].segment);
+                    .sort_unstable_by_key(|&child| self.nodes[child as usize].segment);
             }
             Value::Array(array) => {
                 for (ordinal, child) in array.iter().enumerate() {
-                    let child_id = self.index(child, ordinal, Some(id), depth + 1);
+                    let child_id = self.index(child, compact(ordinal)?, compact(id)?, depth + 1)?;
                     self.children[start + ordinal] = child_id;
                 }
             }
             _ => (),
         }
-        self.nodes[id].end = self.nodes.len();
-        id
+        self.nodes[id].end = compact(self.nodes.len())?;
+        compact(id)
     }
 }
-fn node_count(value: &Value) -> usize {
-    1 + match value {
-        Value::Object(v) => v.values().map(node_count).sum(),
-        Value::Array(v) => v.iter().map(node_count).sum(),
-        _ => 0,
+fn compact(value: usize) -> Result<u32, String> {
+    u32::try_from(value)
+        .map_err(|_| "Document exceeds the 32-bit index limit (4,294,967,295 nodes)".into())
+}
+fn node_count(value: &Value) -> Result<usize, String> {
+    let add = |count: usize, child: &Value| {
+        let total = count
+            .checked_add(node_count(child)?)
+            .ok_or("Node count overflow")?;
+        compact(total)?;
+        Ok(total)
+    };
+    match value {
+        Value::Object(v) => v.values().try_fold(1, add),
+        Value::Array(v) => v.iter().try_fold(1, add),
+        _ => Ok(1),
     }
 }
 impl Document {
@@ -146,56 +163,56 @@ impl Document {
         let value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
             .map_err(|e| format!("Invalid JSON: {e}"))?;
         drop(text);
-        Ok(Self::from_value(value, bytes))
+        Self::from_value(value, bytes)
     }
-    pub fn from_value(value: Value, bytes: usize) -> Self {
+    pub fn from_value(value: Value, bytes: usize) -> Result<Self, String> {
         // Counting avoids geometric capacity growth for the two large index arrays.
-        let count = node_count(&value);
+        let count = node_count(&value)?;
         let mut index = IndexBuilder {
             nodes: Vec::with_capacity(count),
             children: Vec::with_capacity(count.saturating_sub(1)),
             keys: Vec::new(),
             key_ids: HashMap::new(),
         };
-        index.index(&value, 0, None, 0);
-        Self {
+        index.index(&value, 0, u32::MAX, 0)?;
+        Ok(Self {
             value,
             nodes: index.nodes,
             bytes,
             children: index.children,
             keys: index.keys,
             key_ids: index.key_ids,
-        }
+        })
     }
     #[allow(dead_code, reason = "Used by the standalone memory benchmark")]
     pub fn structure_capacity_bytes(&self) -> usize {
         self.nodes.capacity() * std::mem::size_of::<Node>()
-            + self.children.capacity() * std::mem::size_of::<usize>()
+            + self.children.capacity() * std::mem::size_of::<u32>()
     }
     pub fn at(&self, id: usize) -> &Value {
         let node = &self.nodes[id];
-        let Some(parent) = node.parent else {
+        let Some(parent) = node.parent() else {
             return &self.value;
         };
         match self.at(parent) {
-            Value::Object(map) => &map[self.keys[node.segment].as_ref()],
-            Value::Array(array) => &array[node.segment],
+            Value::Object(map) => &map[self.keys[node.segment as usize].as_ref()],
+            Value::Array(array) => &array[node.segment as usize],
             _ => unreachable!("only containers have children"),
         }
     }
     pub fn key(&self, id: usize) -> Cow<'_, str> {
         let node = &self.nodes[id];
-        match node.parent {
+        match node.parent() {
             None => Cow::Borrowed("$"),
             Some(parent) if matches!(self.nodes[parent].kind, Kind::Array) => {
                 Cow::Owned(node.segment.to_string())
             }
-            Some(_) => Cow::Borrowed(&self.keys[node.segment]),
+            Some(_) => Cow::Borrowed(&self.keys[node.segment as usize]),
         }
     }
     fn ancestors(&self, mut id: usize) -> Vec<usize> {
-        let mut result = Vec::with_capacity(self.nodes[id].depth);
-        while let Some(parent) = self.nodes[id].parent {
+        let mut result = Vec::with_capacity(self.nodes[id].depth as usize);
+        while let Some(parent) = self.nodes[id].parent() {
             result.push(id);
             id = parent;
         }
@@ -206,10 +223,10 @@ impl Document {
         let mut path = String::from("$");
         for child in self.ancestors(id) {
             let node = &self.nodes[child];
-            if matches!(self.nodes[node.parent.unwrap()].kind, Kind::Array) {
+            if matches!(self.nodes[node.parent().unwrap()].kind, Kind::Array) {
                 path.push_str(&format!("[{}]", node.segment));
             } else {
-                let key = &self.keys[node.segment];
+                let key = &self.keys[node.segment as usize];
                 if is_identifier(key) {
                     path.push('.');
                     path.push_str(key);
@@ -237,16 +254,17 @@ impl Document {
         }
         let &segment = self.key_ids.get(name)?;
         let node = &self.nodes[parent];
-        let children = &self.children[node.child_start..node.child_start + node.child_count];
+        let children = &self.children
+            [node.child_start as usize..(node.child_start as usize + node.child_count as usize)];
         children
-            .binary_search_by_key(&segment, |&id| self.nodes[id].segment)
+            .binary_search_by_key(&segment, |&id| self.nodes[id as usize].segment)
             .ok()
-            .map(|i| children[i])
+            .map(|i| children[i] as usize)
     }
     fn child_index(&self, parent: usize, index: usize) -> Option<usize> {
         let node = &self.nodes[parent];
-        (matches!(node.kind, Kind::Array) && index < node.child_count)
-            .then(|| self.children[node.child_start + index])
+        (matches!(node.kind, Kind::Array) && index < node.child_count as usize)
+            .then(|| self.children[node.child_start as usize + index] as usize)
     }
     fn pointer_id(&self, pointer: &str) -> Option<usize> {
         let mut id = 0;
@@ -392,12 +410,12 @@ impl Document {
             }
             let node = &self.nodes[id];
             let key_match = scope != SearchScope::Values
-                && match node.parent {
+                && match node.parent() {
                     None => root_match,
                     Some(parent) if matches!(self.nodes[parent].kind, Kind::Array) => {
                         match_array_keys && matcher.is_match(&node.segment.to_string())
                     }
-                    Some(_) => key_matches[node.segment],
+                    Some(_) => key_matches[node.segment as usize],
                 };
             let value_match = !key_match
                 && scope != SearchScope::Keys
@@ -426,7 +444,7 @@ impl Document {
         while id < self.nodes.len() {
             rows.push(id);
             id = if self.nodes[id].container() && !expanded[id] {
-                self.nodes[id].end
+                self.nodes[id].end()
             } else {
                 id + 1
             };
@@ -522,11 +540,35 @@ fn bounded_preview<T: serde::Serialize>(value: &T) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn compact_index_boundaries_and_root_sentinel() {
+        assert_eq!(compact(0).unwrap(), 0);
+        assert_eq!(compact(u32::MAX as usize).unwrap(), u32::MAX);
+        if let Some(too_many) = (u32::MAX as usize).checked_add(1) {
+            assert!(
+                compact(too_many)
+                    .unwrap_err()
+                    .contains("32-bit index limit")
+            );
+        }
+        let doc = Document::parse("[{},[],null]").unwrap();
+        assert_eq!(doc.nodes[0].parent(), None);
+        assert_eq!(doc.nodes[0].end(), doc.nodes.len());
+        for id in 1..doc.nodes.len() {
+            assert_eq!(doc.nodes[id].parent(), Some(0));
+            assert_eq!(doc.nodes[id].end(), id + 1);
+        }
+        assert_eq!(
+            doc.structure_capacity_bytes(),
+            doc.nodes.len() * 28 + (doc.nodes.len() - 1) * 4
+        );
+    }
+    #[test]
     fn compact_index_shares_keys_and_preserves_object_and_array_locations() {
         let d =
             Document::parse(r#"{"z":{"b":1,"a":2},"a":{"a":3,"b":4},"rows":[{"b":5},{"b":6}]}"#)
                 .unwrap();
-        assert!(std::mem::size_of::<Node>() <= 64);
+        assert_eq!(std::mem::size_of::<Node>(), 28);
+        assert_eq!(std::mem::size_of_val(&d.children[0]), 4);
         assert_eq!(d.keys.len(), 4);
         assert_eq!(d.nodes.capacity(), d.nodes.len());
         for id in 0..d.nodes.len() {

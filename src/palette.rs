@@ -144,6 +144,7 @@ pub struct ColorSettings {
     pub dark: bool,
     pub wrap_values: bool,
     pub wrap_results: bool,
+    pub low_memory_load: bool,
     pub custom_dark: Palette,
     pub custom_light: Palette,
 }
@@ -154,6 +155,7 @@ impl Default for ColorSettings {
             dark: true,
             wrap_values: true,
             wrap_results: true,
+            low_memory_load: false,
             custom_dark: Palette::builtin(Preset::Ferris, true),
             custom_light: Palette::builtin(Preset::Ferris, false),
         }
@@ -221,6 +223,7 @@ mod tests {
     fn customization_keeps_both_modes_and_round_trips() {
         let mut settings = ColorSettings {
             preset: Preset::Solarized,
+            low_memory_load: true,
             ..Default::default()
         };
         let dark = settings.active();
@@ -237,6 +240,12 @@ mod tests {
         assert_eq!(copy.custom_dark.string, [1, 2, 3]);
         assert_eq!(copy.preset, Preset::Custom);
         assert!(copy.wrap_values && copy.wrap_results);
+        assert!(copy.low_memory_load);
+        assert!(
+            !serde_json::from_str::<ColorSettings>("{}")
+                .unwrap()
+                .low_memory_load
+        );
         assert!(serde_json::from_str::<ColorSettings>(r#"{"preset":"Unknown"}"#).is_err());
         assert_eq!(
             serde_json::from_str::<ColorSettings>("{}").unwrap().preset,

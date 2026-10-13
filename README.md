@@ -1,6 +1,8 @@
 # FerrisJson
 
-当前版本：**0.4.1**。
+当前版本：**0.4.2**。
+
+0.4.2 的内存优化：节点由 64 B 压缩为 28 B，子节点编号由 8 B 压缩为 4 B，并增加工具栏 **Low memory load** 开关（默认关闭，设置会保存）。开启后加载新文件前关闭旧文档，等待旧后台任务释放引用，再销毁旧文档；等待期间显示状态，加载失败后需要重新打开旧文件。关闭时仍可在新文件加载期间浏览旧文档，失败后保留旧文档。
 
 <img src="assets/FerrisJson.png" alt="FerrisJson 图标：花括号中的橙色螃蟹" width="96" height="96">
 
@@ -201,17 +203,22 @@ Windows 文档引擎内存基准（Release、每种模式独立进程运行三�
 
 ```powershell
 ./scripts/measure-memory.ps1 -File random_300MiB.json -Runs 3
+./scripts/measure-memory.ps1 -File target/memory-switch20MiB-seed42.json -Scenario switch -Runs 3 -Output target/memory-switch.json
+./scripts/measure-memory.ps1 -File random_300MiB.json -Scenario tree -Runs 3 -Output target/memory-tree.json
 ```
 
-报告默认写入 `target/memory-benchmark.json`，包含阶段耗时、峰值/加载完成后的工作集和私有内存、中位数及最小/最大值。`retain` 模拟旧加载流程，`release` 在解析后释放源文本再建索引。测量范围和复现说明见 [大文件优化说明](docs/performance-optimization.md)。
+报告默认写入 `target/memory-benchmark.json`，包含阶段耗时、峰值/加载完成后的工作集和私有内存、中位数及最小/最大值。`retain` 模拟旧源文本生命周期，`release` 在解析后释放源文本再建索引；两者都使用当前代码的节点布局。`switch` 比较同一文件加载两次时保留/提前释放旧文档的峰值；`tree` 测量全展开及匹配所有节点时的数组容量。切换用的固定种子数据生成方式、测量范围和复现说明见 [大文件优化说明](docs/performance-optimization.md)。
 
 每次带版本号的提交必须同步更新 Cargo.toml、Cargo.lock、README、优化记录和 TODO，注明实际变化、验证结果、测量范围及剩余事项；项目协作规则见 [AGENTS.md](AGENTS.md)。
+
+样本、测试数据及基准 JSON 报告只保存在本地，不纳入本次及后续提交；复现命令和测量结论保留在文档中。
 
 ## 当前限制
 
 - 一次读取一个 UTF-8 JSON 文档，支持 UTF-8 BOM；不支持 JSONL、URL 加载或 JavaScript 处理。
 - 文件读取与解析在后台执行，节点使用紧凑索引和共享键名；完整路径和预览按需生成，树行标签最多缓存 512 行。文档和节点索引仍完整保存在内存中，尚未实现超大文件流式解析。
 - 使用 serde_json 默认嵌套深度限制。
+- 紧凑索引最多支持 4,294,967,295 个节点；超限返回明确错误，不截断编号。完整 Value 仍需驻留，紧凑索引不构成总内存预算。
 - 选中值与查询结果的预览最多输出约 200 KB，截断时显示提示；复制与导出仍保留完整内容。
 - 多语种字形覆盖取决于系统安装的字体。Windows 使用微软雅黑、Malgun Gothic、游ゴシック及其他后备字体；其他平台尝试常见系统字体或 Noto 字体。系统字体不随项目分发。
 - 配色和深浅模式可保存到用户配置目录；面板分隔位置仅在当前会话生效。

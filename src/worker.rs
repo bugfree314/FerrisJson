@@ -100,6 +100,9 @@ impl Worker {
                             })
                     }
                 };
+                // A result-channel send can block. Never retain a document while
+                // waiting to deliver IDs/preview, especially during low-memory loading.
+                drop(request.doc);
                 if cancelled() {
                     continue;
                 }
@@ -161,6 +164,33 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_result_channel_does_not_retain_documents() {
+        let ctx = eframe::egui::Context::default();
+        let worker = Worker::new(ctx);
+        let send = || {
+            let doc = Arc::new(Document::parse("[1,2,3]").unwrap());
+            let weak = Arc::downgrade(&doc);
+            worker.inbox.0.lock().unwrap().pending = Some(Request {
+                generation: 0,
+                doc,
+                operation: Operation::Query("$[*]".into()),
+            });
+            worker.inbox.1.notify_one();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while weak.strong_count() != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "Worker retained document while sending a result"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        send();
+        // Leave the first completion in the capacity-one channel, then request another.
+        send();
+        drop(worker);
+    }
     fn wait(worker: &mut Worker) -> Completion {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

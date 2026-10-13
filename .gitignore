@@ -1,1 +1,4 @@
 /target
+
+# Local JSON samples, test inputs and benchmark reports must not be committed.
+*.json

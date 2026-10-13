@@ -11,6 +11,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
     time::{Duration, Instant},
@@ -37,6 +38,8 @@ pub struct Viewer {
     source: String,
     file: Option<PathBuf>,
     pending: Option<Receiver<LoadResult>>,
+    waiting_for_old: Arc<AtomicBool>,
+    loading_cancelled: Arc<AtomicBool>,
     load_started: Option<Instant>,
     open_duration: Option<Duration>,
     query_duration: Option<(&'static str, Duration)>,
@@ -121,6 +124,8 @@ impl Viewer {
             source: "No document".into(),
             file: None,
             pending: None,
+            waiting_for_old: Arc::new(AtomicBool::new(false)),
+            loading_cancelled: Arc::new(AtomicBool::new(false)),
             load_started: None,
             open_duration: None,
             query_duration: None,
@@ -188,12 +193,18 @@ impl Viewer {
             return;
         }
         self.load_started = Some(Instant::now());
+        let old = self.prepare_load();
+        let waiting = Arc::clone(&self.waiting_for_old);
+        let cancelled = Arc::clone(&self.loading_cancelled);
         self.open_duration = None;
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
         self.error = None;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            if !wait_for_old_document(old, &waiting, &cancelled, &ctx) {
+                return;
+            }
             let result = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Cannot open {}: {e}", path.display()))
                 .and_then(Document::parse_owned)
@@ -207,15 +218,52 @@ impl Viewer {
             return;
         }
         self.load_started = Some(Instant::now());
+        let old = self.prepare_load();
+        let waiting = Arc::clone(&self.waiting_for_old);
+        let cancelled = Arc::clone(&self.loading_cancelled);
         self.open_duration = None;
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
         self.error = None;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
+            if !wait_for_old_document(old, &waiting, &cancelled, &ctx) {
+                return;
+            }
             let _ = tx.send(Document::parse_owned(text).map(|doc| (doc, source, None)));
             ctx.request_repaint();
         });
+    }
+    fn prepare_load(&mut self) -> Option<Arc<Document>> {
+        self.loading_cancelled.store(false, Ordering::Relaxed);
+        if !self.colors.low_memory_load {
+            return None;
+        }
+        self.cancel_operations();
+        let old = self.doc.take();
+        self.waiting_for_old.store(old.is_some(), Ordering::Relaxed);
+        self.rows = Vec::new();
+        self.expanded = Vec::new();
+        self.matches = Vec::new();
+        self.path_results = None;
+        self.row_labels = HashMap::new();
+        self.detail = String::new();
+        self.selected_path = String::new();
+        self.history = Vec::new();
+        self.history_index = 0;
+        self.selected = 0;
+        self.match_index = 0;
+        self.source.clear();
+        self.file = None;
+        self.term.clear();
+        self.query = "$".into();
+        self.pending_expression.clear();
+        self.query_duration = None;
+        self.search_error = None;
+        self.vim.cancel();
+        self.notice =
+            "Low memory load: previous document closed; waiting for background work".into();
+        old
     }
     fn poll(&mut self) {
         let Some(rx) = &self.pending else {
@@ -247,7 +295,13 @@ impl Viewer {
                         self.select(0);
                         self.rebuild_rows();
                     }
-                    Err(error) => self.error = Some(error),
+                    Err(error) => {
+                        self.error = Some(error);
+                        if self.doc.is_none() && self.colors.low_memory_load {
+                            self.notice =
+                                "Loading failed. The previous document must be reopened.".into();
+                        }
+                    }
                 }
                 self.open_duration = self.load_started.take().map(|start| start.elapsed());
             }
@@ -334,14 +388,14 @@ impl Viewer {
                     if command.action == Action::Left {
                         if node.container() && self.expanded[self.selected] {
                             self.toggle(self.selected);
-                        } else if let Some(parent) = node.parent {
+                        } else if let Some(parent) = node.parent() {
                             self.reveal(parent);
                         } else {
                             break;
                         }
                     } else if node.container() && !self.expanded[self.selected] {
                         self.toggle(self.selected);
-                    } else if node.end > self.selected + 1 {
+                    } else if node.end() > self.selected + 1 {
                         self.reveal(self.selected + 1);
                     } else {
                         break;
@@ -421,10 +475,10 @@ impl Viewer {
     }
     fn reveal(&mut self, id: usize) {
         if let Some(doc) = &self.doc {
-            let mut parent = doc.nodes[id].parent;
+            let mut parent = doc.nodes[id].parent();
             while let Some(p) = parent {
                 self.expanded[p] = true;
-                parent = doc.nodes[p].parent;
+                parent = doc.nodes[p].parent();
             }
         }
         self.select(id);
@@ -642,7 +696,7 @@ impl Viewer {
         if let Some(doc) = &self.doc
             && !self.expanded[id]
             && self.selected > id
-            && self.selected < doc.nodes[id].end
+            && self.selected < doc.nodes[id].end()
         {
             self.select(id);
         }
@@ -894,6 +948,10 @@ impl Viewer {
                     if ui.button("Paste JSON").clicked() {
                         self.paste_open = true;
                     }
+                    if ui.checkbox(&mut self.colors.low_memory_load, "Low memory load")
+                        .on_hover_text("Release the previous document and wait for its background work before loading. If loading fails, reopen the previous document.").changed() {
+                        self.save_colors();
+                    }
                 });
                 if ui.button("Help").clicked() {
                     self.help = true;
@@ -1058,7 +1116,9 @@ impl Viewer {
                         ui.label(format!("{label}: {}", format_duration(duration))).on_hover_text("Includes query, node reveal and selection preview; excludes painting.");
                     }
                     if self.pending.is_some() {
-                        ui.label("Opening...");
+                        ui.label(if self.waiting_for_old.load(Ordering::Relaxed) {
+                            "Waiting for previous document..."
+                        } else { "Opening..." });
                     } else if let Some(duration) = self.open_duration {
                         ui.label(format!("Open: {}", format_duration(duration))).on_hover_text("Includes file read (when applicable), JSON parse, node index and initial view preparation; excludes file picker and painting.");
                     }
@@ -1304,6 +1364,26 @@ impl Viewer {
         }
     }
 }
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        self.loading_cancelled.store(true, Ordering::Relaxed);
+    }
+}
+fn wait_for_old_document(
+    old: Option<Arc<Document>>,
+    waiting: &AtomicBool,
+    cancelled: &AtomicBool,
+    ctx: &egui::Context,
+) -> bool {
+    crate::loading::release_previous(
+        old,
+        || cancelled.load(Ordering::Relaxed),
+        |value| {
+            waiting.store(value, Ordering::Relaxed);
+            ctx.request_repaint();
+        },
+    )
+}
 fn format_duration(duration: Duration) -> String {
     if duration.as_secs() >= 1 {
         format!("{:.2} s", duration.as_secs_f64())
@@ -1314,6 +1394,80 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn wait_load(app: &mut Viewer) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.pending.is_some() {
+            app.poll();
+            assert!(Instant::now() < deadline, "Loading did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn low_memory_loading_waits_releases_state_and_reports_failure() {
+        let mut app = loaded();
+        let ctx = egui::Context::default();
+        let owner = Arc::clone(app.doc.as_ref().unwrap());
+        let weak = Arc::downgrade(&owner);
+        app.colors.low_memory_load = true;
+        app.search_worker = Some(Worker::new(ctx.clone()));
+        app.term = "name".into();
+        app.search();
+        app.load_text("{bad}".into(), "invalid".into(), &ctx);
+        assert!(app.doc.is_none());
+        assert_eq!(app.rows.capacity(), 0);
+        assert_eq!(app.expanded.capacity(), 0);
+        assert_eq!(app.matches.capacity(), 0);
+        assert!(app.path_results.is_none());
+        assert!(!app.search_worker.as_ref().unwrap().busy);
+        assert!(app.waiting_for_old.load(Ordering::Relaxed));
+        assert!(matches!(
+            app.pending.as_ref().unwrap().try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(owner);
+        wait_load(&mut app);
+        assert!(weak.upgrade().is_none());
+        assert!(app.doc.is_none());
+        assert!(app.error.as_ref().unwrap().contains("Invalid JSON"));
+        assert!(app.notice.contains("must be reopened"));
+        assert!(!app.waiting_for_old.load(Ordering::Relaxed));
+        app.load_text(r#"{"fresh":42}"#.into(), "valid".into(), &ctx);
+        wait_load(&mut app);
+        assert_eq!(
+            app.doc.as_ref().unwrap().value,
+            serde_json::json!({"fresh":42})
+        );
+        assert_eq!(app.selected_path, "$");
+        assert!(app.error.is_none());
+    }
+    #[test]
+    fn normal_loading_preserves_previous_document_on_failure() {
+        let ctx = egui::Context::default();
+        let mut app = loaded();
+        let old = Arc::downgrade(app.doc.as_ref().unwrap());
+        app.load_text("{bad}".into(), "invalid".into(), &ctx);
+        assert!(app.doc.is_some());
+        wait_load(&mut app);
+        assert!(app.error.is_some());
+        assert!(Arc::ptr_eq(
+            &old.upgrade().unwrap(),
+            app.doc.as_ref().unwrap()
+        ));
+    }
+    #[test]
+    fn low_memory_file_failure_clears_previous_document() {
+        let ctx = egui::Context::default();
+        let mut app = loaded();
+        app.colors.low_memory_load = true;
+        app.load_file(
+            PathBuf::from("target/nonexistent-load-test-directory/missing.json"),
+            &ctx,
+        );
+        wait_load(&mut app);
+        assert!(app.doc.is_none());
+        assert!(app.error.as_ref().unwrap().contains("Cannot open"));
+        assert!(app.notice.contains("must be reopened"));
+    }
     fn loaded() -> Viewer {
         let mut app = Viewer::empty();
         let doc = Document::parse(DEMO).unwrap();
