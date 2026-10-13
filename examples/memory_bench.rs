@@ -33,8 +33,8 @@ fn backend(file: String, mode: String) -> Result<(), String> {
         "{}",
         json!({
             "file": file, "mode": mode, "backend": doc.backend_name(), "bytes": doc.bytes,
-            "nodes": doc.nodes.len(), "has_whole_value": doc.value().is_some(),
-            "structure_capacity_bytes": doc.structure_capacity_bytes(), "load_ms": load_ms,
+            "nodes": doc.node_count(), "has_whole_value": doc.value().is_some(),
+            "structure_capacity_bytes": doc.structure_capacity_bytes(), "structure_disk_bytes": doc.structure_disk_bytes(), "load_ms": load_ms,
             "preview_ms": preview_ms, "total_ms": total.elapsed().as_secs_f64() * 1000.0,
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
             "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
@@ -72,7 +72,7 @@ fn switch(file: String, mode: String) -> Result<(), String> {
     println!(
         "{}",
         json!({
-            "file": file, "mode": mode, "bytes": new.bytes, "nodes": new.nodes.len(),
+            "file": file, "mode": mode, "bytes": new.bytes, "nodes": new.node_count(),
             "node_size": std::mem::size_of::<document::Node>(),
             "structure_capacity_bytes": new.structure_capacity_bytes(),
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
@@ -87,18 +87,26 @@ fn switch(file: String, mode: String) -> Result<(), String> {
     Ok(())
 }
 
-fn tree(file: String) -> Result<(), String> {
+fn tree(file: String, indexed: bool) -> Result<(), String> {
     let total = Instant::now();
-    let doc = Document::parse_owned(std::fs::read_to_string(&file).map_err(|e| e.to_string())?)?;
+    let doc = if indexed {
+        Document::open_indexed(
+            std::path::Path::new(&file),
+            || false,
+            &LoadProgress::default(),
+        )?
+    } else {
+        Document::parse_owned(std::fs::read_to_string(&file).map_err(|e| e.to_string())?)?
+    };
     let document_ready = memory();
-    let expanded = vec![true; doc.nodes.len()];
+    let expanded = vec![true; doc.node_count()];
     let started = Instant::now();
-    let mut rows = doc.visible(&expanded);
+    let mut rows = doc.visible(&expanded)?;
     let rows_ms = started.elapsed().as_secs_f64() * 1000.0;
     let after_rows = memory();
     let allocation = rows.as_ptr();
     let started = Instant::now();
-    doc.visible_into(&expanded, &mut rows);
+    doc.visible_into(&expanded, &mut rows)?;
     let rebuild_rows_ms = started.elapsed().as_secs_f64() * 1000.0;
     let reused_row_allocation = allocation == rows.as_ptr();
     let started = Instant::now();
@@ -108,9 +116,10 @@ fn tree(file: String) -> Result<(), String> {
     println!(
         "{}",
         json!({
-            "file": file, "mode": "tree", "bytes": doc.bytes, "nodes": doc.nodes.len(),
+            "file": file, "mode": if indexed { "indexed-tree" } else { "tree" }, "bytes": doc.bytes, "nodes": doc.node_count(),
             "node_size": std::mem::size_of::<document::Node>(),
             "structure_capacity_bytes": doc.structure_capacity_bytes(),
+            "structure_disk_bytes": doc.structure_disk_bytes(),
             "rows": rows.len(), "row_capacity_bytes": rows.capacity() * std::mem::size_of::<u32>(),
             "matches": matches.len(), "match_capacity_bytes": matches.capacity() * std::mem::size_of::<u32>(),
             "expanded_capacity_bytes": expanded.capacity() * std::mem::size_of::<bool>(),
@@ -158,7 +167,7 @@ fn export_file(file: String, mode: String) -> Result<(), String> {
     println!(
         "{}",
         json!({
-            "file": file, "mode": mode, "bytes": doc.bytes, "nodes": doc.nodes.len(),
+            "file": file, "mode": mode, "bytes": doc.bytes, "nodes": doc.node_count(),
             "node_size": std::mem::size_of::<document::Node>(), "output_bytes": output_bytes,
             "output_string_capacity": output_string_capacity, "export_ms": export_ms,
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
@@ -233,13 +242,14 @@ fn run() -> Result<(), String> {
             | "switch-normal"
             | "switch-low"
             | "tree"
+            | "indexed-tree"
             | "export-string"
             | "export-stream"
             | "memory-open"
             | "indexed-open"
     ) || args.next().is_some()
     {
-        return Err("Usage: memory_bench FILE retain|release|switch-normal|switch-low|tree|export-string|export-stream".into());
+        return Err("Usage: memory_bench FILE retain|release|switch-normal|switch-low|tree|indexed-tree|export-string|export-stream|memory-open|indexed-open".into());
     }
     if mode.starts_with("switch-") {
         return switch(file, mode);
@@ -250,8 +260,8 @@ fn run() -> Result<(), String> {
     if mode.ends_with("-open") {
         return backend(file, mode);
     }
-    if mode == "tree" {
-        return tree(file);
+    if mode == "tree" || mode == "indexed-tree" {
+        return tree(file, mode == "indexed-tree");
     }
     let initial = memory();
     let total = Instant::now();
@@ -292,11 +302,11 @@ fn run() -> Result<(), String> {
         "{}",
         json!({
             "file": file, "mode": mode, "bytes": bytes,
-            "nodes": doc.nodes.len(), "node_size": std::mem::size_of::<document::Node>(),
-            "node_capacity_bytes": doc.nodes.capacity() * std::mem::size_of::<document::Node>(),
+            "nodes": doc.node_count(), "node_size": std::mem::size_of::<document::Node>(),
+            "node_capacity_bytes": doc.node_capacity_bytes(),
             "structure_capacity_bytes": doc.structure_capacity_bytes(),
-            "full_expand_rows_payload_bytes": doc.nodes.len() * std::mem::size_of::<u32>(),
-            "expanded_flags_bytes": doc.nodes.len() * std::mem::size_of::<bool>(),
+            "full_expand_rows_payload_bytes": doc.node_count() * std::mem::size_of::<u32>(),
+            "expanded_flags_bytes": doc.node_count() * std::mem::size_of::<bool>(),
             "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
             "read_ms": read_ms, "parse_ms": parse_ms, "release_ms": release_ms,

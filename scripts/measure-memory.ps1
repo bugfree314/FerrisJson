@@ -1,7 +1,9 @@
 param(
     [Parameter(Mandatory = $true)][string]$File,
     [ValidateRange(3, 100)][int]$Runs = 3,
-    [ValidateSet("open", "switch", "tree", "export", "backend")][string]$Scenario = "open",
+    [ValidateSet("open", "switch", "tree", "export", "backend", "paging", "indexed-tree")][string]$Scenario = "open",
+    [string]$BaselineBinary,
+    [string]$CurrentBinary,
     [string]$Output = "target/memory-benchmark.json"
 )
 $ErrorActionPreference = "Stop"
@@ -9,16 +11,26 @@ if (-not ($IsWindows -or $env:OS -eq "Windows_NT")) {
     throw "This measurement script requires Windows process memory counters."
 }
 $inputFile = (Resolve-Path -LiteralPath $File).Path
-cargo build --release --offline --locked --example memory_bench
-if ($LASTEXITCODE -ne 0) { throw "Benchmark build failed" }
-$binaryName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "memory_bench.exe" } else { "memory_bench" }
-$binary = Join-Path "target/release/examples" $binaryName
+if ($Scenario -eq "paging") {
+    if (-not $BaselineBinary) { throw "Paging comparison requires -BaselineBinary from the previous revision" }
+    $BaselineBinary = (Resolve-Path -LiteralPath $BaselineBinary).Path
+}
+if ($CurrentBinary) {
+    $binary = (Resolve-Path -LiteralPath $CurrentBinary).Path
+} else {
+    cargo build --release --offline --locked --example memory_bench
+    if ($LASTEXITCODE -ne 0) { throw "Benchmark build failed" }
+    $binaryName = if ($IsWindows -or $env:OS -eq "Windows_NT") { "memory_bench.exe" } else { "memory_bench" }
+    $binary = Join-Path "target/release/examples" $binaryName
+}
 $samples = @()
 $modePair = switch ($Scenario) {
     "switch" { @("switch-normal", "switch-low") }
     "tree" { @("tree") }
     "export" { @("export-string", "export-stream") }
     "backend" { @("memory-open", "indexed-open") }
+    "paging" { @("resident-index", "paged-index") }
+    "indexed-tree" { @("indexed-tree") }
     default { @("retain", "release") }
 }
 for ($iteration = 0; $iteration -lt $Runs; $iteration++) {
@@ -27,9 +39,19 @@ for ($iteration = 0; $iteration -lt $Runs; $iteration++) {
     if ($iteration % 2 -ne 0) { [array]::Reverse($modes) }
     foreach ($mode in $modes) {
         Write-Host "Run $($iteration + 1)/$Runs : $mode"
-        $result = & $binary $inputFile $mode
+        if ($Scenario -eq "paging") {
+            $selectedBinary = if ($mode -eq "resident-index") { $BaselineBinary } else { $binary }
+            $result = & $selectedBinary $inputFile "indexed-open"
+        } else {
+            $result = & $binary $inputFile $mode
+        }
         if ($LASTEXITCODE -ne 0) { throw "Benchmark failed: $mode" }
         $sample = $result | ConvertFrom-Json
+        if ($Scenario -eq "paging") {
+            $isPaged = $sample.backend -eq "Paged range index"
+            if (($mode -eq "paged-index") -ne $isPaged) { throw "Unexpected backend for $mode : $($sample.backend); rebuild the intended binary" }
+            $sample.mode = $mode
+        }
         if ($null -eq $sample.memory.ready.peak_resident_bytes) { throw "Process memory counters unavailable" }
         $sample | Add-Member -NotePropertyName run -NotePropertyValue ($iteration + 1)
         $samples += $sample
@@ -63,6 +85,10 @@ $report = @{
     git_revision = (& git rev-parse HEAD | Out-String).Trim()
     working_tree_modified = [bool](& git status --porcelain --untracked-files=no | Out-String).Trim()
     scenario = $Scenario
+    baseline_binary = $BaselineBinary
+    current_binary = (Resolve-Path -LiteralPath $binary).Path
+    current_binary_sha256 = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash
+    baseline_binary_sha256 = if ($Scenario -eq "paging") { (Get-FileHash -LiteralPath $BaselineBinary -Algorithm SHA256).Hash } else { $null }
     input_sha256 = (Get-FileHash -LiteralPath $inputFile -Algorithm SHA256).Hash
     cache_policy = "OS cache uncontrolled; fresh child process per sample; alternating mode order"
     scope = switch ($Scenario) {
@@ -70,6 +96,8 @@ $report = @{
         "tree" { "Engine with all nodes expanded and regex .* matching all nodes; excludes GUI/JSONPath" }
         "export" { "Engine exporting full root; legacy formatted String versus stream with flush/sync/atomic rename; excludes GUI" }
         "backend" { "Memory Value backend versus validated file-snapshot/range backend, including initial root preview; excludes GUI/search/query/export" }
+        "paging" { "Previous resident range index versus paged range index; fresh engines with root preview; excludes GUI/search/query/export; cache limits exclude OS file cache" }
+        "indexed-tree" { "Paged range index with all nodes expanded and regex .* matching all nodes; excludes GUI/JSONPath" }
         default { "Document engine only; excludes GUI, fonts, tree rows, search, query, export and document switching" }
     }
     summary = $summary

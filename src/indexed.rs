@@ -1,4 +1,5 @@
 //! Validated file-range backend. No memory mapping and no whole-document Value.
+use super::paged::{Paged, Record};
 use super::{Document, Kind, Node, NodeIds, SearchScope, Storage, compact, short};
 use regex::RegexBuilder;
 use serde_json::Value;
@@ -332,6 +333,19 @@ struct Range {
     start: u64,
     end: u64,
 }
+impl Record for Range {
+    const WIDTH: usize = 16;
+    fn encode(self, bytes: &mut [u8]) {
+        bytes[..8].copy_from_slice(&self.start.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.end.to_le_bytes());
+    }
+    fn decode(bytes: &[u8]) -> Result<Self, String> {
+        Ok(Self {
+            start: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            end: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+        })
+    }
+}
 #[derive(Default)]
 struct Cache {
     entries: HashMap<usize, (Arc<Value>, usize)>,
@@ -340,7 +354,9 @@ struct Cache {
 }
 pub(super) struct Store {
     source: Snapshot,
-    ranges: Vec<Range>,
+    ranges: Paged<Range>,
+    nodes: Paged<Node>,
+    children: Paged<u32>,
     cache: Mutex<Cache>,
 }
 fn value_cost(value: &Value) -> usize {
@@ -363,12 +379,27 @@ fn value_cost(value: &Value) -> usize {
         }
 }
 impl Store {
-    pub(super) fn range_bytes(&self) -> usize {
-        self.ranges.capacity() * std::mem::size_of::<Range>()
+    pub(super) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+    pub(super) fn node(&self, id: usize) -> Result<Node, String> {
+        self.nodes.get(id)
+    }
+    pub(super) fn edge(&self, id: usize) -> Result<u32, String> {
+        self.children.get(id)
+    }
+    pub(super) fn node_cache_bytes(&self) -> usize {
+        self.nodes.cache_bytes()
+    }
+    pub(super) fn structure_cache_bytes(&self) -> usize {
+        self.nodes.cache_bytes() + self.ranges.cache_bytes() + self.children.cache_bytes()
+    }
+    pub(super) fn disk_bytes(&self) -> u64 {
+        self.nodes.disk_bytes() + self.ranges.disk_bytes() + self.children.disk_bytes()
     }
     pub(super) fn subtree(&self, doc: &Document, id: usize) -> Result<Arc<Value>, String> {
-        let range = self.ranges.get(id).ok_or("Invalid node ID")?;
-        if range.end - range.start > SUBTREE_LIMIT as u64 || doc.nodes[id].end() - id > 16_384 {
+        let range = self.ranges.get(id)?;
+        if range.end - range.start > SUBTREE_LIMIT as u64 || doc.node(id)?.end() - id > 16_384 {
             return Err("Subtree exceeds the bounded parse limit (256 KiB / 16,384 nodes); use range preview or export".into());
         }
         {
@@ -404,13 +435,13 @@ impl Store {
         Ok(value)
     }
     pub(super) fn row_preview(&self, doc: &Document, id: usize) -> Result<String, String> {
-        let node = &doc.nodes[id];
+        let node = doc.node(id)?;
         match node.kind {
             Kind::Object => Ok(format!("{{ {} keys }}", node.child_count)),
             Kind::Array => Ok(format!("[ {} items ]", node.child_count)),
             Kind::String => {
                 let mut reader = Reader::new(&self.source);
-                reader.pos = self.ranges[id].start;
+                reader.pos = self.ranges.get(id)?.start;
                 reader.expect(b'"')?;
                 let mut text = String::new();
                 for _ in 0..160 {
@@ -425,7 +456,7 @@ impl Store {
                 Ok(serde_json::to_string(&text).unwrap())
             }
             Kind::Number => {
-                let range = self.ranges[id];
+                let range = self.ranges.get(id)?;
                 if range.end - range.start <= SUBTREE_LIMIT as u64 {
                     return Ok(short(
                         self.subtree(doc, id)?.as_number().unwrap().as_str(),
@@ -459,19 +490,23 @@ impl Store {
             id: usize,
             depth: usize,
         ) -> io::Result<()> {
-            let node = &doc.nodes[id];
+            let node = doc.node(id).map_err(io::Error::other)?;
             if node.container() {
                 let object = matches!(node.kind, Kind::Object);
                 output.write_all(if object { b"{" } else { b"[" })?;
                 for (ordinal, child) in doc.direct_children(id).enumerate() {
+                    let child = child.map_err(io::Error::other)?;
                     if ordinal != 0 {
                         output.write_all(b",")?;
                     }
                     output.write_all(b"\n")?;
                     indent(output, depth + 1)?;
                     if object {
-                        serde_json::to_writer(&mut *output, doc.key(child).as_ref())
-                            .map_err(io::Error::other)?;
+                        serde_json::to_writer(
+                            &mut *output,
+                            doc.try_key(child).map_err(io::Error::other)?.as_ref(),
+                        )
+                        .map_err(io::Error::other)?;
                         output.write_all(b": ")?;
                     }
                     value(store, doc, reader, output, child, depth + 1)?;
@@ -482,7 +517,7 @@ impl Store {
                 }
                 output.write_all(if object { b"}" } else { b"]" })
             } else {
-                let range = store.ranges[id];
+                let range = store.ranges.get(id).map_err(io::Error::other)?;
                 reader.pos = range.start;
                 while reader.pos < range.end {
                     reader.peek().map_err(io::Error::other)?;
@@ -556,14 +591,15 @@ impl Store {
         let array_keys = regex || term.bytes().all(|byte| byte.is_ascii_digit());
         let mut reader = Reader::new(&self.source);
         let mut ids = Vec::new();
-        for (id, node) in doc.nodes.iter().enumerate() {
+        for id in 0..doc.node_count() {
+            let node = doc.node(id)?;
             if id % 1024 == 0 && cancelled() {
                 return Err("Search cancelled".into());
             }
             let key_match = scope != SearchScope::Values
                 && match node.parent() {
                     None => matcher.is_match("$"),
-                    Some(parent) if matches!(doc.nodes[parent].kind, Kind::Array) => {
+                    Some(parent) if matches!(doc.node(parent)?.kind, Kind::Array) => {
                         array_keys && matcher.is_match(&node.segment.to_string())
                     }
                     _ => keys[node.segment as usize],
@@ -575,21 +611,23 @@ impl Store {
                     Kind::Object | Kind::Array => false,
                     Kind::Null => matcher.is_match("null"),
                     Kind::Boolean | Kind::Number => {
-                        let value = reader.scalar(self.ranges[id])?;
+                        let value = reader.scalar(self.ranges.get(id)?)?;
                         match &value {
                             Value::Number(number) => matcher.is_match(number.as_str()),
                             _ => matcher.is_match(&value.to_string()),
                         }
                     }
                     Kind::String if regex => {
-                        if self.ranges[id].end - self.ranges[id].start > SUBTREE_LIMIT as u64 {
+                        if self.ranges.get(id)?.end - self.ranges.get(id)?.start
+                            > SUBTREE_LIMIT as u64
+                        {
                             return Err("Indexed regex search requires strings <=256 KiB; use in-memory mode for larger values".into());
                         }
-                        let value = reader.scalar(self.ranges[id])?;
+                        let value = reader.scalar(self.ranges.get(id)?)?;
                         matcher.is_match(value.as_str().unwrap())
                     }
                     Kind::String => {
-                        reader.pos = self.ranges[id].start;
+                        reader.pos = self.ranges.get(id)?.start;
                         reader.expect(b'"')?;
                         let mut window = String::new();
                         let mut added = 0;
@@ -620,7 +658,7 @@ impl Store {
             };
             if key_match || value_match {
                 if ids.len() == ids.capacity() {
-                    ids.reserve_exact(ids.capacity().max(1024).min(doc.nodes.len() - ids.len()));
+                    ids.reserve_exact(ids.capacity().max(1024).min(doc.node_count() - ids.len()));
                 }
                 ids.push(id as u32);
             }
@@ -990,15 +1028,23 @@ pub(super) fn open(
     if cancelled() {
         return Err("Loading cancelled".into());
     }
+    let nodes = Paged::create(nodes, 8 * 1024 * 1024, &cancelled)?;
+    let ranges = Paged::create(ranges, 4 * 1024 * 1024, &cancelled)?;
+    let children = Paged::create(children, 4 * 1024 * 1024, &cancelled)?;
+    if cancelled() {
+        return Err("Loading cancelled".into());
+    }
     Ok(Document {
-        storage: Storage::Indexed(Store {
+        storage: Storage::Indexed(Box::new(Store {
             source,
             ranges,
+            nodes,
+            children,
             cache: Mutex::new(Cache::default()),
-        }),
-        nodes,
+        })),
+        nodes: Vec::new(),
         bytes,
-        children,
+        children: Vec::new(),
         keys,
         key_ids,
     })
@@ -1186,7 +1232,7 @@ pub(super) fn query(
         let mut result = Vec::new();
         for &base in &current {
             let end = if recursive {
-                doc.nodes[base as usize].end()
+                doc.node(base as usize)?.end()
             } else {
                 base as usize + 1
             };
@@ -1197,12 +1243,13 @@ pub(super) fn query(
                 for selector in &selectors {
                     match selector {
                         Selector::Name(name) => {
-                            if let Some(id) = doc.child_name(id, name) {
+                            if let Some(id) = doc.child_name(id, name)? {
                                 result_id(&mut result, id)?;
                             }
                         }
                         Selector::Wildcard => {
                             for child in doc.direct_children(id) {
+                                let child = child?;
                                 if cancelled() {
                                     return Err("Query cancelled".into());
                                 }
@@ -1210,23 +1257,23 @@ pub(super) fn query(
                             }
                         }
                         Selector::Index(index) => {
-                            let len = doc.nodes[id].child_count as i64;
+                            let len = doc.node(id)?.child_count as i64;
                             let index = if *index < 0 {
                                 len.saturating_add(*index)
                             } else {
                                 *index
                             };
                             if index >= 0
-                                && let Some(id) = doc.child_index(id, index as usize)
+                                && let Some(id) = doc.child_index(id, index as usize)?
                             {
                                 result_id(&mut result, id)?;
                             }
                         }
                         Selector::Slice(start, end, step) => {
-                            if !matches!(doc.nodes[id].kind, Kind::Array) || *step == 0 {
+                            if !matches!(doc.node(id)?.kind, Kind::Array) || *step == 0 {
                                 continue;
                             }
-                            let len = doc.nodes[id].child_count as i64;
+                            let len = doc.node(id)?.child_count as i64;
                             let normalize = |value: Option<i64>, default| {
                                 value.map_or(default, |value| {
                                     if value < 0 {
@@ -1253,7 +1300,7 @@ pub(super) fn query(
                                 }
                                 result_id(
                                     &mut result,
-                                    doc.child_index(id, index as usize).unwrap(),
+                                    doc.child_index(id, index as usize)?.unwrap(),
                                 )?;
                                 let Some(next) = index.checked_add(*step) else {
                                     break;
@@ -1310,12 +1357,18 @@ mod tests {
         let indexed = input.open();
         let memory = Document::parse(text).unwrap();
         assert!(indexed.value().is_none());
-        assert_eq!(indexed.nodes.len(), memory.nodes.len());
+        assert_eq!(indexed.node_count(), memory.node_count());
         assert_eq!(json(&indexed, 0), *memory.value().unwrap());
-        for id in 0..memory.nodes.len() {
+        for id in 0..memory.node_count() {
             assert_eq!(indexed.path(id), memory.path(id));
-            assert_eq!(indexed.nodes[id].parent(), memory.nodes[id].parent());
-            assert_eq!(indexed.nodes[id].end(), memory.nodes[id].end());
+            assert_eq!(
+                indexed.node(id).unwrap().parent(),
+                memory.node(id).unwrap().parent()
+            );
+            assert_eq!(
+                indexed.node(id).unwrap().end(),
+                memory.node(id).unwrap().end()
+            );
             assert_eq!(json(&indexed, id), *memory.at(id));
             assert_eq!(indexed.find_path(&memory.path(id)).unwrap(), id);
             assert_eq!(
@@ -1522,5 +1575,70 @@ mod tests {
         let doc = input.open();
         assert!(doc.read_subtree(0).unwrap_err().contains("limit"));
         assert!(doc.value().is_none());
+    }
+    #[test]
+    fn paged_tables_preserve_navigation_search_and_output_after_eviction() {
+        let value = serde_json::json!({"rows": (0..12_000).map(|i| serde_json::json!({"k": i, "text": format!("item-{i}")})).collect::<Vec<_>>()});
+        let text = value.to_string();
+        let input = Input::new(text.as_bytes());
+        let mut indexed = input.open();
+        let memory = Document::parse(&text).unwrap();
+        if let Storage::Indexed(store) = &mut indexed.storage {
+            store.nodes.test_budget(BLOCK);
+            store.ranges.test_budget(BLOCK);
+            store.children.test_budget(BLOCK);
+        }
+        assert!(indexed.nodes.is_empty() && indexed.children.is_empty());
+        assert_eq!(
+            indexed.structure_disk_bytes(),
+            indexed.node_count() as u64 * 48 - 4
+        );
+        for expression in ["$.rows[0,4096,11999,0].k", "$.rows[::-2000].text", "$..k"] {
+            assert_eq!(
+                indexed.query_path(expression).unwrap(),
+                memory.query_path(expression).unwrap()
+            );
+        }
+        for index in [11_999, 0, 4096, 8192, 0] {
+            let path = format!("$.rows[{index}].text");
+            let id = indexed.find_path(&path).unwrap();
+            assert_eq!(indexed.try_path(id).unwrap(), path);
+            assert_eq!(indexed.row_preview(id), memory.row_preview(id));
+        }
+        assert_eq!(
+            indexed
+                .search("item-11999", false, false, SearchScope::Values)
+                .unwrap(),
+            memory
+                .search("item-11999", false, false, SearchScope::Values)
+                .unwrap()
+        );
+        assert_eq!(json(&indexed, 0), value);
+        let expanded = indexed.initial_expanded().unwrap();
+        assert_eq!(expanded, memory.initial_expanded().unwrap());
+        assert_eq!(
+            indexed.visible(&expanded).unwrap(),
+            memory.visible(&expanded).unwrap()
+        );
+        assert!(indexed.structure_capacity_bytes() <= BLOCK * 3);
+        if let Storage::Indexed(store) = &mut indexed.storage {
+            store.nodes.fail_reads();
+        }
+        assert!(
+            indexed
+                .find_path("/rows/0")
+                .unwrap_err()
+                .contains("Cannot read index page")
+        );
+        assert!(
+            indexed
+                .search("item", false, false, SearchScope::Values)
+                .is_err()
+        );
+        assert!(indexed.write_node(Vec::new(), 0).is_err());
+        assert!(indexed.try_path(1).is_err());
+        let mut rows = vec![0];
+        assert!(indexed.visible_into(&expanded, &mut rows).is_err());
+        assert!(rows.is_empty());
     }
 }

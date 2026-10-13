@@ -334,7 +334,15 @@ impl Viewer {
                     Ok((doc, source, file)) => {
                         self.paste_recovery = None;
                         self.large_copy = None;
-                        self.expanded = doc.nodes.iter().map(|n| n.depth < 2).collect();
+                        self.expanded = match doc.initial_expanded() {
+                            Ok(expanded) => expanded,
+                            Err(error) => {
+                                self.error = Some(error);
+                                self.open_duration =
+                                    self.load_started.take().map(|start| start.elapsed());
+                                return;
+                            }
+                        };
                         self.cancel_operations();
                         self.row_labels.clear();
                         self.detail.clear();
@@ -402,8 +410,19 @@ impl Viewer {
         }
     }
     fn rebuild_rows(&mut self) {
-        if let Some(doc) = &self.doc {
-            doc.visible_into(&self.expanded, &mut self.rows);
+        if let Some(doc) = &self.doc
+            && let Err(error) = doc.visible_into(&self.expanded, &mut self.rows)
+        {
+            self.error = Some(error);
+        }
+    }
+    fn read_node(&mut self, id: usize) -> Option<crate::document::Node> {
+        match self.doc.as_ref()?.node(id) {
+            Ok(node) => Some(node),
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
         }
     }
     fn select(&mut self, id: usize) {
@@ -418,8 +437,15 @@ impl Viewer {
             self.history_index = self.history.len() - 1;
         }
         if self.selected != id || self.detail.is_empty() {
+            let path = match doc.try_path(id) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
             self.detail = doc.preview(id);
-            self.selected_path = doc.path(id);
+            self.selected_path = path;
         }
         self.selected = id;
     }
@@ -462,8 +488,9 @@ impl Viewer {
             Action::Move(delta) => self.move_rows(delta, count),
             Action::Left | Action::Right => {
                 for _ in 0..count {
-                    let doc = self.doc.as_ref().unwrap();
-                    let node = &doc.nodes[self.selected];
+                    let Some(node) = self.read_node(self.selected) else {
+                        break;
+                    };
                     if command.action == Action::Left {
                         if node.container() && self.expanded[self.selected] {
                             self.toggle(self.selected);
@@ -498,7 +525,9 @@ impl Viewer {
                 }
             }
             Action::Toggle | Action::Open | Action::Close => {
-                if self.doc.as_ref().unwrap().nodes[self.selected].container() {
+                if let Some(node) = self.read_node(self.selected)
+                    && node.container()
+                {
                     let want_open = command.action == Action::Open;
                     if command.action == Action::Toggle || self.expanded[self.selected] != want_open
                     {
@@ -556,10 +585,22 @@ impl Viewer {
     }
     fn reveal(&mut self, id: usize) {
         if let Some(doc) = &self.doc {
-            let mut parent = doc.nodes[id].parent();
+            let mut parent = match doc.node(id) {
+                Ok(node) => node.parent(),
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
             while let Some(p) = parent {
                 self.expanded[p] = true;
-                parent = doc.nodes[p].parent();
+                parent = match doc.node(p) {
+                    Ok(node) => node.parent(),
+                    Err(error) => {
+                        self.error = Some(error);
+                        return;
+                    }
+                };
             }
         }
         self.select(id);
@@ -829,12 +870,11 @@ impl Viewer {
         }
     }
     fn toggle(&mut self, id: usize) {
+        let Some(node) = self.read_node(id) else {
+            return;
+        };
         self.expanded[id] = !self.expanded[id];
-        if let Some(doc) = &self.doc
-            && !self.expanded[id]
-            && self.selected > id
-            && self.selected < doc.nodes[id].end()
-        {
+        if !self.expanded[id] && self.selected > id && self.selected < node.end() {
             self.select(id);
         }
         self.rebuild_rows();
@@ -960,7 +1000,9 @@ impl Viewer {
     fn selection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal_wrapped(|ui| {
             ui.heading("Value preview");
-            let node = &self.doc.as_ref().unwrap().nodes[self.selected];
+            let Some(node) = self.read_node(self.selected) else {
+                return;
+            };
             ui.colored_label(kind_color(node.kind(), self.colors.active()), node.kind());
             if ui
                 .checkbox(&mut self.colors.wrap_values, "Wrap")
@@ -1288,7 +1330,7 @@ impl Viewer {
                         ui.label(RichText::new(self.vim.display()).monospace().color(Color32::from_rgb(100, 180, 235)));
                         if let Some(doc) = &self.doc {
                             ui.label(doc.backend_name());
-                            ui.label(format!("{} nodes", doc.nodes.len())).on_hover_text(format!("{:.1} KB", doc.bytes as f64 / 1024.0));
+                            ui.label(format!("{} nodes", doc.node_count())).on_hover_text(format!("{:.1} KB", doc.bytes as f64 / 1024.0));
                         }
                         if let Some((position, path)) = self.cursor_location() {
                             ui.label(RichText::new(position).monospace()).on_hover_text("Current visible tree row / total visible rows");
@@ -1421,7 +1463,13 @@ impl Viewer {
                 for row in range {
                     let id = self.rows[row] as usize;
                     let doc = self.doc.as_ref().unwrap();
-                    let node = &doc.nodes[id];
+                    let node = match doc.node(id) {
+                        Ok(node) => node,
+                        Err(error) => {
+                            self.error = Some(error);
+                            break;
+                        }
+                    };
                     let labels = self
                         .row_labels
                         .labels(id, || (doc.key(id).into_owned(), doc.row_preview(id)));
@@ -1730,7 +1778,7 @@ mod tests {
     fn loaded() -> Viewer {
         let mut app = Viewer::empty();
         let doc = Document::parse(DEMO).unwrap();
-        app.expanded = vec![false; doc.nodes.len()];
+        app.expanded = vec![false; doc.node_count()];
         app.doc = Some(Arc::new(doc));
         app.select(0);
         app.rebuild_rows();

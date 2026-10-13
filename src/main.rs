@@ -124,7 +124,7 @@ fn run() -> Result<(), String> {
             writeln!(output).map_err(|e| e.to_string())?;
         } else if let Some(term) = search {
             for id in doc.search(&term, false, false, SearchScope::All)? {
-                writeln!(output, "{}", doc.path(id as usize)).map_err(|e| e.to_string())?;
+                writeln!(output, "{}", doc.try_path(id as usize)?).map_err(|e| e.to_string())?;
             }
         } else {
             doc.write_node(&mut output, 0).map_err(|e| e.to_string())?;
