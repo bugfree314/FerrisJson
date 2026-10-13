@@ -1,5 +1,5 @@
 //! One active operation and one replaceable pending request per worker.
-use crate::document::{Document, SearchScope};
+use crate::document::{Document, NodeIds, SearchScope};
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -17,10 +17,10 @@ pub enum Operation {
     Query(String),
 }
 pub enum Output {
-    Search(Vec<usize>),
+    Search(NodeIds),
     Query {
         expression: String,
-        ids: Vec<usize>,
+        ids: NodeIds,
         preview: String,
     },
 }

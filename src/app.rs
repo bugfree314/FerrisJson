@@ -1,13 +1,14 @@
 use crate::{
-    document::{Document, SearchScope},
+    document::{Document, NodeIds, SearchScope},
+    export::{self, COPY_LIMIT, CopyError, Selection},
     palette::{ColorSettings, Preset, color},
+    row_cache::RowCache,
     ui::{json_preview, kind_color},
     vim::{Action, Command, Vim},
     worker::{Operation, Output, Worker},
 };
 use eframe::egui::{self, Color32, Key, RichText};
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -22,9 +23,13 @@ const DEMO: &str = include_str!("../examples/sample.json");
 type LoadResult = Result<(Document, String, Option<PathBuf>), String>;
 struct PathResults {
     expression: String,
-    ids: Vec<usize>,
+    ids: Arc<NodeIds>,
     preview: String,
     error: Option<String>,
+}
+struct CopyRequest {
+    doc: Arc<Document>,
+    selection: Selection,
 }
 
 pub struct Viewer {
@@ -33,7 +38,11 @@ pub struct Viewer {
     path_worker: Option<Worker>,
     search_due: Option<Instant>,
     pending_expression: String,
-    row_labels: HashMap<usize, (String, String)>,
+    row_labels: RowCache,
+    pending_export: Option<Receiver<Result<PathBuf, String>>>,
+    export_thread: Option<std::thread::JoinHandle<()>>,
+    export_cancelled: Arc<AtomicBool>,
+    large_copy: Option<CopyRequest>,
     selected_path: String,
     source: String,
     file: Option<PathBuf>,
@@ -45,8 +54,8 @@ pub struct Viewer {
     query_duration: Option<(&'static str, Duration)>,
     expanded: Vec<bool>,
     selected: usize,
-    rows: Vec<usize>,
-    matches: Vec<usize>,
+    rows: NodeIds,
+    matches: NodeIds,
     match_index: usize,
     term: String,
     case: bool,
@@ -67,6 +76,7 @@ pub struct Viewer {
     notice: String,
     paste_open: bool,
     paste: String,
+    paste_recovery: Option<Receiver<String>>,
     help: bool,
     focus_search: bool,
     scroll_to: bool,
@@ -119,7 +129,11 @@ impl Viewer {
             path_worker: None,
             search_due: None,
             pending_expression: String::new(),
-            row_labels: HashMap::new(),
+            row_labels: RowCache::default(),
+            pending_export: None,
+            export_thread: None,
+            export_cancelled: Arc::new(AtomicBool::new(false)),
+            large_copy: None,
             selected_path: String::new(),
             source: "No document".into(),
             file: None,
@@ -153,6 +167,7 @@ impl Viewer {
             notice: String::new(),
             paste_open: false,
             paste: String::new(),
+            paste_recovery: None,
             help: false,
             focus_search: false,
             scroll_to: false,
@@ -166,7 +181,7 @@ impl Viewer {
     fn cursor_location(&self) -> Option<(String, String)> {
         self.doc.as_ref()?;
         // Visible IDs stay sorted; avoid scanning the whole document on every frame.
-        let row = self.rows.binary_search(&self.selected).ok()? + 1;
+        let row = self.rows.binary_search(&(self.selected as u32)).ok()? + 1;
         let total = self.rows.len();
         let progress = if total <= 1 {
             "All".into()
@@ -219,6 +234,13 @@ impl Viewer {
         }
         self.load_started = Some(Instant::now());
         let old = self.prepare_load();
+        let recovery = if source == "Pasted JSON" {
+            let (tx, rx) = mpsc::channel();
+            self.paste_recovery = Some(rx);
+            Some(tx)
+        } else {
+            None
+        };
         let waiting = Arc::clone(&self.waiting_for_old);
         let cancelled = Arc::clone(&self.loading_cancelled);
         self.open_duration = None;
@@ -230,23 +252,36 @@ impl Viewer {
             if !wait_for_old_document(old, &waiting, &cancelled, &ctx) {
                 return;
             }
-            let _ = tx.send(Document::parse_owned(text).map(|doc| (doc, source, None)));
+            let result = if let Some(recovery) = recovery {
+                Document::parse_owned_recover(text).map_err(|(error, text)| {
+                    if let Some(text) = text {
+                        let _ = recovery.send(text);
+                    }
+                    error
+                })
+            } else {
+                Document::parse_owned(text)
+            };
+            let _ = tx.send(result.map(|doc| (doc, source, None)));
             ctx.request_repaint();
         });
     }
     fn prepare_load(&mut self) -> Option<Arc<Document>> {
         self.loading_cancelled.store(false, Ordering::Relaxed);
+        self.large_copy = None;
+        self.paste_recovery = None;
         if !self.colors.low_memory_load {
             return None;
         }
         self.cancel_operations();
+        self.export_cancelled.store(true, Ordering::Relaxed);
         let old = self.doc.take();
         self.waiting_for_old.store(old.is_some(), Ordering::Relaxed);
         self.rows = Vec::new();
         self.expanded = Vec::new();
         self.matches = Vec::new();
         self.path_results = None;
-        self.row_labels = HashMap::new();
+        self.row_labels.clear();
         self.detail = String::new();
         self.selected_path = String::new();
         self.history = Vec::new();
@@ -274,6 +309,8 @@ impl Viewer {
                 self.pending = None;
                 match result {
                     Ok((doc, source, file)) => {
+                        self.paste_recovery = None;
+                        self.large_copy = None;
                         self.expanded = doc.nodes.iter().map(|n| n.depth < 2).collect();
                         self.cancel_operations();
                         self.row_labels.clear();
@@ -283,7 +320,7 @@ impl Viewer {
                         self.file = file;
                         self.selected = 0;
                         self.term.clear();
-                        self.matches.clear();
+                        self.matches = Vec::new();
                         self.search_error = None;
                         self.query_duration = None;
                         self.path_results = None;
@@ -296,6 +333,12 @@ impl Viewer {
                         self.rebuild_rows();
                     }
                     Err(error) => {
+                        if let Some(text) =
+                            self.paste_recovery.take().and_then(|rx| rx.try_recv().ok())
+                        {
+                            self.paste = text;
+                            self.paste_open = true;
+                        }
                         self.error = Some(error);
                         if self.doc.is_none() && self.colors.low_memory_load {
                             self.notice =
@@ -324,7 +367,7 @@ impl Viewer {
     }
     fn rebuild_rows(&mut self) {
         if let Some(doc) = &self.doc {
-            self.rows = doc.visible(&self.expanded);
+            doc.visible_into(&self.expanded, &mut self.rows);
         }
     }
     fn select(&mut self, id: usize) {
@@ -363,11 +406,11 @@ impl Viewer {
         let position = self
             .rows
             .iter()
-            .position(|&id| id == self.selected)
+            .position(|&id| id as usize == self.selected)
             .unwrap_or(0);
         let next = (position as i64 + delta as i64 * count as i64)
             .clamp(0, self.rows.len() as i64 - 1) as usize;
-        self.reveal(self.rows[next]);
+        self.reveal(self.rows[next] as usize);
     }
     fn start_search(&mut self, reverse: bool) {
         self.search_reverse = reverse;
@@ -410,7 +453,7 @@ impl Viewer {
                 } else {
                     self.rows.len() - 1
                 };
-                self.reveal(self.rows[pos]);
+                self.reveal(self.rows[pos] as usize);
             }
             Action::Match(opposite) => self.match_step(self.search_reverse ^ opposite, count),
             Action::History(backwards) => {
@@ -441,7 +484,9 @@ impl Viewer {
                     'L' => self.page_rows.saturating_sub(1),
                     _ => 0,
                 };
-                self.reveal(self.rows[(self.viewport_first + offset).min(self.rows.len() - 1)]);
+                self.reveal(
+                    self.rows[(self.viewport_first + offset).min(self.rows.len() - 1)] as usize,
+                );
             }
         }
     }
@@ -498,7 +543,7 @@ impl Viewer {
         if let Some(worker) = &mut self.search_worker {
             worker.cancel();
         }
-        self.matches.clear();
+        self.matches = Vec::new();
         self.search_error = None;
         self.query_duration = None;
         if self.term.is_empty() {
@@ -510,7 +555,7 @@ impl Viewer {
     }
     fn search(&mut self) {
         self.search_due = None;
-        self.matches.clear();
+        self.matches = Vec::new();
         self.search_error = None;
         self.match_index = 0;
         self.query_duration = None;
@@ -540,7 +585,7 @@ impl Viewer {
             self.finish_search(result, started.elapsed());
         }
     }
-    fn finish_search(&mut self, result: Result<Vec<usize>, String>, elapsed: Duration) {
+    fn finish_search(&mut self, result: Result<NodeIds, String>, elapsed: Duration) {
         let started = Instant::now();
         match result {
             Ok(ids) => self.matches = ids,
@@ -550,15 +595,15 @@ impl Viewer {
             self.match_index = if self.search_reverse {
                 self.matches
                     .iter()
-                    .rposition(|&id| id < self.search_origin)
+                    .rposition(|&id| (id as usize) < self.search_origin)
                     .unwrap_or(self.matches.len() - 1)
             } else {
                 self.matches
                     .iter()
-                    .position(|&id| id > self.search_origin)
+                    .position(|&id| id as usize > self.search_origin)
                     .unwrap_or(0)
             };
-            self.reveal(self.matches[self.match_index]);
+            self.reveal(self.matches[self.match_index] as usize);
         }
         self.query_duration = Some(("Search", elapsed + started.elapsed()));
     }
@@ -586,7 +631,7 @@ impl Viewer {
             self.finish_path(result, started.elapsed());
         }
     }
-    fn finish_path(&mut self, result: Result<(Vec<usize>, String), String>, elapsed: Duration) {
+    fn finish_path(&mut self, result: Result<(NodeIds, String), String>, elapsed: Duration) {
         let started = Instant::now();
         match result {
             Ok((ids, preview)) => {
@@ -595,17 +640,17 @@ impl Viewer {
                 self.path_results = Some(PathResults {
                     expression: self.pending_expression.clone(),
                     preview,
-                    ids,
+                    ids: Arc::new(ids),
                     error: None,
                 });
                 if let Some(id) = first {
-                    self.reveal(id);
+                    self.reveal(id as usize);
                 }
             }
             Err(error) => {
                 self.path_results = Some(PathResults {
                     expression: self.pending_expression.clone(),
-                    ids: Vec::new(),
+                    ids: Arc::new(Vec::new()),
                     preview: String::new(),
                     error: Some(error),
                 });
@@ -660,34 +705,90 @@ impl Viewer {
         } else {
             (self.match_index + count) % self.matches.len()
         };
-        self.reveal(self.matches[self.match_index]);
+        self.reveal(self.matches[self.match_index] as usize);
     }
     fn copy(&mut self, ctx: &egui::Context, path: bool) {
-        if let Some(doc) = &self.doc {
-            ctx.copy_text(if path {
-                self.selected_path.clone()
-            } else {
-                serde_json::to_string_pretty(doc.at(self.selected)).unwrap()
-            });
-            self.notice = if path { "Path copied" } else { "JSON copied" }.into();
+        if path {
+            if self.doc.is_some() {
+                ctx.copy_text(self.selected_path.clone());
+                self.notice = "Path copied".into();
+            }
+        } else if let Some(doc) = &self.doc {
+            self.copy_selection(Arc::clone(doc), Selection::Node(self.selected), ctx);
+        }
+    }
+    fn copy_selection(&mut self, doc: Arc<Document>, selection: Selection, ctx: &egui::Context) {
+        match selection.json(&doc, Some(COPY_LIMIT)) {
+            Ok(json) => {
+                ctx.copy_text(json);
+                self.notice = "JSON copied".into();
+            }
+            Err(CopyError::TooLarge) => {
+                self.large_copy = Some(CopyRequest { doc, selection });
+            }
+            Err(CopyError::Serialization(error)) => self.error = Some(error),
         }
     }
     fn export(&mut self) {
-        let Some(doc) = &self.doc else {
-            return;
-        };
-        let json = serde_json::to_string_pretty(doc.at(self.selected)).unwrap();
-        self.export_json(json);
+        if let Some(doc) = &self.doc {
+            self.export_selection(Arc::clone(doc), Selection::Node(self.selected));
+        }
     }
-    fn export_json(&mut self, json: String) {
+    fn export_selection(&mut self, doc: Arc<Document>, selection: Selection) {
+        if self.pending_export.is_some() {
+            self.notice = "An export is already in progress".into();
+            return;
+        }
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("JSON", &["json"])
             .set_file_name("selection.json")
             .save_file()
         {
-            match std::fs::write(&path, json) {
-                Ok(()) => self.notice = format!("Exported {}", path.display()),
-                Err(error) => self.error = Some(format!("Cannot export: {error}")),
+            self.start_export(path, doc, selection);
+        }
+    }
+    fn start_export(&mut self, path: PathBuf, doc: Arc<Document>, selection: Selection) {
+        self.error = None;
+        self.export_cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::clone(&self.export_cancelled);
+        let (tx, rx) = mpsc::channel();
+        self.pending_export = Some(rx);
+        self.notice = "Exporting JSON...".into();
+        self.export_thread = Some(std::thread::spawn(move || {
+            let result =
+                export::atomic_write(&path, &cancelled, |writer| selection.write(&doc, writer))
+                    .map(|()| path);
+            drop(selection);
+            drop(doc);
+            let _ = tx.send(result);
+        }));
+    }
+    fn poll_export(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.pending_export {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.pending_export = None;
+                    if let Some(thread) = self.export_thread.take() {
+                        let _ = thread.join();
+                    }
+                    match result {
+                        Ok(path) => self.notice = format!("Exported {}", path.display()),
+                        Err(error) if error.contains("Export cancelled") => {
+                            self.notice = "Export cancelled".into()
+                        }
+                        Err(error) => self.error = Some(format!("Cannot export: {error}")),
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_export = None;
+                    if let Some(thread) = self.export_thread.take() {
+                        let _ = thread.join();
+                    }
+                    self.error = Some("Export worker stopped".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(50))
+                }
             }
         }
     }
@@ -704,6 +805,7 @@ impl Viewer {
     }
     fn keyboard(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.large_copy = None;
             self.help = false;
             self.paste_open = false;
             self.colors_open = false;
@@ -718,7 +820,7 @@ impl Viewer {
             self.vim.cancel();
             return;
         }
-        if self.help || self.paste_open || self.colors_open {
+        if self.help || self.paste_open || self.colors_open || self.large_copy.is_some() {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::O)) {
@@ -739,10 +841,10 @@ impl Viewer {
             self.vim.cancel();
             return;
         }
-        if let Some(text) = ctx.input(|i| {
-            i.events.iter().find_map(|e| {
+        if let Some(text) = ctx.input_mut(|i| {
+            i.events.iter_mut().find_map(|e| {
                 if let egui::Event::Paste(t) = e {
-                    Some(t.clone())
+                    Some(std::mem::take(t))
                 } else {
                     None
                 }
@@ -899,12 +1001,12 @@ impl Viewer {
             );
         }
         if copy || export {
-            let json = self.doc.as_ref().unwrap().results_json(&results.ids);
+            let doc = Arc::clone(self.doc.as_ref().unwrap());
+            let selection = Selection::Results(Arc::clone(&results.ids));
             if copy {
-                ctx.copy_text(json);
-                self.notice = "JSONPath results copied".into();
+                self.copy_selection(doc, selection, ctx);
             } else {
-                self.export_json(json);
+                self.export_selection(doc, selection);
             }
         }
         if reset {
@@ -922,6 +1024,7 @@ impl Viewer {
         self.path_worker
             .get_or_insert_with(|| Worker::new(ctx.clone()));
         self.poll();
+        self.poll_export(ctx);
         self.poll_operations(ctx);
         self.keyboard(ctx);
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()))
@@ -958,6 +1061,13 @@ impl Viewer {
                 }
                 if self.pending.is_some() {
                     ui.spinner();
+                }
+                if self.pending_export.is_some() {
+                    ui.spinner();
+                    if ui.button("Cancel export").clicked() {
+                        self.export_cancelled.store(true, Ordering::Relaxed);
+                        self.notice = "Cancelling export...".into();
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Colors").clicked() {
@@ -1243,7 +1353,10 @@ impl Viewer {
                 .id_salt("tree")
                 .auto_shrink([false, false]);
             if self.scroll_to
-                && let Some(pos) = self.rows.iter().position(|&id| id == self.selected)
+                && let Some(pos) = self
+                    .rows
+                    .iter()
+                    .position(|&id| id as usize == self.selected)
             {
                 area = area.vertical_scroll_offset(
                     (pos as f32 * row_stride - ui.available_height() / 2.0).max(0.0),
@@ -1255,17 +1368,14 @@ impl Viewer {
             area.show_rows(ui, row_height, self.rows.len(), |ui, range| {
                 self.viewport_first = range.start;
                 for row in range {
-                    let id = self.rows[row];
+                    let id = self.rows[row] as usize;
                     let doc = self.doc.as_ref().unwrap();
                     let node = &doc.nodes[id];
-                    if self.row_labels.len() >= 512 && !self.row_labels.contains_key(&id) {
-                        self.row_labels.clear();
-                    }
-                    let (row_key, row_preview) = self
+                    let labels = self
                         .row_labels
-                        .entry(id)
-                        .or_insert_with(|| (doc.key(id).into_owned(), doc.row_preview(id)));
-                    let is_match = self.matches.binary_search(&id).is_ok();
+                        .labels(id, || (doc.key(id).into_owned(), doc.row_preview(id)));
+                    let (row_key, row_preview) = labels.as_ref();
+                    let is_match = self.matches.binary_search(&(id as u32)).is_ok();
                     let palette = self.colors.active();
                     let fill = if id == self.selected {
                         color(palette.selection)
@@ -1346,7 +1456,7 @@ impl Viewer {
             });
             self.paste_open = open;
             if load {
-                self.load_text(self.paste.clone(), "Pasted JSON".into(), ctx);
+                self.load_paste(ctx);
                 self.paste_open = false;
             }
         }
@@ -1362,11 +1472,52 @@ impl Viewer {
             self.dark = self.colors.dark;
             self.colors.active().apply(ctx, self.dark);
         }
+        if self.large_copy.is_some() {
+            let mut action = 0;
+            let mut open = true;
+            egui::Window::new("Large clipboard copy").open(&mut open).collapsible(false).show(ctx, |ui| {
+                ui.label("Formatted JSON exceeds 8 MiB. Copying it may require substantial memory and pause the interface. Export writes directly to a file.");
+                ui.horizontal(|ui| {
+                    if ui.button("Copy anyway").clicked() { action = 1; }
+                    if ui.button("Export instead").clicked() { action = 2; }
+                    if ui.button("Cancel").clicked() { action = 3; }
+                });
+            });
+            if !open {
+                action = 3;
+            }
+            if action != 0 {
+                let request = self.large_copy.take().unwrap();
+                match action {
+                    1 => match request.selection.json(&request.doc, None) {
+                        Ok(json) => {
+                            ctx.copy_text(json);
+                            self.notice = "JSON copied".into();
+                        }
+                        Err(error) => self.error = Some(format!("Cannot copy: {error:?}")),
+                    },
+                    2 => self.export_selection(request.doc, request.selection),
+                    _ => (),
+                }
+            }
+        }
+    }
+}
+impl Viewer {
+    fn load_paste(&mut self, ctx: &egui::Context) {
+        if self.pending.is_none() {
+            let text = std::mem::take(&mut self.paste);
+            self.load_text(text, "Pasted JSON".into(), ctx);
+        }
     }
 }
 impl Drop for Viewer {
     fn drop(&mut self) {
         self.loading_cancelled.store(true, Ordering::Relaxed);
+        self.export_cancelled.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.export_thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 fn wait_for_old_document(
@@ -1394,6 +1545,41 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paste_moves_the_buffer_and_restores_it_on_syntax_error() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::empty();
+        app.paste = "{bad}".into();
+        let allocation = app.paste.as_ptr();
+        app.load_paste(&ctx);
+        assert_eq!(app.paste.capacity(), 0);
+        wait_load(&mut app);
+        assert_eq!(app.paste, "{bad}");
+        assert_eq!(app.paste.as_ptr(), allocation);
+        assert!(app.paste_open);
+        app.paste = r#"{"fixed":42}"#.into();
+        app.load_paste(&ctx);
+        wait_load(&mut app);
+        assert!(app.paste.is_empty());
+        assert_eq!(
+            app.doc.as_ref().unwrap().value,
+            serde_json::json!({"fixed":42})
+        );
+    }
+    #[test]
+    fn large_copy_requires_a_choice_and_does_not_silently_truncate() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::empty();
+        let doc = Arc::new(
+            Document::parse(&serde_json::json!("x".repeat(COPY_LIMIT + 1)).to_string()).unwrap(),
+        );
+        app.doc = Some(Arc::clone(&doc));
+        app.copy(&ctx, false);
+        assert!(app.large_copy.is_some());
+        assert!(Arc::ptr_eq(&app.large_copy.as_ref().unwrap().doc, &doc));
+        app.prepare_load();
+        assert!(app.large_copy.is_none());
+    }
     fn wait_load(app: &mut Viewer) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.pending.is_some() {
@@ -1503,7 +1689,7 @@ mod tests {
         assert!(app.matches.is_empty());
         wait_operations(&mut app, &ctx);
         assert_eq!(app.matches.len(), 2);
-        assert!(app.rows.contains(&app.selected));
+        assert!(app.rows.contains(&(app.selected as u32)));
         app.query = "$.users[*].name".into();
         app.go_to_path();
         wait_operations(&mut app, &ctx);
@@ -1555,7 +1741,7 @@ mod tests {
         app.search();
         assert_eq!(app.matches.len(), 2);
         let first = app.selected;
-        assert!(app.rows.contains(&first));
+        assert!(app.rows.contains(&(first as u32)));
         app.next_match(false);
         assert_ne!(first, app.selected);
         app.next_match(false);
@@ -1732,11 +1918,11 @@ mod tests {
         frame(&mut app, "g");
         assert_eq!(app.selected, 0);
         frame(&mut app, "G");
-        assert_eq!(app.selected, *app.rows.last().unwrap());
+        assert_eq!(app.selected, *app.rows.last().unwrap() as usize);
         frame(&mut app, "[");
         assert_eq!(app.selected, 0);
         frame(&mut app, "]");
-        assert_eq!(app.selected, *app.rows.last().unwrap());
+        assert_eq!(app.selected, *app.rows.last().unwrap() as usize);
         let selected = app.selected;
         ctx.memory_mut(|m| m.request_focus(egui::Id::new("query_field")));
         frame(&mut app, "g");
@@ -1759,17 +1945,17 @@ mod tests {
             );
         };
         feed(&mut app, "5j");
-        assert_eq!(app.selected, app.rows[5]);
+        assert_eq!(app.selected, app.rows[5] as usize);
         assert_eq!(app.vim.display(), "5j");
         feed(&mut app, "2k");
-        assert_eq!(app.selected, app.rows[3]);
+        assert_eq!(app.selected, app.rows[3] as usize);
         feed(&mut app, "4G");
-        assert_eq!(app.selected, app.rows[3]);
+        assert_eq!(app.selected, app.rows[3] as usize);
         app.term = "email".into();
         app.start_search(true);
         app.search();
         let first = app.selected;
-        assert_eq!(first, *app.matches.last().unwrap());
+        assert_eq!(first, *app.matches.last().unwrap() as usize);
         app.execute_vim(
             Command {
                 action: Action::Match(false),
@@ -1778,7 +1964,7 @@ mod tests {
             },
             &ctx,
         );
-        assert_eq!(app.selected, app.matches[0]);
+        assert_eq!(app.selected, app.matches[0] as usize);
         app.execute_vim(
             Command {
                 action: Action::Match(true),
@@ -1894,12 +2080,12 @@ mod tests {
         app.expanded.fill(true);
         app.rebuild_rows();
         assert!(app.cursor_location().unwrap().0.ends_with("Top"));
-        let middle = app.rows[app.rows.len() / 2];
+        let middle = app.rows[app.rows.len() / 2] as usize;
         app.reveal(middle);
         let (position, path) = app.cursor_location().unwrap();
         assert!(position.ends_with('%'));
         assert_eq!(path, app.doc.as_ref().unwrap().path(middle));
-        app.reveal(*app.rows.last().unwrap());
+        app.reveal(*app.rows.last().unwrap() as usize);
         assert!(app.cursor_location().unwrap().0.ends_with("Bot"));
         app.toggle(0);
         assert_eq!(app.cursor_location().unwrap().0, "Ln 1/1 All");

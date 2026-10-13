@@ -8,6 +8,8 @@ use std::{
     sync::Arc,
 };
 
+pub type NodeIds = Vec<u32>;
+
 #[derive(Clone, Copy)]
 enum Kind {
     Object,
@@ -159,11 +161,17 @@ impl Document {
     }
     /// Consume input so its allocation is released before the full index is built.
     pub fn parse_owned(text: String) -> Result<Self, String> {
+        Self::parse_owned_recover(text).map_err(|(error, _)| error)
+    }
+    /// Return the original allocation on syntax errors so the paste editor can repair it.
+    pub fn parse_owned_recover(text: String) -> Result<Self, (String, Option<String>)> {
         let bytes = text.len();
-        let value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-            .map_err(|e| format!("Invalid JSON: {e}"))?;
+        let value = match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+            Ok(value) => value,
+            Err(error) => return Err((format!("Invalid JSON: {error}"), Some(text))),
+        };
         drop(text);
-        Self::from_value(value, bytes)
+        Self::from_value(value, bytes).map_err(|error| (error, None))
     }
     pub fn from_value(value: Value, bytes: usize) -> Result<Self, String> {
         // Counting avoids geometric capacity growth for the two large index arrays.
@@ -290,25 +298,29 @@ impl Document {
     pub fn find_path(&self, path: &str) -> Result<usize, String> {
         let ids = self.query_path(path)?;
         match ids.as_slice() {
-            [id] => Ok(*id),
+            [id] => Ok(*id as usize),
             [] => Err(format!("Path not found: {path}")),
             _ => Err("Path selected multiple nodes; use --query to retrieve all results".into()),
         }
     }
-    pub fn query_path(&self, expression: &str) -> Result<Vec<usize>, String> {
+    pub fn query_path(&self, expression: &str) -> Result<NodeIds, String> {
         self.query_path_cancellable(expression, || false)
     }
     pub fn query_path_cancellable(
         &self,
         expression: &str,
         cancelled: impl Fn() -> bool,
-    ) -> Result<Vec<usize>, String> {
+    ) -> Result<NodeIds, String> {
         if cancelled() {
             return Err("Query cancelled".into());
         }
         let expression = expression.trim();
         if expression.starts_with('/') {
-            return Ok(self.pointer_id(expression).into_iter().collect());
+            return Ok(self
+                .pointer_id(expression)
+                .map(|id| id as u32)
+                .into_iter()
+                .collect());
         }
         let normalized = if expression == "." {
             "$".into()
@@ -337,7 +349,7 @@ impl Document {
                     }
                     .ok_or_else(|| "Query result not found in tree".to_string())?;
                 }
-                Ok(id)
+                Ok(id as u32)
             })
             .collect()
     }
@@ -353,11 +365,15 @@ impl Document {
     pub fn preview(&self, id: usize) -> String {
         bounded_preview(self.at(id))
     }
-    pub fn results_json(&self, ids: &[usize]) -> String {
+    #[cfg(test)]
+    pub fn results_json(&self, ids: &[u32]) -> String {
         serde_json::to_string_pretty(&SelectedValues { doc: self, ids }).unwrap()
     }
-    pub fn results_preview(&self, ids: &[usize]) -> String {
+    pub fn results_preview(&self, ids: &[u32]) -> String {
         bounded_preview(&SelectedValues { doc: self, ids })
+    }
+    pub fn write_results(&self, writer: impl Write, ids: &[u32]) -> serde_json::Result<()> {
+        serde_json::to_writer_pretty(writer, &SelectedValues { doc: self, ids })
     }
     pub fn search(
         &self,
@@ -365,7 +381,7 @@ impl Document {
         case: bool,
         regex: bool,
         scope: SearchScope,
-    ) -> Result<Vec<usize>, String> {
+    ) -> Result<NodeIds, String> {
         self.search_cancellable(term, case, regex, scope, || false)
     }
     pub fn search_cancellable(
@@ -375,7 +391,7 @@ impl Document {
         regex: bool,
         scope: SearchScope,
         cancelled: impl Fn() -> bool,
-    ) -> Result<Vec<usize>, String> {
+    ) -> Result<NodeIds, String> {
         if term.is_empty() {
             return Ok(Vec::new());
         }
@@ -427,7 +443,15 @@ impl Document {
                     _ => false,
                 };
             if key_match || value_match {
-                matches.push(id);
+                if matches.len() == matches.capacity() {
+                    let extra = matches
+                        .capacity()
+                        .max(1024)
+                        .min(self.nodes.len() - matches.len());
+                    matches.reserve_exact(extra);
+                }
+                // The document index has already validated every ID fits u32.
+                matches.push(id as u32);
             }
             id += 1;
             true
@@ -438,30 +462,56 @@ impl Document {
             Err("Search cancelled".into())
         }
     }
-    pub fn visible(&self, expanded: &[bool]) -> Vec<usize> {
+    #[allow(
+        dead_code,
+        reason = "Convenience entry for tests and standalone benchmarks"
+    )]
+    pub fn visible(&self, expanded: &[bool]) -> NodeIds {
         let mut rows = Vec::new();
-        let mut id = 0;
-        while id < self.nodes.len() {
-            rows.push(id);
-            id = if self.nodes[id].container() && !expanded[id] {
+        self.visible_into(expanded, &mut rows);
+        rows
+    }
+    pub fn visible_into(&self, expanded: &[bool], rows: &mut NodeIds) {
+        let next = |id: usize| {
+            if self.nodes[id].container() && !expanded[id] {
                 self.nodes[id].end()
             } else {
                 id + 1
-            };
+            }
+        };
+        let mut count: usize = 0;
+        let mut id = 0;
+        while id < self.nodes.len() {
+            count += 1;
+            id = next(id);
         }
-        rows
+        if rows.capacity() > count.saturating_mul(2).max(4096) {
+            *rows = Vec::new();
+        }
+        rows.clear();
+        if count > rows.capacity() {
+            let capacity = count
+                .saturating_add((count / 8).min(65_536))
+                .min(self.nodes.len());
+            rows.reserve_exact(capacity);
+        }
+        let mut id = 0;
+        while id < self.nodes.len() {
+            rows.push(id as u32);
+            id = next(id);
+        }
     }
 }
 struct SelectedValues<'a> {
     doc: &'a Document,
-    ids: &'a [usize],
+    ids: &'a [u32],
 }
 impl serde::Serialize for SelectedValues<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.ids.len()))?;
         for &id in self.ids {
-            sequence.serialize_element(self.doc.at(id))?;
+            sequence.serialize_element(self.doc.at(id as usize))?;
         }
         sequence.end()
     }
@@ -539,6 +589,31 @@ fn bounded_preview<T: serde::Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn visible_ids_reuse_capacity_and_release_large_collapsed_arrays() {
+        let doc = Document::parse(&serde_json::json!(vec![0; 10_000]).to_string()).unwrap();
+        let mut expanded = vec![true; doc.nodes.len()];
+        let mut rows = Vec::new();
+        doc.visible_into(&expanded, &mut rows);
+        assert_eq!(rows.len(), doc.nodes.len());
+        assert_eq!(rows.capacity(), doc.nodes.len());
+        let allocation = rows.as_ptr();
+        doc.visible_into(&expanded, &mut rows);
+        assert_eq!(rows.as_ptr(), allocation);
+        expanded[0] = false;
+        doc.visible_into(&expanded, &mut rows);
+        assert_eq!(rows, vec![0]);
+        assert!(rows.capacity() <= 4096);
+    }
+    #[test]
+    fn compact_match_capacity_is_capped_by_node_count() {
+        let doc = Document::parse(&serde_json::json!(vec!["match"; 10_000]).to_string()).unwrap();
+        let ids = doc.search(".*", false, true, SearchScope::All).unwrap();
+        assert_eq!(ids.len(), doc.nodes.len());
+        assert_eq!(ids.capacity(), doc.nodes.len());
+        assert_eq!(ids[ids.len() - 1] as usize, doc.nodes.len() - 1);
+        assert_eq!(std::mem::size_of_val(&ids[0]), 4);
+    }
     #[test]
     fn compact_index_boundaries_and_root_sentinel() {
         assert_eq!(compact(0).unwrap(), 0);
@@ -641,7 +716,7 @@ mod tests {
             Document::parse(&serde_json::json!({"large":"x".repeat(250_000)}).to_string()).unwrap();
         // The invalid trailing ID must never be visited after serialization is truncated.
         assert!(
-            d.results_preview(&[1, usize::MAX])
+            d.results_preview(&[1, u32::MAX])
                 .contains("Preview truncated")
         );
     }
@@ -709,7 +784,7 @@ mod tests {
             d.query_path(expr)
                 .unwrap()
                 .iter()
-                .map(|&id| d.at(id).clone())
+                .map(|&id| d.at(id as usize).clone())
                 .collect::<Vec<_>>()
         };
         assert_eq!(

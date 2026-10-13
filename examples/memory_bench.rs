@@ -2,6 +2,9 @@
 #[allow(dead_code)]
 #[path = "../src/document.rs"]
 mod document;
+#[allow(dead_code)]
+#[path = "../src/export.rs"]
+mod export;
 #[path = "../src/loading.rs"]
 mod loading;
 
@@ -58,9 +61,14 @@ fn tree(file: String) -> Result<(), String> {
     let document_ready = memory();
     let expanded = vec![true; doc.nodes.len()];
     let started = Instant::now();
-    let rows = doc.visible(&expanded);
+    let mut rows = doc.visible(&expanded);
     let rows_ms = started.elapsed().as_secs_f64() * 1000.0;
     let after_rows = memory();
+    let allocation = rows.as_ptr();
+    let started = Instant::now();
+    doc.visible_into(&expanded, &mut rows);
+    let rebuild_rows_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let reused_row_allocation = allocation == rows.as_ptr();
     let started = Instant::now();
     let matches = doc.search(".*", false, true, SearchScope::All)?;
     let search_all_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -71,14 +79,60 @@ fn tree(file: String) -> Result<(), String> {
             "file": file, "mode": "tree", "bytes": doc.bytes, "nodes": doc.nodes.len(),
             "node_size": std::mem::size_of::<document::Node>(),
             "structure_capacity_bytes": doc.structure_capacity_bytes(),
-            "rows": rows.len(), "row_capacity_bytes": rows.capacity() * std::mem::size_of::<usize>(),
-            "matches": matches.len(), "match_capacity_bytes": matches.capacity() * std::mem::size_of::<usize>(),
+            "rows": rows.len(), "row_capacity_bytes": rows.capacity() * std::mem::size_of::<u32>(),
+            "matches": matches.len(), "match_capacity_bytes": matches.capacity() * std::mem::size_of::<u32>(),
             "expanded_capacity_bytes": expanded.capacity() * std::mem::size_of::<bool>(),
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
             "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
             "rows_ms": rows_ms, "search_all_ms": search_all_ms,
+            "rebuild_rows_ms": rebuild_rows_ms, "reused_row_allocation": reused_row_allocation,
             "total_ms": total.elapsed().as_secs_f64() * 1000.0,
             "memory": {"document_ready": document_ready, "after_rows": after_rows, "ready": memory()}
+        })
+    );
+    Ok(())
+}
+
+fn export_file(file: String, mode: String) -> Result<(), String> {
+    let total = Instant::now();
+    let doc = Document::parse_owned(std::fs::read_to_string(&file).map_err(|e| e.to_string())?)?;
+    let document_ready = memory();
+    let directory =
+        std::path::PathBuf::from(format!("target/memory-export-bench-{}", std::process::id()));
+    std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
+    let path = directory.join("output.json");
+    let started = Instant::now();
+    let retained = if mode == "export-string" {
+        let json = serde_json::to_string_pretty(&doc.value).map_err(|e| e.to_string())?;
+        std::fs::write(&path, &json).map_err(|e| e.to_string())?;
+        Some(json)
+    } else {
+        export::atomic_write(
+            &path,
+            &std::sync::atomic::AtomicBool::new(false),
+            |writer| export::Selection::Node(0).write(&doc, writer),
+        )?;
+        None
+    };
+    let export_ms = started.elapsed().as_secs_f64() * 1000.0;
+    black_box(&retained);
+    let after_export = memory();
+    let output_bytes = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    let output_string_capacity = retained.as_ref().map_or(0, String::capacity);
+    drop(retained);
+    let ready = memory();
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    std::fs::remove_dir(&directory).map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        json!({
+            "file": file, "mode": mode, "bytes": doc.bytes, "nodes": doc.nodes.len(),
+            "node_size": std::mem::size_of::<document::Node>(), "output_bytes": output_bytes,
+            "output_string_capacity": output_string_capacity, "export_ms": export_ms,
+            "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
+            "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
+            "total_ms": total.elapsed().as_secs_f64() * 1000.0,
+            "memory": {"document_ready": document_ready, "after_export": after_export, "ready": ready}
         })
     );
     Ok(())
@@ -142,13 +196,22 @@ fn run() -> Result<(), String> {
     let mode = args.next().ok_or("Specify retain or release")?;
     if !matches!(
         mode.as_str(),
-        "retain" | "release" | "switch-normal" | "switch-low" | "tree"
+        "retain"
+            | "release"
+            | "switch-normal"
+            | "switch-low"
+            | "tree"
+            | "export-string"
+            | "export-stream"
     ) || args.next().is_some()
     {
-        return Err("Usage: memory_bench FILE retain|release|switch-normal|switch-low|tree".into());
+        return Err("Usage: memory_bench FILE retain|release|switch-normal|switch-low|tree|export-string|export-stream".into());
     }
     if mode.starts_with("switch-") {
         return switch(file, mode);
+    }
+    if mode.starts_with("export-") {
+        return export_file(file, mode);
     }
     if mode == "tree" {
         return tree(file);
@@ -195,7 +258,7 @@ fn run() -> Result<(), String> {
             "nodes": doc.nodes.len(), "node_size": std::mem::size_of::<document::Node>(),
             "node_capacity_bytes": doc.nodes.capacity() * std::mem::size_of::<document::Node>(),
             "structure_capacity_bytes": doc.structure_capacity_bytes(),
-            "full_expand_rows_payload_bytes": doc.nodes.len() * std::mem::size_of::<usize>(),
+            "full_expand_rows_payload_bytes": doc.nodes.len() * std::mem::size_of::<u32>(),
             "expanded_flags_bytes": doc.nodes.len() * std::mem::size_of::<bool>(),
             "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),

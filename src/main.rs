@@ -6,15 +6,17 @@
 
 mod app;
 mod document;
+mod export;
 mod fonts;
 mod loading;
 mod palette;
+mod row_cache;
 mod ui;
 mod vim;
 mod worker;
 use document::{Document, SearchScope};
 use std::{
-    io::{self, IsTerminal, Read},
+    io::{self, IsTerminal, Read, Write},
     path::PathBuf,
 };
 
@@ -97,20 +99,25 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("Cannot open file: {e}"))?,
         };
         let doc = Document::parse_owned(text)?;
+        let stdout = io::stdout();
+        let mut output = io::BufWriter::new(stdout.lock());
         if let Some(path) = get {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(doc.at(doc.find_path(&path)?)).unwrap()
-            );
+            serde_json::to_writer_pretty(&mut output, doc.at(doc.find_path(&path)?))
+                .map_err(|e| e.to_string())?;
+            writeln!(output).map_err(|e| e.to_string())?;
         } else if let Some(expression) = query {
-            println!("{}", doc.results_json(&doc.query_path(&expression)?));
+            doc.write_results(&mut output, &doc.query_path(&expression)?)
+                .map_err(|e| e.to_string())?;
+            writeln!(output).map_err(|e| e.to_string())?;
         } else if let Some(term) = search {
             for id in doc.search(&term, false, false, SearchScope::All)? {
-                println!("{}", doc.path(id));
+                writeln!(output, "{}", doc.path(id as usize)).map_err(|e| e.to_string())?;
             }
         } else {
-            println!("{}", serde_json::to_string_pretty(&doc.value).unwrap());
+            serde_json::to_writer_pretty(&mut output, &doc.value).map_err(|e| e.to_string())?;
+            writeln!(output).map_err(|e| e.to_string())?;
         }
+        output.flush().map_err(|e| e.to_string())?;
         return Ok(());
     }
     // Finder launches with an empty redirected stdin. Start with an empty viewer
