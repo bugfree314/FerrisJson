@@ -46,12 +46,13 @@ fn run() -> Result<(), String> {
     let mut query = None;
     let mut search = None;
     let mut pretty = false;
+    let mut indexed = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported.",
+                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --indexed      File snapshot/range backend (limited JSONPath; no full Value)\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported in in-memory mode.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
@@ -64,6 +65,7 @@ fn run() -> Result<(), String> {
             "--query" => query = Some(args.next().ok_or("--query requires a JSONPath")?),
             "--search" => search = Some(args.next().ok_or("--search requires text")?),
             "--pretty" => pretty = true,
+            "--indexed" => indexed = true,
             "-" if file.is_none() => file = Some(PathBuf::from("-")),
             _ if arg.starts_with('-') => return Err(format!("Unknown option: {arg}")),
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
@@ -80,6 +82,9 @@ fn run() -> Result<(), String> {
     }
     let use_stdin = file.as_ref().is_some_and(|f| f.as_os_str() == "-")
         || (file.is_none() && stdin_redirected());
+    if indexed && use_stdin {
+        return Err("--indexed requires a file; stdin keeps the in-memory backend".into());
+    }
     let text = if use_stdin {
         let mut text = String::new();
         io::stdin()
@@ -90,19 +95,27 @@ fn run() -> Result<(), String> {
         None
     };
     if get.is_some() || query.is_some() || search.is_some() || pretty {
-        let text = match text {
-            Some(text) => text,
-            None => std::fs::read_to_string(
-                file.as_ref()
-                    .ok_or("Provide a file or pipe JSON to stdin")?,
-            )
-            .map_err(|e| format!("Cannot open file: {e}"))?,
+        let doc = if indexed {
+            Document::open_indexed(
+                file.as_ref().ok_or("Provide a file for --indexed")?,
+                || false,
+                &document::LoadProgress::default(),
+            )?
+        } else {
+            let text = match text {
+                Some(text) => text,
+                None => std::fs::read_to_string(
+                    file.as_ref()
+                        .ok_or("Provide a file or pipe JSON to stdin")?,
+                )
+                .map_err(|e| format!("Cannot open file: {e}"))?,
+            };
+            Document::parse_owned(text)?
         };
-        let doc = Document::parse_owned(text)?;
         let stdout = io::stdout();
         let mut output = io::BufWriter::new(stdout.lock());
         if let Some(path) = get {
-            serde_json::to_writer_pretty(&mut output, doc.at(doc.find_path(&path)?))
+            doc.write_node(&mut output, doc.find_path(&path)?)
                 .map_err(|e| e.to_string())?;
             writeln!(output).map_err(|e| e.to_string())?;
         } else if let Some(expression) = query {
@@ -114,7 +127,7 @@ fn run() -> Result<(), String> {
                 writeln!(output, "{}", doc.path(id as usize)).map_err(|e| e.to_string())?;
             }
         } else {
-            serde_json::to_writer_pretty(&mut output, &doc.value).map_err(|e| e.to_string())?;
+            doc.write_node(&mut output, 0).map_err(|e| e.to_string())?;
             writeln!(output).map_err(|e| e.to_string())?;
         }
         output.flush().map_err(|e| e.to_string())?;
@@ -141,6 +154,7 @@ fn run() -> Result<(), String> {
                 cc,
                 if use_stdin { None } else { file },
                 text,
+                indexed,
             )))
         }),
     )

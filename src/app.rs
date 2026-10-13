@@ -1,5 +1,5 @@
 use crate::{
-    document::{Document, NodeIds, SearchScope},
+    document::{Document, LoadProgress, NodeIds, SearchScope},
     export::{self, COPY_LIMIT, CopyError, Selection},
     palette::{ColorSettings, Preset, color},
     row_cache::RowCache,
@@ -49,6 +49,8 @@ pub struct Viewer {
     pending: Option<Receiver<LoadResult>>,
     waiting_for_old: Arc<AtomicBool>,
     loading_cancelled: Arc<AtomicBool>,
+    indexed_progress: Arc<LoadProgress>,
+    indexing: bool,
     load_started: Option<Instant>,
     open_duration: Option<Duration>,
     query_duration: Option<(&'static str, Duration)>,
@@ -92,6 +94,7 @@ impl Viewer {
         cc: &eframe::CreationContext<'_>,
         file: Option<PathBuf>,
         text: Option<String>,
+        indexed: bool,
     ) -> Self {
         cc.egui_ctx.set_fonts(crate::fonts::definitions());
         let mut app = Self::empty();
@@ -115,6 +118,9 @@ impl Viewer {
             Err(error) => app.error = Some(error),
         }
         app.colors.active().apply(&cc.egui_ctx, app.dark);
+        if indexed {
+            app.colors.indexed_files = true;
+        }
         if let Some(text) = text {
             app.load_text(text, "Standard input".into(), &cc.egui_ctx);
         } else if let Some(file) = file {
@@ -140,6 +146,8 @@ impl Viewer {
             pending: None,
             waiting_for_old: Arc::new(AtomicBool::new(false)),
             loading_cancelled: Arc::new(AtomicBool::new(false)),
+            indexed_progress: Arc::new(LoadProgress::default()),
+            indexing: false,
             load_started: None,
             open_duration: None,
             query_duration: None,
@@ -211,6 +219,10 @@ impl Viewer {
         let old = self.prepare_load();
         let waiting = Arc::clone(&self.waiting_for_old);
         let cancelled = Arc::clone(&self.loading_cancelled);
+        self.indexing = self.colors.indexed_files;
+        self.indexed_progress = Arc::new(LoadProgress::default());
+        let progress = Arc::clone(&self.indexed_progress);
+        let indexed = self.indexing;
         self.open_duration = None;
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
@@ -220,10 +232,14 @@ impl Viewer {
             if !wait_for_old_document(old, &waiting, &cancelled, &ctx) {
                 return;
             }
-            let result = std::fs::read_to_string(&path)
-                .map_err(|e| format!("Cannot open {}: {e}", path.display()))
-                .and_then(Document::parse_owned)
-                .map(|doc| (doc, path.display().to_string(), Some(path)));
+            let result = if indexed {
+                Document::open_indexed(&path, || cancelled.load(Ordering::Relaxed), &progress)
+            } else {
+                std::fs::read_to_string(&path)
+                    .map_err(|e| format!("Cannot open {}: {e}", path.display()))
+                    .and_then(Document::parse_owned)
+            }
+            .map(|doc| (doc, path.display().to_string(), Some(path)));
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -233,6 +249,7 @@ impl Viewer {
             return;
         }
         self.load_started = Some(Instant::now());
+        self.indexing = false;
         let old = self.prepare_load();
         let recovery = if source == "Pasted JSON" {
             let (tx, rx) = mpsc::channel();
@@ -308,6 +325,12 @@ impl Viewer {
             Ok(result) => {
                 self.pending = None;
                 match result {
+                    Ok((_doc, _, _))
+                        if self.indexing && self.loading_cancelled.load(Ordering::Relaxed) =>
+                    {
+                        self.notice =
+                            "Indexed opening cancelled; reopen the previous file if needed".into();
+                    }
                     Ok((doc, source, file)) => {
                         self.paste_recovery = None;
                         self.large_copy = None;
@@ -333,16 +356,24 @@ impl Viewer {
                         self.rebuild_rows();
                     }
                     Err(error) => {
-                        if let Some(text) =
-                            self.paste_recovery.take().and_then(|rx| rx.try_recv().ok())
-                        {
-                            self.paste = text;
-                            self.paste_open = true;
-                        }
-                        self.error = Some(error);
-                        if self.doc.is_none() && self.colors.low_memory_load {
+                        if error == "Loading cancelled" {
+                            self.error = None;
                             self.notice =
-                                "Loading failed. The previous document must be reopened.".into();
+                                "Indexed opening cancelled; reopen the previous file if needed"
+                                    .into();
+                        } else {
+                            if let Some(text) =
+                                self.paste_recovery.take().and_then(|rx| rx.try_recv().ok())
+                            {
+                                self.paste = text;
+                                self.paste_open = true;
+                            }
+                            self.error = Some(error);
+                            if self.doc.is_none() && self.colors.low_memory_load {
+                                self.notice =
+                                    "Loading failed. The previous document must be reopened."
+                                        .into();
+                            }
                         }
                     }
                 }
@@ -350,7 +381,12 @@ impl Viewer {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.pending = None;
-                self.error = Some("Loading worker stopped".into());
+                if self.loading_cancelled.load(Ordering::Relaxed) {
+                    self.error = None;
+                    self.notice = "Opening cancelled; reopen the previous file if needed".into();
+                } else {
+                    self.error = Some("Loading worker stopped".into());
+                }
                 self.open_duration = self.load_started.take().map(|start| start.elapsed());
             }
             Err(mpsc::TryRecvError::Empty) => (),
@@ -1055,12 +1091,18 @@ impl Viewer {
                         .on_hover_text("Release the previous document and wait for its background work before loading. If loading fails, reopen the previous document.").changed() {
                         self.save_colors();
                     }
+                    if ui.checkbox(&mut self.colors.indexed_files, "Indexed files")
+                        .on_hover_text("Validated disk snapshot and byte-range index; no whole Value. Filters/functions and oversized regex values require reopening in in-memory mode. Paste/stdin keep their existing backend.").changed() { self.save_colors(); }
                 });
                 if ui.button("Help").clicked() {
                     self.help = true;
                 }
                 if self.pending.is_some() {
                     ui.spinner();
+                    if self.indexing && ui.button("Cancel open").clicked() {
+                        self.loading_cancelled.store(true, Ordering::Relaxed);
+                        self.notice = "Cancelling indexed opening...".into();
+                    }
                 }
                 if self.pending_export.is_some() {
                     ui.spinner();
@@ -1226,6 +1268,7 @@ impl Viewer {
                         ui.label(format!("{label}: {}", format_duration(duration))).on_hover_text("Includes query, node reveal and selection preview; excludes painting.");
                     }
                     if self.pending.is_some() {
+                        if self.indexing { ui.label(self.indexed_progress.status()); }
                         ui.label(if self.waiting_for_old.load(Ordering::Relaxed) {
                             "Waiting for previous document..."
                         } else { "Opening..." });
@@ -1237,6 +1280,7 @@ impl Viewer {
                         ui.label(RichText::new(if ctx.wants_keyboard_input() { "INPUT" } else { "NORMAL" }).monospace().strong());
                         ui.label(RichText::new(self.vim.display()).monospace().color(Color32::from_rgb(100, 180, 235)));
                         if let Some(doc) = &self.doc {
+                            ui.label(doc.backend_name());
                             ui.label(format!("{} nodes", doc.nodes.len())).on_hover_text(format!("{:.1} KB", doc.bytes as f64 / 1024.0));
                         }
                         if let Some((position, path)) = self.cursor_location() {
@@ -1562,7 +1606,7 @@ mod tests {
         wait_load(&mut app);
         assert!(app.paste.is_empty());
         assert_eq!(
-            app.doc.as_ref().unwrap().value,
+            *app.doc.as_ref().unwrap().value().unwrap(),
             serde_json::json!({"fixed":42})
         );
     }
@@ -1587,6 +1631,28 @@ mod tests {
             assert!(Instant::now() < deadline, "Loading did not finish");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+    #[test]
+    fn indexed_file_loading_and_late_cancel_preserve_document_state() {
+        let ctx = egui::Context::default();
+        let mut app = loaded();
+        app.colors.indexed_files = true;
+        app.load_file(PathBuf::from("examples/sample.json"), &ctx);
+        wait_load(&mut app);
+        assert!(app.error.is_none());
+        assert!(app.doc.as_ref().unwrap().value().is_none());
+        assert!(!app.detail.is_empty());
+        let old = Arc::clone(app.doc.as_ref().unwrap());
+        let (tx, rx) = mpsc::channel();
+        app.pending = Some(rx);
+        app.indexing = true;
+        app.loading_cancelled.store(true, Ordering::Relaxed);
+        tx.send(Ok((Document::parse("[]").unwrap(), "late".into(), None)))
+            .unwrap();
+        app.poll();
+        assert!(app.pending.is_none());
+        assert!(Arc::ptr_eq(app.doc.as_ref().unwrap(), &old));
+        assert!(app.notice.contains("cancelled"));
     }
     #[test]
     fn low_memory_loading_waits_releases_state_and_reports_failure() {
@@ -1620,7 +1686,7 @@ mod tests {
         app.load_text(r#"{"fresh":42}"#.into(), "valid".into(), &ctx);
         wait_load(&mut app);
         assert_eq!(
-            app.doc.as_ref().unwrap().value,
+            *app.doc.as_ref().unwrap().value().unwrap(),
             serde_json::json!({"fresh":42})
         );
         assert_eq!(app.selected_path, "$");
@@ -1710,7 +1776,7 @@ mod tests {
         assert!(app.path_results.is_none());
         assert_eq!(app.selected_path, "$");
         assert_eq!(
-            app.doc.as_ref().unwrap().value,
+            *app.doc.as_ref().unwrap().value().unwrap(),
             serde_json::json!({"fresh":true})
         );
     }

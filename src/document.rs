@@ -7,6 +7,9 @@ use std::{
     io::{self, Write},
     sync::Arc,
 };
+#[path = "indexed.rs"]
+mod indexed;
+pub use indexed::LoadProgress;
 
 pub type NodeIds = Vec<u32>;
 
@@ -67,12 +70,16 @@ impl Node {
     }
 }
 pub struct Document {
-    pub value: Value,
+    storage: Storage,
     pub nodes: Vec<Node>,
     pub bytes: usize,
     children: Vec<u32>,
     keys: Vec<Arc<str>>,
     key_ids: HashMap<Arc<str>, u32>,
+}
+enum Storage {
+    Memory(Value),
+    Indexed(indexed::Store),
 }
 struct IndexBuilder {
     nodes: Vec<Node>,
@@ -184,7 +191,7 @@ impl Document {
         };
         index.index(&value, 0, u32::MAX, 0)?;
         Ok(Self {
-            value,
+            storage: Storage::Memory(value),
             nodes: index.nodes,
             bytes,
             children: index.children,
@@ -196,13 +203,56 @@ impl Document {
     pub fn structure_capacity_bytes(&self) -> usize {
         self.nodes.capacity() * std::mem::size_of::<Node>()
             + self.children.capacity() * std::mem::size_of::<u32>()
+            + match &self.storage {
+                Storage::Indexed(store) => store.range_bytes(),
+                _ => 0,
+            }
     }
+    pub fn open_indexed(
+        path: &std::path::Path,
+        cancelled: impl Fn() -> bool,
+        progress: &LoadProgress,
+    ) -> Result<Self, String> {
+        indexed::open(path, cancelled, progress)
+    }
+    pub fn backend_name(&self) -> &'static str {
+        match self.storage {
+            Storage::Memory(_) => "In-memory",
+            Storage::Indexed(_) => "Range index",
+        }
+    }
+    #[allow(
+        dead_code,
+        reason = "Memory backend inspection for tests and baseline benchmarks"
+    )]
+    pub fn value(&self) -> Option<&Value> {
+        match &self.storage {
+            Storage::Memory(value) => Some(value),
+            _ => None,
+        }
+    }
+    #[allow(
+        dead_code,
+        reason = "Explicit bounded subtree parsing interface for indexed backend"
+    )]
+    pub fn read_subtree(&self, id: usize) -> Result<Arc<Value>, String> {
+        match &self.storage {
+            Storage::Indexed(store) => store.subtree(self, id),
+            _ => Err("Bounded subtree cache is an indexed-backend interface".into()),
+        }
+    }
+    #[cfg(test)]
     pub fn at(&self, id: usize) -> &Value {
+        self.memory_at(id)
+    }
+    fn memory_at(&self, id: usize) -> &Value {
         let node = &self.nodes[id];
         let Some(parent) = node.parent() else {
-            return &self.value;
+            return self
+                .value()
+                .expect("Value references only exist in the in-memory backend");
         };
-        match self.at(parent) {
+        match self.memory_at(parent) {
             Value::Object(map) => &map[self.keys[node.segment as usize].as_ref()],
             Value::Array(array) => &array[node.segment as usize],
             _ => unreachable!("only containers have children"),
@@ -330,7 +380,10 @@ impl Document {
             expression.to_owned()
         };
         let query = JsonPath::parse(&normalized).map_err(|e| format!("Invalid JSONPath: {e}"))?;
-        let results = query.query_located(&self.value);
+        if matches!(self.storage, Storage::Indexed(_)) {
+            return indexed::query(self, &normalized, cancelled);
+        }
+        let results = query.query_located(self.value().unwrap());
         if cancelled() {
             return Err("Query cancelled".into());
         }
@@ -354,7 +407,12 @@ impl Document {
             .collect()
     }
     pub fn row_preview(&self, id: usize) -> String {
-        match self.at(id) {
+        if let Storage::Indexed(store) = &self.storage {
+            return store
+                .row_preview(self, id)
+                .unwrap_or_else(|error| format!("Read error: {error}"));
+        }
+        match self.memory_at(id) {
             Value::Object(v) => format!("{{ {} keys }}", v.len()),
             Value::Array(v) => format!("[ {} items ]", v.len()),
             Value::String(v) => serde_json::to_string(&short(v, 160)).unwrap(),
@@ -363,17 +421,39 @@ impl Document {
         }
     }
     pub fn preview(&self, id: usize) -> String {
-        bounded_preview(self.at(id))
+        if let Storage::Indexed(store) = &self.storage
+            && let Ok(value) = store.subtree(self, id)
+        {
+            return bounded_preview(|writer| serde_json::to_writer_pretty(writer, value.as_ref()));
+        }
+        bounded_preview(|writer| self.write_node(writer, id))
     }
     #[cfg(test)]
     pub fn results_json(&self, ids: &[u32]) -> String {
-        serde_json::to_string_pretty(&SelectedValues { doc: self, ids }).unwrap()
+        let mut bytes = Vec::new();
+        self.write_results(&mut bytes, ids).unwrap();
+        String::from_utf8(bytes).unwrap()
     }
     pub fn results_preview(&self, ids: &[u32]) -> String {
-        bounded_preview(&SelectedValues { doc: self, ids })
+        bounded_preview(|writer| self.write_results(writer, ids))
     }
-    pub fn write_results(&self, writer: impl Write, ids: &[u32]) -> serde_json::Result<()> {
-        serde_json::to_writer_pretty(writer, &SelectedValues { doc: self, ids })
+    pub fn write_node(&self, mut writer: impl Write, id: usize) -> serde_json::Result<()> {
+        match &self.storage {
+            Storage::Memory(_) => serde_json::to_writer_pretty(writer, self.memory_at(id)),
+            Storage::Indexed(store) => store
+                .write(self, &mut writer, &[id as u32], false)
+                .map_err(serde_json::Error::io),
+        }
+    }
+    pub fn write_results(&self, mut writer: impl Write, ids: &[u32]) -> serde_json::Result<()> {
+        match &self.storage {
+            Storage::Memory(_) => {
+                serde_json::to_writer_pretty(writer, &SelectedValues { doc: self, ids })
+            }
+            Storage::Indexed(store) => store
+                .write(self, &mut writer, ids, true)
+                .map_err(serde_json::Error::io),
+        }
     }
     pub fn search(
         &self,
@@ -394,6 +474,9 @@ impl Document {
     ) -> Result<NodeIds, String> {
         if term.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Storage::Indexed(store) = &self.storage {
+            return store.search(self, term, case, regex, scope, cancelled);
         }
         let pattern = if regex {
             term.to_owned()
@@ -420,7 +503,7 @@ impl Document {
         let root_match = scope != SearchScope::Values && matcher.is_match("$");
         let mut matches = Vec::new();
         let mut id = 0;
-        let completed = walk(&self.value, &mut |value| {
+        let completed = walk(self.value().unwrap(), &mut |value| {
             if id % 1024 == 0 && cancelled() {
                 return false;
             }
@@ -501,6 +584,18 @@ impl Document {
             id = next(id);
         }
     }
+    fn direct_children(&self, id: usize) -> impl Iterator<Item = usize> + '_ {
+        let mut next = id + 1;
+        let end = self.nodes[id].end();
+        std::iter::from_fn(move || {
+            if next >= end {
+                return None;
+            }
+            let id = next;
+            next = self.nodes[id].end();
+            Some(id)
+        })
+    }
 }
 struct SelectedValues<'a> {
     doc: &'a Document,
@@ -511,7 +606,7 @@ impl serde::Serialize for SelectedValues<'_> {
         use serde::ser::SerializeSeq;
         let mut sequence = serializer.serialize_seq(Some(self.ids.len()))?;
         for &id in self.ids {
-            sequence.serialize_element(self.doc.at(id as usize))?;
+            sequence.serialize_element(self.doc.memory_at(id as usize))?;
         }
         sequence.end()
     }
@@ -548,7 +643,7 @@ fn short(text: &str, length: usize) -> String {
     result
 }
 // Bound serialization by output bytes, rather than by the size of the whole document.
-fn bounded_preview<T: serde::Serialize>(value: &T) -> String {
+fn bounded_preview(serialize: impl FnOnce(&mut dyn Write) -> serde_json::Result<()>) -> String {
     struct PreviewWriter {
         bytes: Vec<u8>,
         truncated: bool,
@@ -572,9 +667,11 @@ fn bounded_preview<T: serde::Serialize>(value: &T) -> String {
         bytes: Vec::new(),
         truncated: false,
     };
-    let result = serde_json::to_writer_pretty(&mut writer, value);
-    if result.is_err() && !writer.truncated {
-        return "Cannot format preview".into();
+    let result = serialize(&mut writer);
+    if let Err(error) = result
+        && !writer.truncated
+    {
+        return format!("Cannot format preview: {error}");
     }
     let valid_len = match std::str::from_utf8(&writer.bytes) {
         Ok(_) => writer.bytes.len(),
@@ -647,7 +744,7 @@ mod tests {
         assert_eq!(d.keys.len(), 4);
         assert_eq!(d.nodes.capacity(), d.nodes.len());
         for id in 0..d.nodes.len() {
-            assert_eq!(d.value.pointer(&d.pointer(id)), Some(d.at(id)));
+            assert_eq!(d.value().unwrap().pointer(&d.pointer(id)), Some(d.at(id)));
             assert_eq!(d.find_path(&d.path(id)).unwrap(), id);
         }
         assert_eq!(
@@ -725,7 +822,7 @@ mod tests {
         let d = Document::parse(r#"{"a/b":{"~x":[{"a.b":"中文","quote\"":null}]},"":42}"#).unwrap();
         for id in 0..d.nodes.len() {
             assert_eq!(d.find_path(&d.path(id)).unwrap(), id);
-            assert!(d.value.pointer(&d.pointer(id)).is_some());
+            assert!(d.value().unwrap().pointer(&d.pointer(id)).is_some());
         }
         assert_eq!(d.find_path("/a~1b/~0x/0/a.b").unwrap(), 4);
         assert!(d.find_path("$.missing").is_err());

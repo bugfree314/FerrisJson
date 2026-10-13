@@ -24,7 +24,7 @@ pub enum CopyError {
 impl Selection {
     pub fn write(&self, doc: &Document, writer: impl Write) -> serde_json::Result<()> {
         match self {
-            Self::Node(id) => serde_json::to_writer_pretty(writer, doc.at(*id)),
+            Self::Node(id) => doc.write_node(writer, *id),
             Self::Results(ids) => doc.write_results(writer, ids),
         }
     }

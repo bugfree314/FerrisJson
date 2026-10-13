@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$File,
     [ValidateRange(3, 100)][int]$Runs = 3,
-    [ValidateSet("open", "switch", "tree", "export")][string]$Scenario = "open",
+    [ValidateSet("open", "switch", "tree", "export", "backend")][string]$Scenario = "open",
     [string]$Output = "target/memory-benchmark.json"
 )
 $ErrorActionPreference = "Stop"
@@ -18,6 +18,7 @@ $modePair = switch ($Scenario) {
     "switch" { @("switch-normal", "switch-low") }
     "tree" { @("tree") }
     "export" { @("export-string", "export-stream") }
+    "backend" { @("memory-open", "indexed-open") }
     default { @("retain", "release") }
 }
 for ($iteration = 0; $iteration -lt $Runs; $iteration++) {
@@ -49,7 +50,7 @@ foreach ($mode in $modePair) {
         peak_commit_bytes = Get-Stats @($group | ForEach-Object { $_.memory.ready.peak_commit_bytes })
         ready_private_bytes = Get-Stats @($group | ForEach-Object { $_.memory.ready.private_bytes })
     }
-    foreach ($field in @("total_ms", "read_ms", "parse_ms", "release_ms", "count_and_index_ms", "preview_ms", "previous_load_ms", "previous_release_ms", "new_load_ms", "switch_ms", "rows_ms", "search_all_ms", "rebuild_rows_ms", "export_ms")) {
+    foreach ($field in @("total_ms", "load_ms", "read_ms", "parse_ms", "release_ms", "count_and_index_ms", "preview_ms", "previous_load_ms", "previous_release_ms", "new_load_ms", "switch_ms", "rows_ms", "search_all_ms", "rebuild_rows_ms", "export_ms")) {
         $values = @($group | ForEach-Object { $_.$field } | Where-Object { $null -ne $_ })
         if ($values.Count -gt 0) { $summary[$mode][$field] = Get-Stats $values }
     }
@@ -68,6 +69,7 @@ $report = @{
         "switch" { "Document switching engine; same file loaded twice; no active queries or GUI" }
         "tree" { "Engine with all nodes expanded and regex .* matching all nodes; excludes GUI/JSONPath" }
         "export" { "Engine exporting full root; legacy formatted String versus stream with flush/sync/atomic rename; excludes GUI" }
+        "backend" { "Memory Value backend versus validated file-snapshot/range backend, including initial root preview; excludes GUI/search/query/export" }
         default { "Document engine only; excludes GUI, fonts, tree rows, search, query, export and document switching" }
     }
     summary = $summary

@@ -8,9 +8,41 @@ mod export;
 #[path = "../src/loading.rs"]
 mod loading;
 
-use document::{Document, SearchScope};
+use document::{Document, LoadProgress, SearchScope};
 use serde_json::json;
 use std::{hint::black_box, sync::Arc, time::Instant};
+
+fn backend(file: String, mode: String) -> Result<(), String> {
+    let total = Instant::now();
+    let started = Instant::now();
+    let doc = if mode == "indexed-open" {
+        Document::open_indexed(
+            std::path::Path::new(&file),
+            || false,
+            &LoadProgress::default(),
+        )?
+    } else {
+        Document::parse_owned(std::fs::read_to_string(&file).map_err(|e| e.to_string())?)?
+    };
+    let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let after_load = memory();
+    let started = Instant::now();
+    black_box(doc.preview(0));
+    let preview_ms = started.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "{}",
+        json!({
+            "file": file, "mode": mode, "backend": doc.backend_name(), "bytes": doc.bytes,
+            "nodes": doc.nodes.len(), "has_whole_value": doc.value().is_some(),
+            "structure_capacity_bytes": doc.structure_capacity_bytes(), "load_ms": load_ms,
+            "preview_ms": preview_ms, "total_ms": total.elapsed().as_secs_f64() * 1000.0,
+            "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
+            "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
+            "memory": {"after_load": after_load, "ready": memory()}
+        })
+    );
+    Ok(())
+}
 
 fn switch(file: String, mode: String) -> Result<(), String> {
     let total = Instant::now();
@@ -103,7 +135,7 @@ fn export_file(file: String, mode: String) -> Result<(), String> {
     let path = directory.join("output.json");
     let started = Instant::now();
     let retained = if mode == "export-string" {
-        let json = serde_json::to_string_pretty(&doc.value).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string_pretty(doc.value().unwrap()).map_err(|e| e.to_string())?;
         std::fs::write(&path, &json).map_err(|e| e.to_string())?;
         Some(json)
     } else {
@@ -203,6 +235,8 @@ fn run() -> Result<(), String> {
             | "tree"
             | "export-string"
             | "export-stream"
+            | "memory-open"
+            | "indexed-open"
     ) || args.next().is_some()
     {
         return Err("Usage: memory_bench FILE retain|release|switch-normal|switch-low|tree|export-string|export-stream".into());
@@ -212,6 +246,9 @@ fn run() -> Result<(), String> {
     }
     if mode.starts_with("export-") {
         return export_file(file, mode);
+    }
+    if mode.ends_with("-open") {
+        return backend(file, mode);
     }
     if mode == "tree" {
         return tree(file);
