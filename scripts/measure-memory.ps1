@@ -1,7 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$File,
     [ValidateRange(3, 100)][int]$Runs = 3,
-    [ValidateSet("open", "switch", "tree", "export", "backend")][string]$Scenario = "open",
+    [ValidateSet("open", "switch", "tree", "export", "backend", "demand", "lazy-browse")][string]$Scenario = "open",
     [string]$Output = "target/memory-benchmark.json"
 )
 $ErrorActionPreference = "Stop"
@@ -19,6 +19,8 @@ $modePair = switch ($Scenario) {
     "tree" { @("tree") }
     "export" { @("export-string", "export-stream") }
     "backend" { @("memory-open", "indexed-open") }
+    "demand" { @("indexed-open", "lazy-open") }
+    "lazy-browse" { @("lazy-browse") }
     default { @("retain", "release") }
 }
 for ($iteration = 0; $iteration -lt $Runs; $iteration++) {
@@ -70,6 +72,8 @@ $report = @{
         "tree" { "Engine with all nodes expanded and regex .* matching all nodes; excludes GUI/JSONPath" }
         "export" { "Engine exporting full root; legacy formatted String versus stream with flush/sync/atomic rename; excludes GUI" }
         "backend" { "Memory Value backend versus validated file-snapshot/range backend, including initial root preview; excludes GUI/search/query/export" }
+        "demand" { "Resident range index versus sparse on-demand backend with root preview; excludes GUI and OS caches; process IO counters recorded" }
+        "lazy-browse" { "On-demand backend with sparse browsing, virtual expand-all rows and compressed regex .* matches; excludes GUI; .* matches keys without reading every scalar value" }
         default { "Document engine only; excludes GUI, fonts, tree rows, search, query, export and document switching" }
     }
     summary = $summary

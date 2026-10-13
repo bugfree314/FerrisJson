@@ -8,6 +8,16 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub enum Operation {
+    StreamSearch {
+        term: String,
+        case: bool,
+        regex: bool,
+        scope: SearchScope,
+        from: u32,
+        next: bool,
+        reverse: bool,
+        count: usize,
+    },
     Search {
         term: String,
         case: bool,
@@ -17,6 +27,13 @@ pub enum Operation {
     Query(String),
 }
 pub enum Output {
+    SearchBatch {
+        ids: NodeIds,
+        scanned: usize,
+        total: usize,
+        finished: bool,
+        next: bool,
+    },
     Search(NodeIds),
     Query {
         expression: String,
@@ -71,6 +88,114 @@ impl Worker {
                 }
                 let started = Instant::now();
                 let result = match request.operation {
+                    Operation::StreamSearch {
+                        term,
+                        case,
+                        regex,
+                        scope,
+                        from,
+                        next,
+                        reverse,
+                        count,
+                    } => {
+                        if next {
+                            let result = request
+                                .doc
+                                .find_next(
+                                    &term, case, regex, scope, from, reverse, count, &cancelled,
+                                )
+                                .map(|id| Output::SearchBatch {
+                                    ids: id.into_iter().collect(),
+                                    scanned: request.doc.node_count(),
+                                    total: request.doc.node_count(),
+                                    finished: true,
+                                    next: true,
+                                });
+                            drop(request.doc);
+                            if !cancelled() {
+                                if tx
+                                    .send(Completion {
+                                        generation: request.generation,
+                                        elapsed: started.elapsed(),
+                                        result,
+                                    })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                ctx.request_repaint();
+                            }
+                            continue;
+                        }
+                        let mut batch = Vec::new();
+                        let mut scanned = 0;
+                        let total = request.doc.node_count();
+                        let mut last_emit = Instant::now();
+                        let send = |ids, scanned| -> Result<(), String> {
+                            let mut message = Completion {
+                                generation: request.generation,
+                                elapsed: started.elapsed(),
+                                result: Ok(Output::SearchBatch {
+                                    ids,
+                                    scanned,
+                                    total,
+                                    finished: false,
+                                    next,
+                                }),
+                            };
+                            loop {
+                                if cancelled() {
+                                    return Err("Search cancelled".into());
+                                }
+                                match tx.try_send(message) {
+                                    Ok(()) => {
+                                        ctx.request_repaint();
+                                        return Ok(());
+                                    }
+                                    Err(mpsc::TrySendError::Full(value)) => {
+                                        message = value;
+                                        std::thread::sleep(Duration::from_millis(5));
+                                    }
+                                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                                        return Err("Search receiver closed".into());
+                                    }
+                                }
+                            }
+                        };
+                        let mut first_report = true;
+                        request
+                            .doc
+                            .stream_search(
+                                &term,
+                                case,
+                                regex,
+                                scope,
+                                0,
+                                &cancelled,
+                                |id, done, _| {
+                                    scanned = done;
+                                    if let Some(id) = id {
+                                        batch.push(id);
+                                    }
+                                    if (!batch.is_empty() && first_report)
+                                        || batch.len() >= 65_536
+                                        || last_emit.elapsed() >= Duration::from_millis(100)
+                                    {
+                                        send(std::mem::take(&mut batch), scanned)?;
+                                        first_report = false;
+                                        last_emit = Instant::now();
+                                    }
+                                    Ok(true)
+                                },
+                            )
+                            .map(|()| Output::SearchBatch {
+                                ids: batch,
+                                scanned,
+                                total,
+                                finished: true,
+                                next: false,
+                            })
+                    }
                     Operation::Search {
                         term,
                         case,
@@ -146,7 +271,13 @@ impl Worker {
     pub fn poll(&mut self) -> Option<Completion> {
         while let Ok(result) = self.results.try_recv() {
             if result.generation == self.generation.load(Ordering::Relaxed) {
-                self.busy = false;
+                self.busy = matches!(
+                    &result.result,
+                    Ok(Output::SearchBatch {
+                        finished: false,
+                        ..
+                    })
+                );
                 return Some(result);
             }
         }
@@ -164,6 +295,69 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incremental_batches_keep_busy_and_cancellation_discards_old_generations() {
+        let ctx = eframe::egui::Context::default();
+        let mut worker = Worker::new(ctx);
+        let doc = Arc::new(
+            Document::open_lazy(
+                std::path::Path::new("examples/sample.json"),
+                || false,
+                &crate::document::LoadProgress::default(),
+            )
+            .unwrap(),
+        );
+        let submit = |worker: &mut Worker, term: &str| {
+            worker.submit(
+                Arc::clone(&doc),
+                Operation::StreamSearch {
+                    term: term.into(),
+                    case: false,
+                    regex: term == ".*",
+                    scope: SearchScope::Keys,
+                    from: 0,
+                    next: false,
+                    reverse: false,
+                    count: 1,
+                },
+            )
+        };
+        submit(&mut worker, ".*");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(event) = worker.poll() {
+                assert!(matches!(
+                    event.result,
+                    Ok(Output::SearchBatch {
+                        finished: false,
+                        ..
+                    })
+                ));
+                assert!(worker.busy);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worker.cancel();
+        submit(&mut worker, "email");
+        let mut found = Vec::new();
+        while worker.busy {
+            if let Some(event) = worker.poll() {
+                match event.result.unwrap() {
+                    Output::SearchBatch { ids, .. } => found.extend(ids),
+                    _ => panic!("Wrong operation output"),
+                }
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            found,
+            doc.search("email", false, false, SearchScope::Keys)
+                .unwrap()
+        );
+    }
     #[test]
     fn full_result_channel_does_not_retain_documents() {
         let ctx = eframe::egui::Context::default();

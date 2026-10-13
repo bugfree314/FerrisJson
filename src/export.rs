@@ -1,4 +1,4 @@
-use crate::document::{Document, NodeIds};
+use crate::document::{Document, MatchSet, NodeIds};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
@@ -15,6 +15,7 @@ pub const COPY_LIMIT: usize = 8 * 1024 * 1024;
 pub enum Selection {
     Node(usize),
     Results(Arc<NodeIds>),
+    Matches(Arc<MatchSet>),
 }
 #[derive(Debug, PartialEq)]
 pub enum CopyError {
@@ -22,10 +23,20 @@ pub enum CopyError {
     Serialization(String),
 }
 impl Selection {
-    pub fn write(&self, doc: &Document, writer: impl Write) -> serde_json::Result<()> {
+    pub fn write(&self, doc: &Document, mut writer: impl Write) -> serde_json::Result<()> {
         match self {
             Self::Node(id) => doc.write_node(writer, *id),
             Self::Results(ids) => doc.write_results(writer, ids),
+            Self::Matches(matches) => {
+                writer.write_all(b"[").map_err(serde_json::Error::io)?;
+                for (ordinal, id) in matches.iter().enumerate() {
+                    if ordinal > 0 {
+                        writer.write_all(b",\n").map_err(serde_json::Error::io)?;
+                    }
+                    doc.write_node(&mut writer, id as usize)?;
+                }
+                writer.write_all(b"]").map_err(serde_json::Error::io)
+            }
         }
     }
     pub fn json(&self, doc: &Document, limit: Option<usize>) -> Result<String, CopyError> {
@@ -162,6 +173,21 @@ pub fn atomic_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compressed_matches_export_in_order_without_expanding_ids() {
+        let doc = Document::parse(r#"{"rows":[1,2,3]}"#).unwrap();
+        let mut matches = MatchSet::default();
+        for id in doc.query_path("$.rows[0,2]").unwrap() {
+            matches.insert(id).unwrap();
+        }
+        let selection = Selection::Matches(Arc::new(matches));
+        let mut output = Vec::new();
+        selection.write(&doc, &mut output).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+            serde_json::json!([1, 3])
+        );
+    }
     struct Directory(PathBuf);
     impl Directory {
         fn new() -> Self {

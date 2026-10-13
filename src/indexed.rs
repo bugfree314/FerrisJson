@@ -19,6 +19,8 @@ const KEY_BUDGET: usize = 64 * 1024 * 1024;
 const SUBTREE_LIMIT: usize = 256 * 1024;
 const CACHE_BUDGET: usize = 8 * 1024 * 1024;
 static SERIAL: AtomicU64 = AtomicU64::new(0);
+#[path = "lazy.rs"]
+pub(super) mod lazy;
 
 #[derive(Default)]
 pub struct LoadProgress {
@@ -35,9 +37,11 @@ impl LoadProgress {
         let phase = match self.phase.load(Ordering::Relaxed) {
             0 => "Snapshot",
             1 => "Validating/indexing",
+            3 => "Reading into memory",
+            4 => "Opening read-only source",
             _ => "Finishing index",
         };
-        if self.phase.load(Ordering::Relaxed) >= 2 {
+        if self.phase.load(Ordering::Relaxed) == 2 {
             return "Finishing index...".into();
         }
         format!(
@@ -50,6 +54,8 @@ struct Snapshot {
     file: Mutex<Option<File>>,
     path: Option<PathBuf>,
     len: u64,
+    memory: Option<Box<[u8]>>,
+    original: Option<(u64, Option<std::time::SystemTime>)>,
 }
 impl Drop for Snapshot {
     fn drop(&mut self) {
@@ -112,6 +118,8 @@ impl Snapshot {
                         file: Mutex::new(Some(file)),
                         path: Some(path),
                         len: 0,
+                        memory: None,
+                        original: None,
                     });
                     #[cfg(unix)]
                     if let Some(snapshot) = &mut result {
@@ -168,6 +176,10 @@ impl Snapshot {
         {
             return Err(io::Error::other("Snapshot range out of bounds"));
         }
+        if let Some(memory) = &self.memory {
+            bytes.copy_from_slice(&memory[offset as usize..offset as usize + bytes.len()]);
+            return Ok(());
+        }
         let mut guard = self
             .file
             .lock()
@@ -175,8 +187,76 @@ impl Snapshot {
         let file = guard
             .as_mut()
             .ok_or_else(|| io::Error::other("Snapshot closed"))?;
+        if let Some((length, modified)) = self.original {
+            let current = file.metadata()?;
+            if current.len() != length || current.modified().ok() != modified {
+                return Err(io::Error::other("Source changed; reopen the file"));
+            }
+        }
         file.seek(SeekFrom::Start(offset))?;
         file.read_exact(bytes)
+    }
+    fn open_lazy(
+        path: &Path,
+        cancelled: &impl Fn() -> bool,
+        progress: &LoadProgress,
+    ) -> Result<Self, String> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(1);
+        }
+        let mut file = options
+            .open(path)
+            .map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        let len = meta.len();
+        progress.total.store(len, Ordering::Relaxed);
+        progress.done.store(0, Ordering::Relaxed);
+        progress.phase.store(
+            if len <= 512 * 1024 * 1024 { 3 } else { 4 },
+            Ordering::Relaxed,
+        );
+        let mut memory = None;
+        if len <= 512 * 1024 * 1024 {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(len as usize)
+                .map_err(|e| format!("Cannot allocate source buffer: {e}"))?;
+            let mut block = [0; BLOCK];
+            loop {
+                if cancelled() {
+                    return Err("Loading cancelled".into());
+                }
+                let count = file.read(&mut block).map_err(|e| e.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                if bytes.len() + count > len as usize {
+                    return Err("Source changed while reading; reopen the file".into());
+                }
+                bytes.extend_from_slice(&block[..count]);
+                progress.done.store(bytes.len() as u64, Ordering::Relaxed);
+            }
+            if bytes.len() as u64 != len {
+                return Err("Source changed while reading; reopen the file".into());
+            }
+            memory = Some(bytes.into_boxed_slice());
+        }
+        let after = file.metadata().map_err(|e| e.to_string())?;
+        if after.len() != len || after.modified().ok() != meta.modified().ok() {
+            return Err("Source changed while reading; reopen the file".into());
+        }
+        let original = memory.is_none().then_some((len, meta.modified().ok()));
+        Ok(Self {
+            file: Mutex::new(original.map(|_| file)),
+            path: None,
+            len,
+            memory,
+            original,
+        })
     }
 }
 struct Reader<'a> {
@@ -464,14 +544,18 @@ impl Store {
                 let object = matches!(node.kind, Kind::Object);
                 output.write_all(if object { b"{" } else { b"[" })?;
                 for (ordinal, child) in doc.direct_children(id).enumerate() {
+                    let child = child.map_err(io::Error::other)?;
                     if ordinal != 0 {
                         output.write_all(b",")?;
                     }
                     output.write_all(b"\n")?;
                     indent(output, depth + 1)?;
                     if object {
-                        serde_json::to_writer(&mut *output, doc.key(child).as_ref())
-                            .map_err(io::Error::other)?;
+                        serde_json::to_writer(
+                            &mut *output,
+                            doc.try_key(child).map_err(io::Error::other)?.as_ref(),
+                        )
+                        .map_err(io::Error::other)?;
                         output.write_all(b": ")?;
                     }
                     value(store, doc, reader, output, child, depth + 1)?;
@@ -1005,16 +1089,34 @@ pub(super) fn open(
 }
 
 #[derive(Clone)]
-enum Selector {
+pub(super) enum Selector {
     Name(String),
     Index(i64),
     Wildcard,
     Slice(Option<i64>, Option<i64>, i64),
+    Filter(super::filter::Filter),
+}
+pub(super) fn plan_bytes(plan: &QueryPlan) -> usize {
+    plan.capacity() * std::mem::size_of::<(bool, Vec<Selector>)>()
+        + plan
+            .iter()
+            .map(|(_, selectors)| {
+                selectors.capacity() * std::mem::size_of::<Selector>()
+                    + selectors
+                        .iter()
+                        .map(|s| match s {
+                            Selector::Name(s) => s.capacity(),
+                            Selector::Filter(f) => f.heap_bytes(),
+                            _ => 0,
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
 }
 fn result_id(result: &mut NodeIds, id: usize) -> Result<(), String> {
-    const LIMIT: usize = 256 * 1024 * 1024 / 4;
+    const LIMIT: usize = 64 * 1024 * 1024 / 4;
     if result.len() >= LIMIT {
-        return Err("Indexed query exceeds 256 MiB result-ID budget; narrow the expression".into());
+        return Err("Indexed query exceeds 64 MiB result-ID budget; narrow the expression".into());
     }
     if result.len() == result.capacity() {
         result.reserve_exact(result.capacity().max(1024).min(LIMIT - result.len()));
@@ -1025,7 +1127,10 @@ fn result_id(result: &mut NodeIds, id: usize) -> Result<(), String> {
 fn unsupported() -> String {
     "Indexed JSONPath supports fields, unions, wildcard, recursion and slices; filters/functions are unsupported. Disable Indexed files and reopen for full JSONPath (no automatic full-document fallback).".into()
 }
-fn selectors(text: &str) -> Result<Vec<Selector>, String> {
+pub(super) fn selectors(text: &str) -> Result<Vec<Selector>, String> {
+    if let Some(filter) = text.trim().strip_prefix('?') {
+        return super::filter::Filter::parse(filter).map(|f| vec![Selector::Filter(f)]);
+    }
     let mut parts = Vec::new();
     let mut start = 0;
     let mut quote = None;
@@ -1113,11 +1218,15 @@ fn selectors(text: &str) -> Result<Vec<Selector>, String> {
         })
         .collect()
 }
+pub(super) type QueryPlan = Vec<(bool, Vec<Selector>)>;
 pub(super) fn query(
     doc: &Document,
     expression: &str,
-    cancelled: impl Fn() -> bool,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<NodeIds, String> {
+    execute_plan(doc, &parse_plan(expression)?, cancelled)
+}
+pub(super) fn parse_plan(expression: &str) -> Result<QueryPlan, String> {
     let mut segments = Vec::new();
     let bytes = expression.as_bytes();
     let mut position = 1;
@@ -1156,6 +1265,7 @@ pub(super) fn query(
         let start = position;
         let mut quote = None;
         let mut escape = false;
+        let mut nested = 0;
         while position < bytes.len() {
             let byte = bytes[position];
             if escape {
@@ -1168,10 +1278,13 @@ pub(super) fn query(
                 }
             } else if byte == b'\'' || byte == b'"' {
                 quote = Some(byte);
+            } else if byte == b'[' {
+                nested += 1;
             } else if byte == b']' {
-                break;
-            } else if byte == b'?' || byte == b'(' {
-                return Err(unsupported());
+                if nested == 0 {
+                    break;
+                }
+                nested -= 1;
             }
             position += 1;
         }
@@ -1181,12 +1294,20 @@ pub(super) fn query(
         segments.push((recursive, selectors(&expression[start..position])?));
         position += 1;
     }
+    Ok(segments)
+}
+pub(super) fn execute_plan(
+    doc: &Document,
+    segments: &QueryPlan,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<NodeIds, String> {
     let mut current = vec![0];
     for (recursive, selectors) in segments {
+        let recursive = *recursive;
         let mut result = Vec::new();
         for &base in &current {
             let end = if recursive {
-                doc.nodes[base as usize].end()
+                doc.node(base as usize)?.end()
             } else {
                 base as usize + 1
             };
@@ -1194,15 +1315,27 @@ pub(super) fn query(
                 if cancelled() {
                     return Err("Query cancelled".into());
                 }
-                for selector in &selectors {
+                for selector in selectors {
                     match selector {
+                        Selector::Filter(filter) => {
+                            if !doc.is_lazy() {
+                                return Err(unsupported());
+                            }
+                            for child in doc.direct_children(id) {
+                                let child = child?;
+                                if filter.evaluate(doc, child, cancelled)? {
+                                    result_id(&mut result, child)?;
+                                }
+                            }
+                        }
                         Selector::Name(name) => {
-                            if let Some(id) = doc.child_name(id, name) {
+                            if let Some(id) = doc.child_name(id, name)? {
                                 result_id(&mut result, id)?;
                             }
                         }
                         Selector::Wildcard => {
                             for child in doc.direct_children(id) {
+                                let child = child?;
                                 if cancelled() {
                                     return Err("Query cancelled".into());
                                 }
@@ -1210,23 +1343,23 @@ pub(super) fn query(
                             }
                         }
                         Selector::Index(index) => {
-                            let len = doc.nodes[id].child_count as i64;
+                            let len = doc.node(id)?.child_count as i64;
                             let index = if *index < 0 {
                                 len.saturating_add(*index)
                             } else {
                                 *index
                             };
                             if index >= 0
-                                && let Some(id) = doc.child_index(id, index as usize)
+                                && let Some(id) = doc.child_index(id, index as usize)?
                             {
                                 result_id(&mut result, id)?;
                             }
                         }
                         Selector::Slice(start, end, step) => {
-                            if !matches!(doc.nodes[id].kind, Kind::Array) || *step == 0 {
+                            if !matches!(doc.node(id)?.kind, Kind::Array) || *step == 0 {
                                 continue;
                             }
-                            let len = doc.nodes[id].child_count as i64;
+                            let len = doc.node(id)?.child_count as i64;
                             let normalize = |value: Option<i64>, default| {
                                 value.map_or(default, |value| {
                                     if value < 0 {
@@ -1253,7 +1386,7 @@ pub(super) fn query(
                                 }
                                 result_id(
                                     &mut result,
-                                    doc.child_index(id, index as usize).unwrap(),
+                                    doc.child_index(id, index as usize)?.unwrap(),
                                 )?;
                                 let Some(next) = index.checked_add(*step) else {
                                     break;

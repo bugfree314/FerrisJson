@@ -1,5 +1,5 @@
 use crate::{
-    document::{Document, LoadProgress, NodeIds, SearchScope},
+    document::{Document, LazyView, LoadProgress, MatchSet, NodeIds, SearchScope},
     export::{self, COPY_LIMIT, CopyError, Selection},
     palette::{ColorSettings, Preset, color},
     row_cache::RowCache,
@@ -55,9 +55,14 @@ pub struct Viewer {
     open_duration: Option<Duration>,
     query_duration: Option<(&'static str, Duration)>,
     expanded: Vec<bool>,
+    lazy_view: Option<LazyView>,
     selected: usize,
     rows: NodeIds,
     matches: NodeIds,
+    stream_matches: Option<Arc<MatchSet>>,
+    search_progress: Option<(usize, usize, bool)>,
+    search_next: bool,
+    stream_revealed: bool,
     match_index: usize,
     term: String,
     case: bool,
@@ -152,9 +157,14 @@ impl Viewer {
             open_duration: None,
             query_duration: None,
             expanded: Vec::new(),
+            lazy_view: None,
             selected: 0,
             rows: Vec::new(),
             matches: Vec::new(),
+            stream_matches: None,
+            search_progress: None,
+            search_next: false,
+            stream_revealed: false,
             match_index: 0,
             term: String::new(),
             case: false,
@@ -189,8 +199,8 @@ impl Viewer {
     fn cursor_location(&self) -> Option<(String, String)> {
         self.doc.as_ref()?;
         // Visible IDs stay sorted; avoid scanning the whole document on every frame.
-        let row = self.rows.binary_search(&(self.selected as u32)).ok()? + 1;
-        let total = self.rows.len();
+        let row = self.row_position(self.selected)? + 1;
+        let total = self.row_count();
         let progress = if total <= 1 {
             "All".into()
         } else if row == 1 {
@@ -233,7 +243,7 @@ impl Viewer {
                 return;
             }
             let result = if indexed {
-                Document::open_indexed(&path, || cancelled.load(Ordering::Relaxed), &progress)
+                Document::open_lazy(&path, || cancelled.load(Ordering::Relaxed), &progress)
             } else {
                 std::fs::read_to_string(&path)
                     .map_err(|e| format!("Cannot open {}: {e}", path.display()))
@@ -296,7 +306,12 @@ impl Viewer {
         self.waiting_for_old.store(old.is_some(), Ordering::Relaxed);
         self.rows = Vec::new();
         self.expanded = Vec::new();
+        self.lazy_view = None;
         self.matches = Vec::new();
+        self.stream_matches = None;
+        self.stream_revealed = false;
+        self.search_progress = None;
+        self.search_next = false;
         self.path_results = None;
         self.row_labels.clear();
         self.detail = String::new();
@@ -334,7 +349,30 @@ impl Viewer {
                     Ok((doc, source, file)) => {
                         self.paste_recovery = None;
                         self.large_copy = None;
-                        self.expanded = doc.nodes.iter().map(|n| n.depth < 2).collect();
+                        self.lazy_view = if doc.is_lazy() {
+                            match LazyView::new(&doc) {
+                                Ok(view) => Some(view),
+                                Err(error) => {
+                                    self.error = Some(error);
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        self.expanded = match if doc.is_lazy() {
+                            Ok(Vec::new())
+                        } else {
+                            doc.initial_expanded()
+                        } {
+                            Ok(expanded) => expanded,
+                            Err(error) => {
+                                self.error = Some(error);
+                                self.open_duration =
+                                    self.load_started.take().map(|start| start.elapsed());
+                                return;
+                            }
+                        };
                         self.cancel_operations();
                         self.row_labels.clear();
                         self.detail.clear();
@@ -344,6 +382,10 @@ impl Viewer {
                         self.selected = 0;
                         self.term.clear();
                         self.matches = Vec::new();
+                        self.stream_matches = None;
+                        self.stream_revealed = false;
+                        self.search_progress = None;
+                        self.search_next = false;
                         self.search_error = None;
                         self.query_duration = None;
                         self.path_results = None;
@@ -402,8 +444,91 @@ impl Viewer {
         }
     }
     fn rebuild_rows(&mut self) {
-        if let Some(doc) = &self.doc {
-            doc.visible_into(&self.expanded, &mut self.rows);
+        if let Some(view) = &mut self.lazy_view {
+            if let Err(error) = view.rebuild(self.doc.as_ref().unwrap()) {
+                self.error = Some(error);
+            }
+            return;
+        }
+        if let Some(doc) = &self.doc
+            && let Err(error) = doc.visible_into(&self.expanded, &mut self.rows)
+        {
+            self.error = Some(error);
+        }
+    }
+    fn read_node(&mut self, id: usize) -> Option<crate::document::Node> {
+        match self.doc.as_ref()?.node(id) {
+            Ok(node) => Some(node),
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
+    }
+    fn row_count(&self) -> usize {
+        self.lazy_view
+            .as_ref()
+            .map_or(self.rows.len(), LazyView::len)
+    }
+    fn match_count(&self) -> usize {
+        self.stream_matches
+            .as_ref()
+            .map_or(self.matches.len(), |s| s.len())
+    }
+    fn match_id(&self, index: usize) -> Option<u32> {
+        if let Some(set) = &self.stream_matches {
+            set.get(index)
+        } else {
+            self.matches.get(index).copied()
+        }
+    }
+    fn is_match(&self, id: u32) -> bool {
+        self.stream_matches.as_ref().map_or_else(
+            || self.matches.binary_search(&id).is_ok(),
+            |s| s.contains(id),
+        )
+    }
+    fn row_position(&self, id: usize) -> Option<usize> {
+        if let Some(view) = &self.lazy_view {
+            view.position(self.doc.as_ref()?, id).ok().flatten()
+        } else {
+            self.rows.binary_search(&(id as u32)).ok()
+        }
+    }
+    fn row_id(&mut self, row: usize) -> Option<u32> {
+        if let Some(view) = &self.lazy_view {
+            match view.row(self.doc.as_ref()?, row) {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    self.error = Some(error);
+                    None
+                }
+            }
+        } else {
+            self.rows.get(row).copied()
+        }
+    }
+    fn is_expanded(&self, id: usize) -> bool {
+        self.lazy_view
+            .as_ref()
+            .map_or_else(|| self.expanded[id], |v| v.is_open(id))
+    }
+    fn set_expanded(&mut self, id: usize, open: bool) -> bool {
+        if let Some(view) = &mut self.lazy_view {
+            if let Err(error) = view.set_open(id, open) {
+                self.error = Some(error);
+                return false;
+            }
+        } else {
+            self.expanded[id] = open;
+        }
+        true
+    }
+    fn set_all_expanded(&mut self, open: bool) {
+        if let Some(view) = &mut self.lazy_view {
+            view.all(open);
+        } else {
+            self.expanded.fill(open);
         }
     }
     fn select(&mut self, id: usize) {
@@ -418,8 +543,15 @@ impl Viewer {
             self.history_index = self.history.len() - 1;
         }
         if self.selected != id || self.detail.is_empty() {
+            let path = match doc.try_path(id) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
             self.detail = doc.preview(id);
-            self.selected_path = doc.path(id);
+            self.selected_path = path;
         }
         self.selected = id;
     }
@@ -436,17 +568,15 @@ impl Viewer {
         self.reveal(self.history[self.history_index]);
     }
     fn move_rows(&mut self, delta: i32, count: usize) {
-        if self.rows.is_empty() {
+        if self.row_count() == 0 {
             return;
         }
-        let position = self
-            .rows
-            .iter()
-            .position(|&id| id as usize == self.selected)
-            .unwrap_or(0);
+        let position = self.row_position(self.selected).unwrap_or(0);
         let next = (position as i64 + delta as i64 * count as i64)
-            .clamp(0, self.rows.len() as i64 - 1) as usize;
-        self.reveal(self.rows[next] as usize);
+            .clamp(0, self.row_count() as i64 - 1) as usize;
+        if let Some(id) = self.row_id(next) {
+            self.reveal(id as usize);
+        }
     }
     fn start_search(&mut self, reverse: bool) {
         self.search_reverse = reverse;
@@ -462,17 +592,18 @@ impl Viewer {
             Action::Move(delta) => self.move_rows(delta, count),
             Action::Left | Action::Right => {
                 for _ in 0..count {
-                    let doc = self.doc.as_ref().unwrap();
-                    let node = &doc.nodes[self.selected];
+                    let Some(node) = self.read_node(self.selected) else {
+                        break;
+                    };
                     if command.action == Action::Left {
-                        if node.container() && self.expanded[self.selected] {
+                        if node.container() && self.is_expanded(self.selected) {
                             self.toggle(self.selected);
                         } else if let Some(parent) = node.parent() {
                             self.reveal(parent);
                         } else {
                             break;
                         }
-                    } else if node.container() && !self.expanded[self.selected] {
+                    } else if node.container() && !self.is_expanded(self.selected) {
                         self.toggle(self.selected);
                     } else if node.end() > self.selected + 1 {
                         self.reveal(self.selected + 1);
@@ -483,13 +614,15 @@ impl Viewer {
             }
             Action::First | Action::Last => {
                 let pos = if command.explicit_count {
-                    count.saturating_sub(1).min(self.rows.len() - 1)
+                    count.saturating_sub(1).min(self.row_count() - 1)
                 } else if command.action == Action::First {
                     0
                 } else {
-                    self.rows.len() - 1
+                    self.row_count() - 1
                 };
-                self.reveal(self.rows[pos] as usize);
+                if let Some(id) = self.row_id(pos) {
+                    self.reveal(id as usize);
+                }
             }
             Action::Match(opposite) => self.match_step(self.search_reverse ^ opposite, count),
             Action::History(backwards) => {
@@ -498,20 +631,23 @@ impl Viewer {
                 }
             }
             Action::Toggle | Action::Open | Action::Close => {
-                if self.doc.as_ref().unwrap().nodes[self.selected].container() {
+                if let Some(node) = self.read_node(self.selected)
+                    && node.container()
+                {
                     let want_open = command.action == Action::Open;
-                    if command.action == Action::Toggle || self.expanded[self.selected] != want_open
+                    if command.action == Action::Toggle
+                        || self.is_expanded(self.selected) != want_open
                     {
                         self.toggle(self.selected);
                     }
                 }
             }
             Action::ExpandAll => {
-                self.expanded.fill(true);
+                self.set_all_expanded(true);
                 self.rebuild_rows();
             }
             Action::CollapseAll => {
-                self.expanded.fill(false);
+                self.set_all_expanded(false);
                 self.reveal(0);
             }
             Action::Screen(which) => {
@@ -520,9 +656,11 @@ impl Viewer {
                     'L' => self.page_rows.saturating_sub(1),
                     _ => 0,
                 };
-                self.reveal(
-                    self.rows[(self.viewport_first + offset).min(self.rows.len() - 1)] as usize,
-                );
+                if let Some(id) =
+                    self.row_id((self.viewport_first + offset).min(self.row_count() - 1))
+                {
+                    self.reveal(id as usize);
+                }
             }
         }
     }
@@ -556,10 +694,29 @@ impl Viewer {
     }
     fn reveal(&mut self, id: usize) {
         if let Some(doc) = &self.doc {
-            let mut parent = doc.nodes[id].parent();
+            let mut parent = match doc.node(id) {
+                Ok(node) => node.parent(),
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
             while let Some(p) = parent {
-                self.expanded[p] = true;
-                parent = doc.nodes[p].parent();
+                if let Some(view) = &mut self.lazy_view {
+                    if let Err(error) = view.set_open(p, true) {
+                        self.error = Some(error);
+                        return;
+                    }
+                } else {
+                    self.expanded[p] = true;
+                }
+                parent = match doc.node(p) {
+                    Ok(node) => node.parent(),
+                    Err(error) => {
+                        self.error = Some(error);
+                        return;
+                    }
+                };
             }
         }
         self.select(id);
@@ -580,6 +737,10 @@ impl Viewer {
             worker.cancel();
         }
         self.matches = Vec::new();
+        self.stream_matches = None;
+        self.stream_revealed = false;
+        self.search_progress = None;
+        self.search_next = false;
         self.search_error = None;
         self.query_duration = None;
         if self.term.is_empty() || !self.colors.live_search {
@@ -592,6 +753,10 @@ impl Viewer {
     fn search(&mut self) {
         self.search_due = None;
         self.matches = Vec::new();
+        self.stream_matches = None;
+        self.stream_revealed = false;
+        self.search_progress = None;
+        self.search_next = false;
         self.search_error = None;
         self.match_index = 0;
         self.query_duration = None;
@@ -605,6 +770,24 @@ impl Viewer {
             return;
         }
         if let Some(worker) = &mut self.search_worker {
+            if doc.is_lazy() {
+                self.stream_matches = Some(Arc::new(MatchSet::default()));
+                self.search_progress = Some((0, doc.node_count(), false));
+                worker.submit(
+                    Arc::clone(doc),
+                    Operation::StreamSearch {
+                        term: self.term.clone(),
+                        case: self.case,
+                        regex: self.regex,
+                        scope: self.scope,
+                        from: 0,
+                        next: false,
+                        reverse: false,
+                        count: 1,
+                    },
+                );
+                return;
+            }
             worker.submit(
                 Arc::clone(doc),
                 Operation::Search {
@@ -627,19 +810,21 @@ impl Viewer {
             Ok(ids) => self.matches = ids,
             Err(error) => self.search_error = Some(error),
         }
-        if !self.matches.is_empty() {
+        if self.match_count() != 0 {
             self.match_index = if self.search_reverse {
                 self.matches
                     .iter()
                     .rposition(|&id| (id as usize) < self.search_origin)
-                    .unwrap_or(self.matches.len() - 1)
+                    .unwrap_or(self.match_count() - 1)
             } else {
                 self.matches
                     .iter()
                     .position(|&id| id as usize > self.search_origin)
                     .unwrap_or(0)
             };
-            self.reveal(self.matches[self.match_index] as usize);
+            if let Some(id) = self.match_id(self.match_index) {
+                self.reveal(id as usize);
+            }
         }
         self.query_duration = Some(("Search", elapsed + started.elapsed()));
     }
@@ -699,13 +884,21 @@ impl Viewer {
             self.search();
         }
         if let Some(completed) = self.search_worker.as_mut().and_then(Worker::poll) {
-            self.finish_search(
-                completed.result.map(|output| match output {
-                    Output::Search(ids) => ids,
-                    _ => unreachable!(),
-                }),
-                completed.elapsed,
-            );
+            match completed.result {
+                Ok(Output::SearchBatch {
+                    ids,
+                    scanned,
+                    total,
+                    finished,
+                    next,
+                }) => self.finish_batch(ids, scanned, total, finished, next, completed.elapsed),
+                Ok(Output::Search(ids)) => self.finish_search(Ok(ids), completed.elapsed),
+                Err(error) => {
+                    self.search_error = Some(error);
+                    self.query_duration = Some(("Search", completed.elapsed));
+                }
+                _ => unreachable!(),
+            }
         }
         if let Some(completed) = self.path_worker.as_mut().and_then(Worker::poll) {
             let result = completed.result.map(|output| match output {
@@ -731,17 +924,117 @@ impl Viewer {
     fn next_match(&mut self, backwards: bool) {
         self.match_step(backwards, 1);
     }
-    fn match_step(&mut self, backwards: bool, count: usize) {
-        if self.matches.is_empty() {
+    fn find_one(&mut self, backwards: bool, count: usize) {
+        let Some(doc) = &self.doc else {
+            return;
+        };
+        if !doc.is_lazy() {
+            self.search_reverse = backwards;
+            self.search_origin = self.selected;
+            self.search();
             return;
         }
-        let count = count % self.matches.len();
+        if self.term.is_empty() {
+            return;
+        }
+        self.search_due = None;
+        self.matches = Vec::new();
+        self.stream_matches = None;
+        self.stream_revealed = false;
+        self.search_progress = None;
+        self.search_next = false;
+        self.stream_matches = Some(Arc::new(MatchSet::default()));
+        self.search_next = true;
+        self.search_error = None;
+        self.search_progress = Some((0, doc.node_count(), false));
+        let from = self.selected as u32;
+        if let Some(worker) = &mut self.search_worker {
+            worker.submit(
+                Arc::clone(doc),
+                Operation::StreamSearch {
+                    term: self.term.clone(),
+                    case: self.case,
+                    regex: self.regex,
+                    scope: self.scope,
+                    from,
+                    next: true,
+                    reverse: backwards,
+                    count,
+                },
+            );
+        }
+    }
+    fn finish_batch(
+        &mut self,
+        ids: NodeIds,
+        scanned: usize,
+        total: usize,
+        finished: bool,
+        next: bool,
+        elapsed: Duration,
+    ) {
+        let set = self
+            .stream_matches
+            .get_or_insert_with(|| Arc::new(MatchSet::default()));
+        for id in ids {
+            if let Err(error) = Arc::make_mut(set).insert(id) {
+                self.search_error = Some(error);
+                if let Some(worker) = &mut self.search_worker {
+                    worker.cancel();
+                }
+                return;
+            }
+        }
+        self.search_progress = Some((scanned, total, finished));
+        self.query_duration = Some(("Search", elapsed));
+        self.search_next = next;
+        if (next || !self.stream_revealed) && self.match_count() > 0 {
+            let set = self.stream_matches.as_ref().unwrap();
+            let candidate = if next {
+                Some(0)
+            } else if self.search_reverse {
+                if scanned >= self.search_origin || finished {
+                    set.before(self.search_origin as u32)
+                        .checked_sub(1)
+                        .or_else(|| finished.then_some(self.match_count() - 1))
+                } else {
+                    None
+                }
+            } else {
+                let index = set.before((self.search_origin as u32).saturating_add(1));
+                if index < self.match_count() {
+                    Some(index)
+                } else {
+                    finished.then_some(0)
+                }
+            };
+            let Some(index) = candidate else {
+                return;
+            };
+            self.match_index = index;
+            self.stream_revealed = true;
+            if let Some(id) = self.match_id(self.match_index) {
+                self.reveal(id as usize);
+            }
+        }
+    }
+    fn match_step(&mut self, backwards: bool, count: usize) {
+        if self.search_next {
+            self.find_one(backwards, count);
+            return;
+        }
+        if self.match_count() == 0 {
+            return;
+        }
+        let count = count % self.match_count();
         self.match_index = if backwards {
-            (self.match_index + self.matches.len() - count) % self.matches.len()
+            (self.match_index + self.match_count() - count) % self.match_count()
         } else {
-            (self.match_index + count) % self.matches.len()
+            (self.match_index + count) % self.match_count()
         };
-        self.reveal(self.matches[self.match_index] as usize);
+        if let Some(id) = self.match_id(self.match_index) {
+            self.reveal(id as usize);
+        }
     }
     fn copy(&mut self, ctx: &egui::Context, path: bool) {
         if path {
@@ -829,12 +1122,14 @@ impl Viewer {
         }
     }
     fn toggle(&mut self, id: usize) {
-        self.expanded[id] = !self.expanded[id];
-        if let Some(doc) = &self.doc
-            && !self.expanded[id]
-            && self.selected > id
-            && self.selected < doc.nodes[id].end()
-        {
+        let Some(node) = self.read_node(id) else {
+            return;
+        };
+        let open = !self.is_expanded(id);
+        if !self.set_expanded(id, open) {
+            return;
+        }
+        if !open && self.selected > id && self.selected < node.end() {
             self.select(id);
         }
         self.rebuild_rows();
@@ -960,7 +1255,9 @@ impl Viewer {
     fn selection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal_wrapped(|ui| {
             ui.heading("Value preview");
-            let node = &self.doc.as_ref().unwrap().nodes[self.selected];
+            let Some(node) = self.read_node(self.selected) else {
+                return;
+            };
             ui.colored_label(kind_color(node.kind(), self.colors.active()), node.kind());
             if ui
                 .checkbox(&mut self.colors.wrap_values, "Wrap")
@@ -1091,8 +1388,8 @@ impl Viewer {
                         .on_hover_text("Release the previous document and wait for its background work before loading. If loading fails, reopen the previous document.").changed() {
                         self.save_colors();
                     }
-                    if ui.checkbox(&mut self.colors.indexed_files, "Indexed files")
-                        .on_hover_text("Validated disk snapshot and byte-range index; no whole Value. Filters/functions and oversized regex values require reopening in in-memory mode. Paste/stdin keep their existing backend.").changed() { self.save_colors(); }
+                    if ui.checkbox(&mut self.colors.indexed_files, "On-demand files")
+                        .on_hover_text("Sparse memory index and bounded container pages; no temporary index files. Files up to 512 MiB use a memory source; larger files stay open read-only.").changed() { self.save_colors(); }
                 });
                 if ui.button("Help").clicked() {
                     self.help = true;
@@ -1202,10 +1499,10 @@ impl Viewer {
                 {
                     ui.spinner();
                 }
-                ui.label(if self.matches.is_empty() {
+                ui.label(if self.match_count() == 0 {
                     "0 / 0".into()
                 } else {
-                    format!("{} / {}", self.match_index + 1, self.matches.len())
+                    format!("{} / {}", self.match_index + 1, self.match_count())
                 });
                 if ui.button("<").clicked() {
                     self.next_match(true);
@@ -1217,9 +1514,24 @@ impl Viewer {
                     self.term.clear();
                     self.search();
                 }
+                if self.doc.as_ref().is_some_and(|doc| doc.is_lazy()) {
+                    if ui.button("Find next").clicked() { self.find_one(self.search_reverse, 1); }
+                    let complete = self.search_progress.is_some_and(|(_, _, done)| done) && !self.search_next;
+                    if ui.add_enabled(complete && self.match_count() > 0, egui::Button::new("Export matches")).clicked() {
+                        let doc = Arc::clone(self.doc.as_ref().unwrap()); let set = Arc::clone(self.stream_matches.as_ref().unwrap());
+                        self.export_selection(doc, Selection::Matches(set));
+                    }
+                    if self.search_worker.as_ref().is_some_and(|w| w.busy) && ui.button("Cancel search").clicked() {
+                        self.search_worker.as_mut().unwrap().cancel(); self.notice = "Search cancelled; discovered matches are partial".into();
+                    }
+                }
             });
             if let Some(error) = &self.search_error {
                 ui.colored_label(Color32::LIGHT_RED, error);
+            }
+            if let Some((done, total, finished)) = self.search_progress {
+                ui.label(if self.search_next { if finished { if self.match_count() > 0 { "Next match found".into() } else { "No match found".into() } } else { "Finding next match...".into() } } else if finished { format!("Search complete: {} matches", self.match_count()) } else { format!("Found {} so far · scanned {:.0}%", self.match_count(), done as f64 * 100.0 / total.max(1) as f64) })
+                    .on_hover_text(format!("Match storage: {:.2} MiB", self.stream_matches.as_ref().map_or(0, |set| set.bytes()) as f64 / 1048576.0));
             }
             ui.horizontal(|ui| {
                 ui.label("JSONPath");
@@ -1257,11 +1569,11 @@ impl Viewer {
                     self.query_duration = None;
                 }
                 if ui.button("Expand all").clicked() {
-                    self.expanded.fill(true);
+                    self.set_all_expanded(true);
                     self.rebuild_rows();
                 }
                 if ui.button("Collapse all").clicked() {
-                    self.expanded.fill(false);
+                    self.set_all_expanded(false);
                     self.select(0);
                     self.rebuild_rows();
                 }
@@ -1288,7 +1600,7 @@ impl Viewer {
                         ui.label(RichText::new(self.vim.display()).monospace().color(Color32::from_rgb(100, 180, 235)));
                         if let Some(doc) = &self.doc {
                             ui.label(doc.backend_name());
-                            ui.label(format!("{} nodes", doc.nodes.len())).on_hover_text(format!("{:.1} KB", doc.bytes as f64 / 1024.0));
+                            ui.label(format!("{} nodes", doc.node_count())).on_hover_text(format!("{:.1} KB", doc.bytes as f64 / 1024.0));
                         }
                         if let Some((position, path)) = self.cursor_location() {
                             ui.label(RichText::new(position).monospace()).on_hover_text("Current visible tree row / total visible rows");
@@ -1404,10 +1716,7 @@ impl Viewer {
                 .id_salt("tree")
                 .auto_shrink([false, false]);
             if self.scroll_to
-                && let Some(pos) = self
-                    .rows
-                    .iter()
-                    .position(|&id| id as usize == self.selected)
+                && let Some(pos) = self.row_position(self.selected)
             {
                 area = area.vertical_scroll_offset(
                     (pos as f32 * row_stride - ui.available_height() / 2.0).max(0.0),
@@ -1416,17 +1725,27 @@ impl Viewer {
             }
             let mut select = None;
             let mut toggle = None;
-            area.show_rows(ui, row_height, self.rows.len(), |ui, range| {
+            area.show_rows(ui, row_height, self.row_count(), |ui, range| {
                 self.viewport_first = range.start;
                 for row in range {
-                    let id = self.rows[row] as usize;
+                    let Some(id) = self.row_id(row) else {
+                        break;
+                    };
+                    let id = id as usize;
                     let doc = self.doc.as_ref().unwrap();
-                    let node = &doc.nodes[id];
+                    let node = match doc.node(id) {
+                        Ok(node) => node,
+                        Err(error) => {
+                            self.error = Some(error);
+                            break;
+                        }
+                    };
+                    let expanded = self.is_expanded(id);
+                    let is_match = self.is_match(id as u32);
                     let labels = self
                         .row_labels
                         .labels(id, || (doc.key(id).into_owned(), doc.row_preview(id)));
                     let (row_key, row_preview) = labels.as_ref();
-                    let is_match = self.matches.binary_search(&(id as u32)).is_ok();
                     let palette = self.colors.active();
                     let fill = if id == self.selected {
                         color(palette.selection)
@@ -1444,12 +1763,8 @@ impl Viewer {
                                 if ui
                                     .add_sized(
                                         [18.0, 18.0],
-                                        egui::Button::new(if self.expanded[id] {
-                                            "▾"
-                                        } else {
-                                            "▸"
-                                        })
-                                        .frame(false),
+                                        egui::Button::new(if expanded { "▾" } else { "▸" })
+                                            .frame(false),
                                     )
                                     .clicked()
                                 {
@@ -1597,6 +1912,36 @@ fn format_duration(duration: Duration) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn on_demand_view_and_incremental_search_do_not_allocate_dense_gui_arrays() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::empty();
+        app.colors.indexed_files = true;
+        app.search_worker = Some(Worker::new(ctx.clone()));
+        app.load_file(PathBuf::from("examples/sample.json"), &ctx);
+        wait_load(&mut app);
+        assert!(app.lazy_view.is_some());
+        assert!(app.rows.is_empty() && app.expanded.is_empty());
+        app.term = "email".into();
+        app.scope = SearchScope::Keys;
+        app.search();
+        wait_operations(&mut app, &ctx);
+        assert_eq!(app.match_count(), 2);
+        assert!(app.matches.is_empty());
+        assert!(app.search_progress.unwrap().2);
+        let first = app.match_id(0).unwrap();
+        let last = app.match_id(1).unwrap();
+        app.reveal(last as usize);
+        app.find_one(false, 1);
+        wait_operations(&mut app, &ctx);
+        assert_eq!(app.selected, first as usize);
+        app.find_one(true, 1);
+        wait_operations(&mut app, &ctx);
+        assert_eq!(app.selected, last as usize);
+        app.schedule_search(&ctx);
+        assert!(app.stream_matches.is_none());
+        assert!(app.search_progress.is_none());
+    }
+    #[test]
     fn paste_moves_the_buffer_and_restores_it_on_syntax_error() {
         let ctx = egui::Context::default();
         let mut app = Viewer::empty();
@@ -1730,7 +2075,7 @@ mod tests {
     fn loaded() -> Viewer {
         let mut app = Viewer::empty();
         let doc = Document::parse(DEMO).unwrap();
-        app.expanded = vec![false; doc.nodes.len()];
+        app.expanded = vec![false; doc.node_count()];
         app.doc = Some(Arc::new(doc));
         app.select(0);
         app.rebuild_rows();

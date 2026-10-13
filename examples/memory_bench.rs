@@ -8,14 +8,21 @@ mod export;
 #[path = "../src/loading.rs"]
 mod loading;
 
-use document::{Document, LoadProgress, SearchScope};
+use document::{Document, LazyView, LoadProgress, MatchSet, SearchScope};
 use serde_json::json;
 use std::{hint::black_box, sync::Arc, time::Instant};
 
 fn backend(file: String, mode: String) -> Result<(), String> {
     let total = Instant::now();
     let started = Instant::now();
-    let doc = if mode == "indexed-open" {
+    let io_start = io_counters();
+    let doc = if mode == "lazy-open" {
+        Document::open_lazy(
+            std::path::Path::new(&file),
+            || false,
+            &LoadProgress::default(),
+        )?
+    } else if mode == "indexed-open" {
         Document::open_indexed(
             std::path::Path::new(&file),
             || false,
@@ -33,8 +40,9 @@ fn backend(file: String, mode: String) -> Result<(), String> {
         "{}",
         json!({
             "file": file, "mode": mode, "backend": doc.backend_name(), "bytes": doc.bytes,
-            "nodes": doc.nodes.len(), "has_whole_value": doc.value().is_some(),
+            "nodes": doc.node_count(), "has_whole_value": doc.value().is_some(),
             "structure_capacity_bytes": doc.structure_capacity_bytes(), "load_ms": load_ms,
+            "lazy_memory_bytes": doc.lazy_memory_bytes(), "io_start": io_start, "io_ready": io_counters(),
             "preview_ms": preview_ms, "total_ms": total.elapsed().as_secs_f64() * 1000.0,
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
             "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
@@ -42,6 +50,84 @@ fn backend(file: String, mode: String) -> Result<(), String> {
         })
     );
     Ok(())
+}
+fn lazy_browse(file: String) -> Result<(), String> {
+    let total = Instant::now();
+    let io_start = io_counters();
+    let doc = Document::open_lazy(
+        std::path::Path::new(&file),
+        || false,
+        &LoadProgress::default(),
+    )?;
+    let mut view = LazyView::new(&doc)?;
+    let initial_rows = view.len();
+    let started = Instant::now();
+    for row in [
+        0,
+        initial_rows / 2,
+        initial_rows - 1,
+        1.min(initial_rows - 1),
+    ] {
+        let id = view.row(&doc, row)?;
+        black_box(doc.row_preview(id as usize));
+    }
+    let browse_ms = started.elapsed().as_secs_f64() * 1000.0;
+    view.all(true);
+    view.rebuild(&doc)?;
+    let full_rows = view.len();
+    let mut matches = MatchSet::default();
+    let started = Instant::now();
+    let mut first_ms = None;
+    doc.stream_search(
+        ".*",
+        false,
+        true,
+        SearchScope::All,
+        0,
+        &|| false,
+        |id, _, _| {
+            if let Some(id) = id {
+                if first_ms.is_none() {
+                    first_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                matches.insert(id)?;
+            }
+            Ok(true)
+        },
+    )?;
+    println!(
+        "{}",
+        json!({"file":file,"mode":"lazy-browse","nodes":doc.node_count(),"initial_rows":initial_rows,"full_rows":full_rows,"matches":matches.len(),"match_bytes":matches.bytes(),"structure_capacity_bytes":doc.structure_capacity_bytes(),"lazy_memory_bytes":doc.lazy_memory_bytes(),"first_match_ms":first_ms,"browse_ms":browse_ms,"search_all_ms":started.elapsed().as_secs_f64()*1000.0,"total_ms":total.elapsed().as_secs_f64()*1000.0,"io_start":io_start,"io_ready":io_counters(),"package_version":env!("CARGO_PKG_VERSION"),"memory":{"ready":memory()}})
+    );
+    Ok(())
+}
+#[cfg(windows)]
+fn io_counters() -> serde_json::Value {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        reads: u64,
+        writes: u64,
+        other: u64,
+        read_bytes: u64,
+        write_bytes: u64,
+        other_bytes: u64,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetProcessIoCounters(process: *mut std::ffi::c_void, counters: *mut Counters) -> i32;
+    }
+    let mut counters = Counters::default();
+    // A valid IO_COUNTERS buffer and the pseudo-handle for this process.
+    if unsafe { GetProcessIoCounters(GetCurrentProcess(), &mut counters) } == 0 {
+        return json!({"unavailable":true});
+    }
+    json!({"read_bytes":counters.read_bytes,"write_bytes":counters.write_bytes})
+}
+#[cfg(not(windows))]
+fn io_counters() -> serde_json::Value {
+    json!({"unavailable":true})
 }
 
 fn switch(file: String, mode: String) -> Result<(), String> {
@@ -72,7 +158,7 @@ fn switch(file: String, mode: String) -> Result<(), String> {
     println!(
         "{}",
         json!({
-            "file": file, "mode": mode, "bytes": new.bytes, "nodes": new.nodes.len(),
+            "file": file, "mode": mode, "bytes": new.bytes, "nodes": new.node_count(),
             "node_size": std::mem::size_of::<document::Node>(),
             "structure_capacity_bytes": new.structure_capacity_bytes(),
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
@@ -91,14 +177,14 @@ fn tree(file: String) -> Result<(), String> {
     let total = Instant::now();
     let doc = Document::parse_owned(std::fs::read_to_string(&file).map_err(|e| e.to_string())?)?;
     let document_ready = memory();
-    let expanded = vec![true; doc.nodes.len()];
+    let expanded = vec![true; doc.node_count()];
     let started = Instant::now();
-    let mut rows = doc.visible(&expanded);
+    let mut rows = doc.visible(&expanded)?;
     let rows_ms = started.elapsed().as_secs_f64() * 1000.0;
     let after_rows = memory();
     let allocation = rows.as_ptr();
     let started = Instant::now();
-    doc.visible_into(&expanded, &mut rows);
+    doc.visible_into(&expanded, &mut rows)?;
     let rebuild_rows_ms = started.elapsed().as_secs_f64() * 1000.0;
     let reused_row_allocation = allocation == rows.as_ptr();
     let started = Instant::now();
@@ -108,7 +194,7 @@ fn tree(file: String) -> Result<(), String> {
     println!(
         "{}",
         json!({
-            "file": file, "mode": "tree", "bytes": doc.bytes, "nodes": doc.nodes.len(),
+            "file": file, "mode": "tree", "bytes": doc.bytes, "nodes": doc.node_count(),
             "node_size": std::mem::size_of::<document::Node>(),
             "structure_capacity_bytes": doc.structure_capacity_bytes(),
             "rows": rows.len(), "row_capacity_bytes": rows.capacity() * std::mem::size_of::<u32>(),
@@ -158,7 +244,7 @@ fn export_file(file: String, mode: String) -> Result<(), String> {
     println!(
         "{}",
         json!({
-            "file": file, "mode": mode, "bytes": doc.bytes, "nodes": doc.nodes.len(),
+            "file": file, "mode": mode, "bytes": doc.bytes, "nodes": doc.node_count(),
             "node_size": std::mem::size_of::<document::Node>(), "output_bytes": output_bytes,
             "output_string_capacity": output_string_capacity, "export_ms": export_ms,
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
@@ -237,6 +323,8 @@ fn run() -> Result<(), String> {
             | "export-stream"
             | "memory-open"
             | "indexed-open"
+            | "lazy-open"
+            | "lazy-browse"
     ) || args.next().is_some()
     {
         return Err("Usage: memory_bench FILE retain|release|switch-normal|switch-low|tree|export-string|export-stream".into());
@@ -249,6 +337,9 @@ fn run() -> Result<(), String> {
     }
     if mode.ends_with("-open") {
         return backend(file, mode);
+    }
+    if mode == "lazy-browse" {
+        return lazy_browse(file);
     }
     if mode == "tree" {
         return tree(file);
@@ -292,11 +383,11 @@ fn run() -> Result<(), String> {
         "{}",
         json!({
             "file": file, "mode": mode, "bytes": bytes,
-            "nodes": doc.nodes.len(), "node_size": std::mem::size_of::<document::Node>(),
-            "node_capacity_bytes": doc.nodes.capacity() * std::mem::size_of::<document::Node>(),
+            "nodes": doc.node_count(), "node_size": std::mem::size_of::<document::Node>(),
+            "node_capacity_bytes": doc.structure_capacity_bytes(),
             "structure_capacity_bytes": doc.structure_capacity_bytes(),
-            "full_expand_rows_payload_bytes": doc.nodes.len() * std::mem::size_of::<u32>(),
-            "expanded_flags_bytes": doc.nodes.len() * std::mem::size_of::<bool>(),
+            "full_expand_rows_payload_bytes": doc.node_count() * std::mem::size_of::<u32>(),
+            "expanded_flags_bytes": doc.node_count() * std::mem::size_of::<bool>(),
             "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
             "package_version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
             "read_ms": read_ms, "parse_ms": parse_ms, "release_ms": release_ms,

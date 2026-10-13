@@ -47,12 +47,13 @@ fn run() -> Result<(), String> {
     let mut search = None;
     let mut pretty = false;
     let mut indexed = false;
+    let mut resident_index = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --indexed      File snapshot/range backend (limited JSONPath; no full Value)\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported in in-memory mode.",
+                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --indexed      On-demand file backend (bounded JSONPath; no temporary index files)\n  --resident-index  Previous resident index, CLI output actions only\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported in in-memory mode.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
@@ -66,6 +67,10 @@ fn run() -> Result<(), String> {
             "--search" => search = Some(args.next().ok_or("--search requires text")?),
             "--pretty" => pretty = true,
             "--indexed" => indexed = true,
+            "--resident-index" => {
+                indexed = true;
+                resident_index = true;
+            }
             "-" if file.is_none() => file = Some(PathBuf::from("-")),
             _ if arg.starts_with('-') => return Err(format!("Unknown option: {arg}")),
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
@@ -96,11 +101,19 @@ fn run() -> Result<(), String> {
     };
     if get.is_some() || query.is_some() || search.is_some() || pretty {
         let doc = if indexed {
-            Document::open_indexed(
-                file.as_ref().ok_or("Provide a file for --indexed")?,
-                || false,
-                &document::LoadProgress::default(),
-            )?
+            if resident_index {
+                Document::open_indexed(
+                    file.as_ref().ok_or("Provide a file for --resident-index")?,
+                    || false,
+                    &document::LoadProgress::default(),
+                )?
+            } else {
+                Document::open_lazy(
+                    file.as_ref().ok_or("Provide a file for --indexed")?,
+                    || false,
+                    &document::LoadProgress::default(),
+                )?
+            }
         } else {
             let text = match text {
                 Some(text) => text,
@@ -123,8 +136,27 @@ fn run() -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             writeln!(output).map_err(|e| e.to_string())?;
         } else if let Some(term) = search {
-            for id in doc.search(&term, false, false, SearchScope::All)? {
-                writeln!(output, "{}", doc.path(id as usize)).map_err(|e| e.to_string())?;
+            if doc.is_lazy() {
+                doc.stream_search(
+                    &term,
+                    false,
+                    false,
+                    SearchScope::All,
+                    0,
+                    &|| false,
+                    |id, _, _| {
+                        if let Some(id) = id {
+                            writeln!(output, "{}", doc.try_path(id as usize)?)
+                                .map_err(|e| e.to_string())?;
+                        }
+                        Ok(true)
+                    },
+                )?;
+            } else {
+                for id in doc.search(&term, false, false, SearchScope::All)? {
+                    writeln!(output, "{}", doc.try_path(id as usize)?)
+                        .map_err(|e| e.to_string())?;
+                }
             }
         } else {
             doc.write_node(&mut output, 0).map_err(|e| e.to_string())?;
@@ -134,6 +166,9 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     // Finder launches with an empty redirected stdin. Start with an empty viewer
+    if resident_index {
+        return Err("--resident-index is available with CLI output actions; use --indexed for the on-demand viewer".into());
+    }
     // instead of trying to parse that as a JSON document; CLI parsing stays strict.
     let text = text.filter(|text| !text.is_empty());
     let options = eframe::NativeOptions {

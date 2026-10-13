@@ -7,9 +7,21 @@ use std::{
     io::{self, Write},
     sync::Arc,
 };
+#[path = "filter.rs"]
+mod filter;
 #[path = "indexed.rs"]
 mod indexed;
+#[path = "view.rs"]
+mod view;
 pub use indexed::LoadProgress;
+#[allow(
+    unused_imports,
+    reason = "The standalone engine benchmark does not use GUI navigation"
+)]
+pub use view::LazyView;
+#[path = "matches.rs"]
+mod matches;
+pub use matches::MatchSet;
 
 pub type NodeIds = Vec<u32>;
 
@@ -46,6 +58,7 @@ impl Kind {
 }
 
 // Preorder node IDs remain stable. Strings and complete paths are never stored per node.
+#[derive(Clone, Copy)]
 pub struct Node {
     parent: u32,
     pub depth: u32,
@@ -71,7 +84,7 @@ impl Node {
 }
 pub struct Document {
     storage: Storage,
-    pub nodes: Vec<Node>,
+    nodes: Vec<Node>,
     pub bytes: usize,
     children: Vec<u32>,
     keys: Vec<Arc<str>>,
@@ -80,6 +93,7 @@ pub struct Document {
 enum Storage {
     Memory(Value),
     Indexed(indexed::Store),
+    Lazy(Box<indexed::lazy::Store>),
 }
 struct IndexBuilder {
     nodes: Vec<Node>,
@@ -162,6 +176,166 @@ fn node_count(value: &Value) -> Result<usize, String> {
     }
 }
 impl Document {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Search parameters plus incremental/cancellation callbacks"
+    )]
+    pub fn stream_search(
+        &self,
+        term: &str,
+        case: bool,
+        regex: bool,
+        scope: SearchScope,
+        from: u32,
+        cancelled: &impl Fn() -> bool,
+        emit: impl FnMut(Option<u32>, usize, usize) -> Result<bool, String>,
+    ) -> Result<(), String> {
+        match &self.storage {
+            Storage::Lazy(store) => store.scan(term, case, regex, scope, from, cancelled, emit),
+            _ => Err("Incremental search requires the on-demand backend".into()),
+        }
+    }
+    pub fn open_lazy(
+        path: &std::path::Path,
+        cancelled: impl Fn() -> bool,
+        progress: &LoadProgress,
+    ) -> Result<Self, String> {
+        indexed::lazy::open(path, cancelled, progress)
+    }
+    pub fn is_lazy(&self) -> bool {
+        matches!(self.storage, Storage::Lazy(_))
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Search controls plus direction, count and cancellation"
+    )]
+    pub fn find_next(
+        &self,
+        term: &str,
+        case: bool,
+        regex: bool,
+        scope: SearchScope,
+        origin: u32,
+        reverse: bool,
+        count: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Option<u32>, String> {
+        let count = count.clamp(1, 10_000);
+        if reverse {
+            let mut recent = std::collections::VecDeque::new();
+            self.stream_search(term, case, regex, scope, 0, cancelled, |id, done, _| {
+                if done.saturating_sub(1) >= origin as usize {
+                    return Ok(false);
+                }
+                if let Some(id) = id {
+                    if recent.len() == count {
+                        recent.pop_front();
+                    }
+                    recent.push_back(id);
+                }
+                Ok(true)
+            })?;
+            if recent.len() == count {
+                return Ok(recent.front().copied());
+            }
+            let remaining = count - recent.len();
+            recent.clear();
+            self.stream_search(term, case, regex, scope, 0, cancelled, |id, _, _| {
+                if let Some(id) = id {
+                    if recent.len() == remaining {
+                        recent.pop_front();
+                    }
+                    recent.push_back(id);
+                }
+                Ok(true)
+            })?;
+            if recent.is_empty() {
+                return Ok(None);
+            }
+            let index = (recent.len() - remaining % recent.len()) % recent.len();
+            Ok(recent.get(index).copied())
+        } else {
+            let mut tail = Vec::new();
+            self.stream_search(
+                term,
+                case,
+                regex,
+                scope,
+                origin.saturating_add(1),
+                cancelled,
+                |id, _, _| {
+                    if let Some(id) = id {
+                        tail.push(id);
+                    }
+                    Ok(tail.len() < count)
+                },
+            )?;
+            if tail.len() == count {
+                return Ok(tail.last().copied());
+            }
+            let remaining = count - tail.len();
+            let mut head = Vec::new();
+            self.stream_search(term, case, regex, scope, 0, cancelled, |id, _, _| {
+                if let Some(id) = id {
+                    head.push(id);
+                }
+                Ok(head.len() < remaining)
+            })?;
+            if head.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(head[(remaining - 1) % head.len()]))
+        }
+    }
+    #[allow(
+        dead_code,
+        reason = "Standalone benchmark measures all on-demand storage"
+    )]
+    pub fn lazy_memory_bytes(&self) -> usize {
+        if let Storage::Lazy(store) = &self.storage {
+            store.memory_bytes()
+        } else {
+            0
+        }
+    }
+    pub fn child_ordinal(&self, parent: usize, ordinal: usize) -> Result<usize, String> {
+        if let Storage::Lazy(store) = &self.storage {
+            return store.child_ordinal(parent, ordinal);
+        }
+        self.direct_children(parent)
+            .nth(ordinal)
+            .ok_or_else(|| "Invalid child ordinal".to_string())?
+    }
+    pub fn node_count(&self) -> usize {
+        match &self.storage {
+            Storage::Lazy(store) => store.node_count(),
+            _ => self.nodes.len(),
+        }
+    }
+    pub fn node(&self, id: usize) -> Result<Node, String> {
+        match &self.storage {
+            Storage::Lazy(store) => store.node(id),
+            _ => self
+                .nodes
+                .get(id)
+                .copied()
+                .ok_or_else(|| "Invalid node ID".into()),
+        }
+    }
+    pub fn initial_expanded(&self) -> Result<Vec<bool>, String> {
+        let mut expanded = vec![false; self.node_count()];
+        expanded[0] = true;
+        for child in self.direct_children(0) {
+            expanded[child?] = true;
+        }
+        Ok(expanded)
+    }
+    fn edge(&self, id: usize) -> Result<u32, String> {
+        self.children
+            .get(id)
+            .copied()
+            .ok_or_else(|| "Invalid edge ID".into())
+    }
     #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self, String> {
         Self::parse_owned(text.to_owned())
@@ -205,6 +379,7 @@ impl Document {
             + self.children.capacity() * std::mem::size_of::<u32>()
             + match &self.storage {
                 Storage::Indexed(store) => store.range_bytes(),
+                Storage::Lazy(store) => store.index_bytes(),
                 _ => 0,
             }
     }
@@ -216,9 +391,10 @@ impl Document {
         indexed::open(path, cancelled, progress)
     }
     pub fn backend_name(&self) -> &'static str {
-        match self.storage {
+        match &self.storage {
             Storage::Memory(_) => "In-memory",
             Storage::Indexed(_) => "Range index",
+            Storage::Lazy(store) => store.backend_name(),
         }
     }
     #[allow(
@@ -238,6 +414,7 @@ impl Document {
     pub fn read_subtree(&self, id: usize) -> Result<Arc<Value>, String> {
         match &self.storage {
             Storage::Indexed(store) => store.subtree(self, id),
+            Storage::Lazy(store) => store.subtree(id),
             _ => Err("Bounded subtree cache is an indexed-backend interface".into()),
         }
     }
@@ -259,35 +436,47 @@ impl Document {
         }
     }
     pub fn key(&self, id: usize) -> Cow<'_, str> {
-        let node = &self.nodes[id];
-        match node.parent() {
+        self.try_key(id)
+            .unwrap_or_else(|error| Cow::Owned(format!("Read error: {error}")))
+    }
+    fn try_key(&self, id: usize) -> Result<Cow<'_, str>, String> {
+        if let Storage::Lazy(store) = &self.storage {
+            return store.key(id).map(Cow::Owned);
+        }
+        let node = self.node(id)?;
+        Ok(match node.parent() {
             None => Cow::Borrowed("$"),
-            Some(parent) if matches!(self.nodes[parent].kind, Kind::Array) => {
+            Some(parent) if matches!(self.node(parent)?.kind, Kind::Array) => {
                 Cow::Owned(node.segment.to_string())
             }
             Some(_) => Cow::Borrowed(&self.keys[node.segment as usize]),
-        }
+        })
     }
-    fn ancestors(&self, mut id: usize) -> Vec<usize> {
-        let mut result = Vec::with_capacity(self.nodes[id].depth as usize);
-        while let Some(parent) = self.nodes[id].parent() {
+    fn ancestors(&self, mut id: usize) -> Result<Vec<usize>, String> {
+        let mut result = Vec::with_capacity(self.node(id)?.depth as usize);
+        while let Some(parent) = self.node(id)?.parent() {
             result.push(id);
             id = parent;
         }
         result.reverse();
-        result
+        Ok(result)
     }
+    #[cfg(test)]
     pub fn path(&self, id: usize) -> String {
+        self.try_path(id)
+            .unwrap_or_else(|error| format!("Read error: {error}"))
+    }
+    pub fn try_path(&self, id: usize) -> Result<String, String> {
         let mut path = String::from("$");
-        for child in self.ancestors(id) {
-            let node = &self.nodes[child];
-            if matches!(self.nodes[node.parent().unwrap()].kind, Kind::Array) {
+        for child in self.ancestors(id)? {
+            let node = self.node(child)?;
+            if matches!(self.node(node.parent().unwrap())?.kind, Kind::Array) {
                 path.push_str(&format!("[{}]", node.segment));
             } else {
-                let key = &self.keys[node.segment as usize];
-                if is_identifier(key) {
+                let key = self.try_key(child)?;
+                if is_identifier(&key) {
                     path.push('.');
-                    path.push_str(key);
+                    path.push_str(&key);
                 } else {
                     path.push('[');
                     path.push_str(&serde_json::to_string(key.as_ref()).unwrap());
@@ -295,55 +484,82 @@ impl Document {
                 }
             }
         }
-        path
+        Ok(path)
     }
     #[cfg(test)]
     fn pointer(&self, id: usize) -> String {
         let mut pointer = String::new();
-        for child in self.ancestors(id) {
+        for child in self.ancestors(id).unwrap() {
             pointer.push('/');
             pointer.push_str(&self.key(child).replace('~', "~0").replace('/', "~1"));
         }
         pointer
     }
-    fn child_name(&self, parent: usize, name: &str) -> Option<usize> {
-        if !matches!(self.nodes[parent].kind, Kind::Object) {
-            return None;
+    fn child_name(&self, parent: usize, name: &str) -> Result<Option<usize>, String> {
+        if let Storage::Lazy(store) = &self.storage {
+            return store.child_name(parent, name);
         }
-        let &segment = self.key_ids.get(name)?;
-        let node = &self.nodes[parent];
-        let children = &self.children
-            [node.child_start as usize..(node.child_start as usize + node.child_count as usize)];
-        children
-            .binary_search_by_key(&segment, |&id| self.nodes[id as usize].segment)
-            .ok()
-            .map(|i| children[i] as usize)
+        let node = self.node(parent)?;
+        if !matches!(node.kind, Kind::Object) {
+            return Ok(None);
+        }
+        let Some(&segment) = self.key_ids.get(name) else {
+            return Ok(None);
+        };
+        let mut low = 0;
+        let mut high = node.child_count as usize;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let id = self.edge(node.child_start as usize + mid)? as usize;
+            match self.node(id)?.segment.cmp(&segment) {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+                std::cmp::Ordering::Equal => return Ok(Some(id)),
+            }
+        }
+        Ok(None)
     }
-    fn child_index(&self, parent: usize, index: usize) -> Option<usize> {
-        let node = &self.nodes[parent];
-        (matches!(node.kind, Kind::Array) && index < node.child_count as usize)
-            .then(|| self.children[node.child_start as usize + index] as usize)
+    fn child_index(&self, parent: usize, index: usize) -> Result<Option<usize>, String> {
+        if let Storage::Lazy(store) = &self.storage {
+            return store.child_index(parent, index);
+        }
+        let node = self.node(parent)?;
+        if matches!(node.kind, Kind::Array) && index < node.child_count as usize {
+            Ok(Some(self.edge(node.child_start as usize + index)? as usize))
+        } else {
+            Ok(None)
+        }
     }
-    fn pointer_id(&self, pointer: &str) -> Option<usize> {
+    fn pointer_id(&self, pointer: &str) -> Result<Option<usize>, String> {
         let mut id = 0;
-        for token in pointer.strip_prefix('/')?.split('/') {
+        let Some(pointer) = pointer.strip_prefix('/') else {
+            return Ok(None);
+        };
+        for token in pointer.split('/') {
             let mut bytes = token.bytes();
             while let Some(byte) = bytes.next() {
                 if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
-                    return None;
+                    return Ok(None);
                 }
             }
             let token = token.replace("~1", "/").replace("~0", "~");
-            id = if matches!(self.nodes[id].kind, Kind::Array) {
+            let child = if matches!(self.node(id)?.kind, Kind::Array) {
                 if token.starts_with('+') || (token.len() > 1 && token.starts_with('0')) {
-                    return None;
+                    return Ok(None);
                 }
-                self.child_index(id, token.parse().ok()?)?
+                let Ok(index) = token.parse() else {
+                    return Ok(None);
+                };
+                self.child_index(id, index)?
             } else {
                 self.child_name(id, &token)?
             };
+            let Some(child) = child else {
+                return Ok(None);
+            };
+            id = child;
         }
-        Some(id)
+        Ok(Some(id))
     }
     pub fn find_path(&self, path: &str) -> Result<usize, String> {
         let ids = self.query_path(path)?;
@@ -367,7 +583,7 @@ impl Document {
         let expression = expression.trim();
         if expression.starts_with('/') {
             return Ok(self
-                .pointer_id(expression)
+                .pointer_id(expression)?
                 .map(|id| id as u32)
                 .into_iter()
                 .collect());
@@ -379,9 +595,12 @@ impl Document {
         } else {
             expression.to_owned()
         };
+        if let Storage::Lazy(store) = &self.storage {
+            return store.query(self, &normalized, &cancelled);
+        }
         let query = JsonPath::parse(&normalized).map_err(|e| format!("Invalid JSONPath: {e}"))?;
         if matches!(self.storage, Storage::Indexed(_)) {
-            return indexed::query(self, &normalized, cancelled);
+            return indexed::query(self, &normalized, &cancelled);
         }
         let results = query.query_located(self.value().unwrap());
         if cancelled() {
@@ -399,7 +618,7 @@ impl Document {
                     id = match element {
                         PathElement::Name(name) => self.child_name(id, name),
                         PathElement::Index(index) => self.child_index(id, *index),
-                    }
+                    }?
                     .ok_or_else(|| "Query result not found in tree".to_string())?;
                 }
                 Ok(id as u32)
@@ -407,6 +626,11 @@ impl Document {
             .collect()
     }
     pub fn row_preview(&self, id: usize) -> String {
+        if let Storage::Lazy(store) = &self.storage {
+            return store
+                .row_preview(id)
+                .unwrap_or_else(|e| format!("Read error: {e}"));
+        }
         if let Storage::Indexed(store) = &self.storage {
             return store
                 .row_preview(self, id)
@@ -440,6 +664,9 @@ impl Document {
     pub fn write_node(&self, mut writer: impl Write, id: usize) -> serde_json::Result<()> {
         match &self.storage {
             Storage::Memory(_) => serde_json::to_writer_pretty(writer, self.memory_at(id)),
+            Storage::Lazy(store) => store
+                .write(self, &mut writer, &[id as u32], false)
+                .map_err(serde_json::Error::io),
             Storage::Indexed(store) => store
                 .write(self, &mut writer, &[id as u32], false)
                 .map_err(serde_json::Error::io),
@@ -450,6 +677,9 @@ impl Document {
             Storage::Memory(_) => {
                 serde_json::to_writer_pretty(writer, &SelectedValues { doc: self, ids })
             }
+            Storage::Lazy(store) => store
+                .write(self, &mut writer, ids, true)
+                .map_err(serde_json::Error::io),
             Storage::Indexed(store) => store
                 .write(self, &mut writer, ids, true)
                 .map_err(serde_json::Error::io),
@@ -477,6 +707,9 @@ impl Document {
         }
         if let Storage::Indexed(store) = &self.storage {
             return store.search(self, term, case, regex, scope, cancelled);
+        }
+        if let Storage::Lazy(store) = &self.storage {
+            return store.search(term, case, regex, scope, cancelled);
         }
         let pattern = if regex {
             term.to_owned()
@@ -549,24 +782,29 @@ impl Document {
         dead_code,
         reason = "Convenience entry for tests and standalone benchmarks"
     )]
-    pub fn visible(&self, expanded: &[bool]) -> NodeIds {
+    pub fn visible(&self, expanded: &[bool]) -> Result<NodeIds, String> {
         let mut rows = Vec::new();
-        self.visible_into(expanded, &mut rows);
-        rows
+        self.visible_into(expanded, &mut rows)?;
+        Ok(rows)
     }
-    pub fn visible_into(&self, expanded: &[bool], rows: &mut NodeIds) {
+    pub fn visible_into(&self, expanded: &[bool], rows: &mut NodeIds) -> Result<(), String> {
+        rows.clear();
+        if expanded.len() != self.node_count() {
+            return Err("Invalid expanded-node state".into());
+        }
         let next = |id: usize| {
-            if self.nodes[id].container() && !expanded[id] {
-                self.nodes[id].end()
+            let node = self.node(id)?;
+            Ok::<_, String>(if node.container() && !expanded[id] {
+                node.end()
             } else {
                 id + 1
-            }
+            })
         };
         let mut count: usize = 0;
         let mut id = 0;
-        while id < self.nodes.len() {
+        while id < self.node_count() {
             count += 1;
-            id = next(id);
+            id = next(id)?;
         }
         if rows.capacity() > count.saturating_mul(2).max(4096) {
             *rows = Vec::new();
@@ -575,25 +813,48 @@ impl Document {
         if count > rows.capacity() {
             let capacity = count
                 .saturating_add((count / 8).min(65_536))
-                .min(self.nodes.len());
+                .min(self.node_count());
             rows.reserve_exact(capacity);
         }
         let mut id = 0;
-        while id < self.nodes.len() {
+        while id < self.node_count() {
             rows.push(id as u32);
-            id = next(id);
+            id = match next(id) {
+                Ok(next) => next,
+                Err(error) => {
+                    rows.clear();
+                    return Err(error);
+                }
+            };
         }
+        Ok(())
     }
-    fn direct_children(&self, id: usize) -> impl Iterator<Item = usize> + '_ {
+    fn direct_children(&self, id: usize) -> impl Iterator<Item = Result<usize, String>> + '_ {
         let mut next = id + 1;
-        let end = self.nodes[id].end();
+        let mut end = self.node(id).map(|n| n.end());
         std::iter::from_fn(move || {
-            if next >= end {
+            let limit = match &end {
+                Ok(end) => *end,
+                Err(error) => {
+                    let error = error.clone();
+                    end = Ok(0);
+                    return Some(Err(error));
+                }
+            };
+            if next >= limit {
                 return None;
             }
             let id = next;
-            next = self.nodes[id].end();
-            Some(id)
+            match self.node(id) {
+                Ok(node) => {
+                    next = node.end();
+                    Some(Ok(id))
+                }
+                Err(error) => {
+                    next = limit;
+                    Some(Err(error))
+                }
+            }
         })
     }
 }
@@ -691,14 +952,14 @@ mod tests {
         let doc = Document::parse(&serde_json::json!(vec![0; 10_000]).to_string()).unwrap();
         let mut expanded = vec![true; doc.nodes.len()];
         let mut rows = Vec::new();
-        doc.visible_into(&expanded, &mut rows);
+        doc.visible_into(&expanded, &mut rows).unwrap();
         assert_eq!(rows.len(), doc.nodes.len());
         assert_eq!(rows.capacity(), doc.nodes.len());
         let allocation = rows.as_ptr();
-        doc.visible_into(&expanded, &mut rows);
+        doc.visible_into(&expanded, &mut rows).unwrap();
         assert_eq!(rows.as_ptr(), allocation);
         expanded[0] = false;
-        doc.visible_into(&expanded, &mut rows);
+        doc.visible_into(&expanded, &mut rows).unwrap();
         assert_eq!(rows, vec![0]);
         assert!(rows.capacity() <= 4096);
     }
@@ -864,9 +1125,9 @@ mod tests {
         let d = Document::parse(r#"{"a":[1,{"b":2}],"c":3}"#).unwrap();
         let mut expanded = vec![true; d.nodes.len()];
         expanded[1] = false;
-        assert_eq!(d.visible(&expanded), vec![0, 1, 5]);
+        assert_eq!(d.visible(&expanded).unwrap(), vec![0, 1, 5]);
         expanded[0] = false;
-        assert_eq!(d.visible(&expanded), vec![0]);
+        assert_eq!(d.visible(&expanded).unwrap(), vec![0]);
     }
     #[test]
     fn invalid_json_and_precision() {
