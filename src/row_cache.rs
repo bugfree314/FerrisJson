@@ -1,3 +1,4 @@
+use crate::engine::budget::{BudgetManager, Reservation, Resource};
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
@@ -9,6 +10,7 @@ pub struct RowCache {
     order: VecDeque<usize>,
     bytes: usize,
     budget: usize,
+    reservation: Option<Reservation>,
 }
 impl Default for RowCache {
     fn default() -> Self {
@@ -22,16 +24,28 @@ impl RowCache {
             order: VecDeque::new(),
             bytes: 0,
             budget,
+            reservation: BudgetManager::default()
+                .reserve(
+                    Resource::Memory,
+                    budget.saturating_add(512 * 256),
+                    "row cache pool and metadata allowance",
+                )
+                .ok(),
         }
     }
     pub fn clear(&mut self) {
-        *self = Self::new(self.budget);
+        self.entries = HashMap::new();
+        self.order = VecDeque::new();
+        self.bytes = 0;
     }
     pub fn labels(
         &mut self,
         id: usize,
         build: impl FnOnce() -> (String, String),
     ) -> Cow<'_, (String, String)> {
+        if self.reservation.is_none() {
+            return Cow::Owned((String::new(), "Memory budget exceeded for row cache".into()));
+        }
         if self.entries.contains_key(&id) {
             self.order.retain(|&key| key != id);
             self.order.push_back(id);

@@ -1,5 +1,7 @@
 //! One active operation and one replaceable pending request per worker.
 use crate::document::{Document, NodeIds, SearchScope};
+use crate::engine::budget::{Reservation, Resource};
+use crate::engine::session::{SessionId, TaskId};
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -26,6 +28,8 @@ pub enum Output {
 }
 pub struct Completion {
     generation: u64,
+    pub task: TaskId,
+    _reservation: Option<Reservation>,
     pub elapsed: Duration,
     pub result: Result<Output, String>,
 }
@@ -33,6 +37,7 @@ struct Request {
     generation: u64,
     doc: Arc<Document>,
     operation: Operation,
+    reservation: Option<Reservation>,
 }
 #[derive(Default)]
 struct Inbox {
@@ -44,6 +49,7 @@ pub struct Worker {
     generation: Arc<AtomicU64>,
     results: Receiver<Completion>,
     pub busy: bool,
+    session: Option<SessionId>,
 }
 impl Worker {
     pub fn new(ctx: eframe::egui::Context) -> Self {
@@ -102,12 +108,18 @@ impl Worker {
                 };
                 // A result-channel send can block. Never retain a document while
                 // waiting to deliver IDs/preview, especially during low-memory loading.
+                let task = TaskId {
+                    session: request.doc.session_id(),
+                    generation: request.generation,
+                };
                 drop(request.doc);
                 if cancelled() {
                     continue;
                 }
                 let completion = Completion {
                     generation: request.generation,
+                    task,
+                    _reservation: request.reservation,
                     elapsed: started.elapsed(),
                     result,
                 };
@@ -124,6 +136,7 @@ impl Worker {
             generation,
             results,
             busy: false,
+            session: None,
         }
     }
     pub fn cancel(&mut self) {
@@ -131,21 +144,36 @@ impl Worker {
         self.inbox.0.lock().unwrap().pending = None;
         while self.results.try_recv().is_ok() {}
         self.busy = false;
+        self.session = None;
     }
-    pub fn submit(&mut self, doc: Arc<Document>, operation: Operation) {
+    pub fn submit(&mut self, doc: Arc<Document>, operation: Operation) -> Result<(), String> {
         self.cancel();
+        let input_bytes = match &operation {
+            Operation::Search { term, .. } => term.capacity(),
+            Operation::Query(expression) => expression.capacity(),
+        };
+        let reservation = doc.budget().reserve(
+            Resource::Memory,
+            input_bytes.saturating_add(512 * 1024),
+            "worker request and preview allowance",
+        )?;
+        self.session = Some(doc.session_id());
         let generation = self.generation.load(Ordering::Relaxed);
         self.inbox.0.lock().unwrap().pending = Some(Request {
             generation,
             doc,
             operation,
+            reservation: Some(reservation),
         });
         self.busy = true;
         self.inbox.1.notify_one();
+        Ok(())
     }
     pub fn poll(&mut self) -> Option<Completion> {
         while let Ok(result) = self.results.try_recv() {
-            if result.generation == self.generation.load(Ordering::Relaxed) {
+            if result.generation == self.generation.load(Ordering::Relaxed)
+                && Some(result.task.session) == self.session
+            {
                 self.busy = false;
                 return Some(result);
             }
@@ -175,6 +203,7 @@ mod tests {
                 generation: 0,
                 doc,
                 operation: Operation::Query("$[*]".into()),
+                reservation: None,
             });
             worker.inbox.1.notify_one();
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -206,20 +235,26 @@ mod tests {
         let mut worker = Worker::new(eframe::egui::Context::default());
         let old =
             Arc::new(Document::parse(&serde_json::json!(vec!["old"; 20_000]).to_string()).unwrap());
-        worker.submit(
-            old,
-            Operation::Search {
-                term: "old".into(),
-                case: false,
-                regex: false,
-                scope: SearchScope::All,
-            },
-        );
+        worker
+            .submit(
+                old,
+                Operation::Search {
+                    term: "old".into(),
+                    case: false,
+                    regex: false,
+                    scope: SearchScope::All,
+                },
+            )
+            .unwrap();
         let new = Arc::new(Document::parse(r#"{"answer":42}"#).unwrap());
         for _ in 0..20 {
-            worker.submit(Arc::clone(&new), Operation::Query("$.missing".into()));
+            worker
+                .submit(Arc::clone(&new), Operation::Query("$.missing".into()))
+                .unwrap();
         }
-        worker.submit(new, Operation::Query("$.answer".into()));
+        worker
+            .submit(new, Operation::Query("$.answer".into()))
+            .unwrap();
         match wait(&mut worker).result.unwrap() {
             Output::Query {
                 ids,
@@ -238,7 +273,9 @@ mod tests {
     fn cancellation_resets_busy_and_worker_accepts_new_requests() {
         let mut worker = Worker::new(eframe::egui::Context::default());
         let doc = Arc::new(Document::parse(r#"{"x":1}"#).unwrap());
-        worker.submit(Arc::clone(&doc), Operation::Query("$.x".into()));
+        worker
+            .submit(Arc::clone(&doc), Operation::Query("$.x".into()))
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while worker.results.try_recv().is_err() {
             assert!(Instant::now() < deadline);
@@ -247,7 +284,7 @@ mod tests {
         worker.cancel();
         assert!(!worker.busy);
         assert!(worker.poll().is_none());
-        worker.submit(doc, Operation::Query("$[?".into()));
+        worker.submit(doc, Operation::Query("$[?".into())).unwrap();
         assert!(
             matches!(wait(&mut worker).result, Err(error) if error.contains("Invalid JSONPath"))
         );
@@ -255,24 +292,55 @@ mod tests {
     #[test]
     fn obsolete_queued_results_cannot_replace_the_current_result() {
         let (tx, results) = mpsc::sync_channel(1);
+        let session = Document::parse("null").unwrap().session_id();
         let mut worker = Worker {
             inbox: Arc::new((Mutex::new(Inbox::default()), Condvar::new())),
             generation: Arc::new(AtomicU64::new(2)),
             results,
             busy: true,
+            session: Some(session),
         };
         tx.send(Completion {
             generation: 1,
+            task: TaskId {
+                session,
+                generation: 1,
+            },
+            _reservation: None,
             elapsed: Duration::ZERO,
-            result: Ok(Output::Search(vec![99])),
+            result: Ok(Output::Search(
+                NodeIds::from_slice(&Default::default(), &[99]).unwrap(),
+            )),
         })
         .unwrap();
         assert!(worker.poll().is_none());
         assert!(worker.busy);
         tx.send(Completion {
             generation: 2,
+            task: TaskId {
+                session: Document::parse("null").unwrap().session_id(),
+                generation: 2,
+            },
+            _reservation: None,
             elapsed: Duration::ZERO,
-            result: Ok(Output::Search(vec![1])),
+            result: Ok(Output::Search(NodeIds::default())),
+        })
+        .unwrap();
+        assert!(
+            worker.poll().is_none(),
+            "same task generation from a different session must be rejected"
+        );
+        tx.send(Completion {
+            generation: 2,
+            task: TaskId {
+                session,
+                generation: 2,
+            },
+            _reservation: None,
+            elapsed: Duration::ZERO,
+            result: Ok(Output::Search(
+                NodeIds::from_slice(&Default::default(), &[1]).unwrap(),
+            )),
         })
         .unwrap();
         assert!(matches!(worker.poll().unwrap().result, Ok(Output::Search(ids)) if ids == vec![1]));

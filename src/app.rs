@@ -1,3 +1,4 @@
+use crate::engine::budget::{Reservation, Resource};
 use crate::{
     document::{Document, LoadProgress, NodeIds, SearchScope},
     export::{self, COPY_LIMIT, CopyError, Selection},
@@ -55,6 +56,8 @@ pub struct Viewer {
     open_duration: Option<Duration>,
     query_duration: Option<(&'static str, Duration)>,
     expanded: Vec<bool>,
+    expanded_resource: Option<Reservation>,
+    preview_resource: Option<Reservation>,
     selected: usize,
     rows: NodeIds,
     matches: NodeIds,
@@ -152,9 +155,11 @@ impl Viewer {
             open_duration: None,
             query_duration: None,
             expanded: Vec::new(),
+            expanded_resource: None,
+            preview_resource: None,
             selected: 0,
-            rows: Vec::new(),
-            matches: Vec::new(),
+            rows: NodeIds::default(),
+            matches: NodeIds::default(),
             match_index: 0,
             term: String::new(),
             case: false,
@@ -294,9 +299,11 @@ impl Viewer {
         self.export_cancelled.store(true, Ordering::Relaxed);
         let old = self.doc.take();
         self.waiting_for_old.store(old.is_some(), Ordering::Relaxed);
-        self.rows = Vec::new();
+        self.rows = NodeIds::default();
         self.expanded = Vec::new();
-        self.matches = Vec::new();
+        self.expanded_resource = None;
+        self.preview_resource = None;
+        self.matches = NodeIds::default();
         self.path_results = None;
         self.row_labels.clear();
         self.detail = String::new();
@@ -334,7 +341,32 @@ impl Viewer {
                     Ok((doc, source, file)) => {
                         self.paste_recovery = None;
                         self.large_copy = None;
-                        self.expanded = doc.nodes.iter().map(|n| n.depth < 2).collect();
+                        let expanded_lease = doc.budget().reserve(
+                            Resource::Memory,
+                            doc.node_count(),
+                            "GUI expansion flags",
+                        );
+                        let preview_lease = doc.budget().reserve(
+                            Resource::Memory,
+                            512 * 1024,
+                            "GUI preview strings",
+                        );
+                        let (expanded_lease, preview_lease) = match (expanded_lease, preview_lease)
+                        {
+                            (Ok(expanded), Ok(preview)) => (expanded, preview),
+                            (Err(error), _) | (_, Err(error)) => {
+                                self.error = Some(error);
+                                self.open_duration =
+                                    self.load_started.take().map(|start| start.elapsed());
+                                return;
+                            }
+                        };
+                        self.expanded = (0..doc.node_count())
+                            .map(|id| doc.node_info(id).depth < 2)
+                            .collect();
+                        self.expanded_resource = Some(expanded_lease);
+                        self.preview_resource = Some(preview_lease);
+                        self.rows = NodeIds::new(doc.budget());
                         self.cancel_operations();
                         self.row_labels.clear();
                         self.detail.clear();
@@ -343,7 +375,7 @@ impl Viewer {
                         self.file = file;
                         self.selected = 0;
                         self.term.clear();
-                        self.matches = Vec::new();
+                        self.matches = NodeIds::default();
                         self.search_error = None;
                         self.query_duration = None;
                         self.path_results = None;
@@ -402,8 +434,10 @@ impl Viewer {
         }
     }
     fn rebuild_rows(&mut self) {
-        if let Some(doc) = &self.doc {
-            doc.visible_into(&self.expanded, &mut self.rows);
+        if let Some(doc) = &self.doc
+            && let Err(error) = doc.visible_into(&self.expanded, &mut self.rows)
+        {
+            self.error = Some(error);
         }
     }
     fn select(&mut self, id: usize) {
@@ -463,7 +497,7 @@ impl Viewer {
             Action::Left | Action::Right => {
                 for _ in 0..count {
                     let doc = self.doc.as_ref().unwrap();
-                    let node = &doc.nodes[self.selected];
+                    let node = doc.node_info(self.selected);
                     if command.action == Action::Left {
                         if node.container() && self.expanded[self.selected] {
                             self.toggle(self.selected);
@@ -474,8 +508,17 @@ impl Viewer {
                         }
                     } else if node.container() && !self.expanded[self.selected] {
                         self.toggle(self.selected);
-                    } else if node.end() > self.selected + 1 {
-                        self.reveal(self.selected + 1);
+                    } else if node.container() {
+                        match doc.children_page(node.reference, 0, 1) {
+                            Ok(page) if !page.children.is_empty() => {
+                                self.reveal(page.children[0].reference.address as usize)
+                            }
+                            Ok(_) => break,
+                            Err(error) => {
+                                self.error = Some(error);
+                                break;
+                            }
+                        }
                     } else {
                         break;
                     }
@@ -498,7 +541,13 @@ impl Viewer {
                 }
             }
             Action::Toggle | Action::Open | Action::Close => {
-                if self.doc.as_ref().unwrap().nodes[self.selected].container() {
+                if self
+                    .doc
+                    .as_ref()
+                    .unwrap()
+                    .node_info(self.selected)
+                    .container()
+                {
                     let want_open = command.action == Action::Open;
                     if command.action == Action::Toggle || self.expanded[self.selected] != want_open
                     {
@@ -556,10 +605,10 @@ impl Viewer {
     }
     fn reveal(&mut self, id: usize) {
         if let Some(doc) = &self.doc {
-            let mut parent = doc.nodes[id].parent();
+            let mut parent = doc.node_info(id).parent();
             while let Some(p) = parent {
                 self.expanded[p] = true;
-                parent = doc.nodes[p].parent();
+                parent = doc.node_info(p).parent();
             }
         }
         self.select(id);
@@ -579,7 +628,7 @@ impl Viewer {
         if let Some(worker) = &mut self.search_worker {
             worker.cancel();
         }
-        self.matches = Vec::new();
+        self.matches = NodeIds::default();
         self.search_error = None;
         self.query_duration = None;
         if self.term.is_empty() || !self.colors.live_search {
@@ -591,7 +640,7 @@ impl Viewer {
     }
     fn search(&mut self) {
         self.search_due = None;
-        self.matches = Vec::new();
+        self.matches = NodeIds::default();
         self.search_error = None;
         self.match_index = 0;
         self.query_duration = None;
@@ -605,7 +654,7 @@ impl Viewer {
             return;
         }
         if let Some(worker) = &mut self.search_worker {
-            worker.submit(
+            let result = worker.submit(
                 Arc::clone(doc),
                 Operation::Search {
                     term: self.term.clone(),
@@ -614,6 +663,9 @@ impl Viewer {
                     scope: self.scope,
                 },
             );
+            if let Err(error) = result {
+                self.search_error = Some(error);
+            }
         } else {
             // Headless callers can use the same completion path without an egui context.
             let started = Instant::now();
@@ -657,7 +709,10 @@ impl Viewer {
         };
         self.pending_expression = self.query.clone();
         if let Some(worker) = &mut self.path_worker {
-            worker.submit(Arc::clone(doc), Operation::Query(self.query.clone()));
+            if let Err(error) = worker.submit(Arc::clone(doc), Operation::Query(self.query.clone()))
+            {
+                self.finish_path(Err(error), Duration::ZERO);
+            }
         } else {
             let started = Instant::now();
             let result = doc.query_path(&self.query).map(|ids| {
@@ -686,7 +741,7 @@ impl Viewer {
             Err(error) => {
                 self.path_results = Some(PathResults {
                     expression: self.pending_expression.clone(),
-                    ids: Arc::new(Vec::new()),
+                    ids: Arc::new(NodeIds::default()),
                     preview: String::new(),
                     error: Some(error),
                 });
@@ -792,8 +847,10 @@ impl Viewer {
         self.notice = "Exporting JSON...".into();
         self.export_thread = Some(std::thread::spawn(move || {
             let result =
-                export::atomic_write(&path, &cancelled, |writer| selection.write(&doc, writer))
-                    .map(|()| path);
+                export::atomic_write_with_budget(&path, &cancelled, doc.budget(), |writer| {
+                    selection.write(&doc, writer)
+                })
+                .map(|()| path);
             drop(selection);
             drop(doc);
             let _ = tx.send(result);
@@ -833,7 +890,7 @@ impl Viewer {
         if let Some(doc) = &self.doc
             && !self.expanded[id]
             && self.selected > id
-            && self.selected < doc.nodes[id].end()
+            && self.selected < doc.node_info(id).end()
         {
             self.select(id);
         }
@@ -960,7 +1017,7 @@ impl Viewer {
     fn selection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal_wrapped(|ui| {
             ui.heading("Value preview");
-            let node = &self.doc.as_ref().unwrap().nodes[self.selected];
+            let node = self.doc.as_ref().unwrap().node_info(self.selected);
             ui.colored_label(kind_color(node.kind(), self.colors.active()), node.kind());
             if ui
                 .checkbox(&mut self.colors.wrap_values, "Wrap")
@@ -1288,7 +1345,7 @@ impl Viewer {
                         ui.label(RichText::new(self.vim.display()).monospace().color(Color32::from_rgb(100, 180, 235)));
                         if let Some(doc) = &self.doc {
                             ui.label(doc.backend_name());
-                            ui.label(format!("{} nodes", doc.nodes.len())).on_hover_text(format!("{:.1} KB", doc.bytes as f64 / 1024.0));
+                            ui.label(format!("{} nodes", doc.node_count())).on_hover_text(format!("{:.1} KB", doc.bytes as f64 / 1024.0));
                         }
                         if let Some((position, path)) = self.cursor_location() {
                             ui.label(RichText::new(position).monospace()).on_hover_text("Current visible tree row / total visible rows");
@@ -1421,7 +1478,7 @@ impl Viewer {
                 for row in range {
                     let id = self.rows[row] as usize;
                     let doc = self.doc.as_ref().unwrap();
-                    let node = &doc.nodes[id];
+                    let node = &doc.node_info(id);
                     let labels = self
                         .row_labels
                         .labels(id, || (doc.key(id).into_owned(), doc.row_preview(id)));
@@ -1730,7 +1787,7 @@ mod tests {
     fn loaded() -> Viewer {
         let mut app = Viewer::empty();
         let doc = Document::parse(DEMO).unwrap();
-        app.expanded = vec![false; doc.nodes.len()];
+        app.expanded = vec![false; doc.node_count()];
         app.doc = Some(Arc::new(doc));
         app.select(0);
         app.rebuild_rows();
@@ -1903,7 +1960,7 @@ mod tests {
         app.query = "$.users[1].name".into();
         app.go_to_path();
         assert_eq!(app.query_duration.unwrap().0, "Path");
-        assert_eq!(app.doc.as_ref().unwrap().at(app.selected), "张三");
+        assert_eq!(app.doc.as_ref().unwrap().preview(app.selected), "\"张三\"");
         app.query = "$.missing".into();
         app.go_to_path();
         assert!(app.path_results.as_ref().unwrap().ids.is_empty());

@@ -10,8 +10,13 @@ use std::{
 #[path = "indexed.rs"]
 mod indexed;
 pub use indexed::LoadProgress;
+pub use indexed::Subtree;
 
-pub type NodeIds = Vec<u32>;
+pub use crate::engine::ids::NodeIds;
+use crate::engine::{
+    budget::{BudgetManager, Reservation, Resource},
+    session::{ChildPage, NodeInfo, NodeRef, SessionId, SessionStatus},
+};
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -71,11 +76,14 @@ impl Node {
 }
 pub struct Document {
     storage: Storage,
-    pub nodes: Vec<Node>,
+    session: SessionId,
+    budget: BudgetManager,
+    nodes: Vec<Node>,
     pub bytes: usize,
     children: Vec<u32>,
     keys: Vec<Arc<str>>,
     key_ids: HashMap<Arc<str>, u32>,
+    _resources: Vec<Reservation>,
 }
 enum Storage {
     Memory(Value),
@@ -86,6 +94,7 @@ struct IndexBuilder {
     children: Vec<u32>,
     keys: Vec<Arc<str>>,
     key_ids: HashMap<Arc<str>, u32>,
+    resources: Vec<Reservation>,
 }
 impl IndexBuilder {
     fn index(
@@ -119,6 +128,14 @@ impl IndexBuilder {
                         index
                     } else {
                         let index = compact(self.keys.len())?;
+                        let extra = key.len() + 2 * std::mem::size_of::<Arc<str>>() + 192;
+                        let lease = &mut self.resources[2];
+                        lease.resize(
+                            lease
+                                .bytes()
+                                .checked_add(extra)
+                                .ok_or("Key size overflow")?,
+                        )?;
                         let key: Arc<str> = Arc::from(key.as_str());
                         self.key_ids.insert(Arc::clone(&key), index);
                         self.keys.push(key);
@@ -162,7 +179,6 @@ fn node_count(value: &Value) -> Result<usize, String> {
     }
 }
 impl Document {
-    #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self, String> {
         Self::parse_owned(text.to_owned())
     }
@@ -172,26 +188,80 @@ impl Document {
     }
     /// Return the original allocation on syntax errors so the paste editor can repair it.
     pub fn parse_owned_recover(text: String) -> Result<Self, (String, Option<String>)> {
+        Self::parse_owned_recover_with_budget(text, BudgetManager::default())
+    }
+    pub fn parse_owned_recover_with_budget(
+        text: String,
+        budget: BudgetManager,
+    ) -> Result<Self, (String, Option<String>)> {
+        let input = match budget.reserve(Resource::Memory, text.capacity(), "input text") {
+            Ok(lease) => lease,
+            Err(error) => return Err((error, Some(text))),
+        };
         let bytes = text.len();
         let value = match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
             Ok(value) => value,
             Err(error) => return Err((format!("Invalid JSON: {error}"), Some(text))),
         };
         drop(text);
-        Self::from_value(value, bytes).map_err(|error| (error, None))
+        drop(input);
+        Self::from_value_with_budget(value, bytes, budget).map_err(|error| (error, None))
     }
     pub fn from_value(value: Value, bytes: usize) -> Result<Self, String> {
+        Self::from_value_with_budget(value, bytes, BudgetManager::default())
+    }
+    pub fn from_value_with_budget(
+        value: Value,
+        bytes: usize,
+        budget: BudgetManager,
+    ) -> Result<Self, String> {
         // Counting avoids geometric capacity growth for the two large index arrays.
         let count = node_count(&value)?;
+        let node_bytes = count
+            .checked_mul(std::mem::size_of::<Node>())
+            .ok_or("Index size overflow")?;
+        let child_bytes = count
+            .saturating_sub(1)
+            .checked_mul(4)
+            .ok_or("Index size overflow")?;
+        let mut resources = vec![
+            budget.reserve(
+                Resource::Memory,
+                node_bytes + child_bytes,
+                "memory structure",
+            )?,
+            // serde builds Value internally; this is a conservative retained estimate,
+            // not enforcement of the parser's transient allocations.
+            budget.reserve(
+                Resource::Memory,
+                indexed::value_cost(&value),
+                "retained Value estimate",
+            )?,
+        ];
+        resources.push(budget.reserve(Resource::Memory, 0, "shared key estimate")?);
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve_exact(count)
+            .map_err(|e| format!("Cannot allocate nodes: {e}"))?;
+        let mut children = Vec::new();
+        children
+            .try_reserve_exact(count.saturating_sub(1))
+            .map_err(|e| format!("Cannot allocate children: {e}"))?;
+        resources[0]
+            .resize(nodes.capacity() * std::mem::size_of::<Node>() + children.capacity() * 4)?;
         let mut index = IndexBuilder {
-            nodes: Vec::with_capacity(count),
-            children: Vec::with_capacity(count.saturating_sub(1)),
+            nodes,
+            children,
             keys: Vec::new(),
             key_ids: HashMap::new(),
+            resources,
         };
         index.index(&value, 0, u32::MAX, 0)?;
         Ok(Self {
             storage: Storage::Memory(value),
+            session: SessionId::fresh(),
+            budget,
+            _resources: index.resources,
             nodes: index.nodes,
             bytes,
             children: index.children,
@@ -213,7 +283,114 @@ impl Document {
         cancelled: impl Fn() -> bool,
         progress: &LoadProgress,
     ) -> Result<Self, String> {
-        indexed::open(path, cancelled, progress)
+        Self::open_indexed_with_budget(path, cancelled, progress, BudgetManager::default())
+    }
+    pub fn open_indexed_with_budget(
+        path: &std::path::Path,
+        cancelled: impl Fn() -> bool,
+        progress: &LoadProgress,
+        budget: BudgetManager,
+    ) -> Result<Self, String> {
+        indexed::open_with_budget(path, cancelled, progress, budget)
+    }
+    pub fn budget(&self) -> &BudgetManager {
+        &self.budget
+    }
+    pub fn session_id(&self) -> SessionId {
+        self.session
+    }
+    pub fn status(&self) -> SessionStatus {
+        SessionStatus::Ready
+    }
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+    pub fn node_capacity_bytes(&self) -> usize {
+        self.nodes.capacity() * std::mem::size_of::<Node>()
+    }
+    pub fn node_ref(&self, id: usize) -> Result<NodeRef, String> {
+        if id >= self.nodes.len() {
+            return Err("Invalid node ID".into());
+        }
+        Ok(NodeRef {
+            session: self.session,
+            address: id as u64,
+        })
+    }
+    pub fn resolve(&self, reference: NodeRef) -> Result<usize, String> {
+        if reference.session != self.session {
+            return Err("Node belongs to a different document session".into());
+        }
+        let id = usize::try_from(reference.address).map_err(|_| "Invalid node address")?;
+        if id >= self.nodes.len() {
+            return Err("Invalid node address".into());
+        }
+        Ok(id)
+    }
+    /// Complete-index adapter metadata. No borrowed storage nodes escape the engine.
+    pub fn node_info(&self, id: usize) -> NodeInfo {
+        let node = &self.nodes[id];
+        NodeInfo {
+            reference: NodeRef {
+                session: self.session,
+                address: id as u64,
+            },
+            parent: node.parent().map(|parent| NodeRef {
+                session: self.session,
+                address: parent as u64,
+            }),
+            depth: node.depth,
+            kind: node.kind(),
+            child_count: Some(node.child_count as u64),
+            subtree_end: node.end(),
+        }
+    }
+    pub fn metadata(&self, reference: NodeRef) -> Result<NodeInfo, String> {
+        Ok(self.node_info(self.resolve(reference)?))
+    }
+    pub fn locate(&self, path: &str) -> Result<NodeRef, String> {
+        self.node_ref(self.find_path(path)?)
+    }
+    pub fn preview_ref(&self, reference: NodeRef) -> Result<String, String> {
+        Ok(self.preview(self.resolve(reference)?))
+    }
+    pub fn path_ref(&self, reference: NodeRef) -> Result<String, String> {
+        Ok(self.path(self.resolve(reference)?))
+    }
+    /// Pages preserve source/display order, not the internal sorted lookup table.
+    pub fn children_page(
+        &self,
+        reference: NodeRef,
+        offset: u64,
+        limit: usize,
+    ) -> Result<ChildPage, String> {
+        let id = self.resolve(reference)?;
+        if limit == 0 || limit > 4096 {
+            return Err("Child page limit must be between 1 and 4096".into());
+        }
+        let count = self.nodes[id].child_count as u64;
+        if offset > count {
+            return Err("Child page offset exceeds child count".into());
+        }
+        let take = limit.min((count - offset) as usize);
+        let reservation = self.budget.reserve(
+            Resource::Memory,
+            take * std::mem::size_of::<NodeInfo>(),
+            "child page",
+        )?;
+        let children = self
+            .direct_children(id)
+            .skip(offset as usize)
+            .take(take)
+            .map(|child| self.node_info(child))
+            .collect();
+        let next = offset + take as u64;
+        Ok(ChildPage {
+            children,
+            next: (next < count).then_some(next),
+            total: Some(count),
+            _reservation: reservation,
+        })
     }
     pub fn backend_name(&self) -> &'static str {
         match self.storage {
@@ -235,7 +412,7 @@ impl Document {
         dead_code,
         reason = "Explicit bounded subtree parsing interface for indexed backend"
     )]
-    pub fn read_subtree(&self, id: usize) -> Result<Arc<Value>, String> {
+    pub fn read_subtree(&self, id: usize) -> Result<Arc<indexed::Subtree>, String> {
         match &self.storage {
             Storage::Indexed(store) => store.subtree(self, id),
             _ => Err("Bounded subtree cache is an indexed-backend interface".into()),
@@ -366,11 +543,11 @@ impl Document {
         }
         let expression = expression.trim();
         if expression.starts_with('/') {
-            return Ok(self
-                .pointer_id(expression)
-                .map(|id| id as u32)
-                .into_iter()
-                .collect());
+            let mut ids = NodeIds::new(&self.budget);
+            if let Some(id) = self.pointer_id(expression) {
+                ids.push(id as u32)?;
+            }
+            return Ok(ids);
         }
         let normalized = if expression == "." {
             "$".into()
@@ -387,25 +564,25 @@ impl Document {
         if cancelled() {
             return Err("Query cancelled".into());
         }
-        results
-            .iter()
-            .enumerate()
-            .map(|(index, node)| {
-                if index % 1024 == 0 && cancelled() {
-                    return Err("Query cancelled".into());
+        let mut ids = NodeIds::new(&self.budget);
+        ids.reserve_exact(results.len())?;
+        for (index, node) in results.iter().enumerate() {
+            if index % 1024 == 0 && cancelled() {
+                return Err("Query cancelled".into());
+            }
+            let mut id = 0;
+            for element in node.location().iter() {
+                id = match element {
+                    PathElement::Name(name) => self.child_name(id, name),
+                    PathElement::Index(index) => self.child_index(id, *index),
                 }
-                let mut id = 0;
-                for element in node.location().iter() {
-                    id = match element {
-                        PathElement::Name(name) => self.child_name(id, name),
-                        PathElement::Index(index) => self.child_index(id, *index),
-                    }
-                    .ok_or_else(|| "Query result not found in tree".to_string())?;
-                }
-                Ok(id as u32)
-            })
-            .collect()
+                .ok_or_else(|| "Query result not found in tree".to_string())?;
+            }
+            ids.push(id as u32)?;
+        }
+        Ok(ids)
     }
+
     pub fn row_preview(&self, id: usize) -> String {
         if let Storage::Indexed(store) = &self.storage {
             return store
@@ -424,9 +601,11 @@ impl Document {
         if let Storage::Indexed(store) = &self.storage
             && let Ok(value) = store.subtree(self, id)
         {
-            return bounded_preview(|writer| serde_json::to_writer_pretty(writer, value.as_ref()));
+            return bounded_preview(&self.budget, |writer| {
+                serde_json::to_writer_pretty(writer, value.as_ref())
+            });
         }
-        bounded_preview(|writer| self.write_node(writer, id))
+        bounded_preview(&self.budget, |writer| self.write_node(writer, id))
     }
     #[cfg(test)]
     pub fn results_json(&self, ids: &[u32]) -> String {
@@ -435,7 +614,7 @@ impl Document {
         String::from_utf8(bytes).unwrap()
     }
     pub fn results_preview(&self, ids: &[u32]) -> String {
-        bounded_preview(|writer| self.write_results(writer, ids))
+        bounded_preview(&self.budget, |writer| self.write_results(writer, ids))
     }
     pub fn write_node(&self, mut writer: impl Write, id: usize) -> serde_json::Result<()> {
         match &self.storage {
@@ -473,7 +652,7 @@ impl Document {
         cancelled: impl Fn() -> bool,
     ) -> Result<NodeIds, String> {
         if term.is_empty() {
-            return Ok(Vec::new());
+            return Ok(NodeIds::new(&self.budget));
         }
         if let Storage::Indexed(store) = &self.storage {
             return store.search(self, term, case, regex, scope, cancelled);
@@ -489,6 +668,9 @@ impl Document {
             .map_err(|e| format!("Invalid regular expression: {e}"))?;
         // Repeated object keys are tested once. Array keys contain only ASCII
         // digits, so a literal containing other characters cannot match them.
+        let _key_workspace =
+            self.budget
+                .reserve(Resource::Memory, self.keys.len(), "search key matches")?;
         let mut key_matches = Vec::new();
         if scope != SearchScope::Values {
             key_matches.reserve(self.keys.len());
@@ -501,8 +683,9 @@ impl Document {
         }
         let match_array_keys = regex || term.bytes().all(|byte| byte.is_ascii_digit());
         let root_match = scope != SearchScope::Values && matcher.is_match("$");
-        let mut matches = Vec::new();
+        let mut matches = NodeIds::new(&self.budget);
         let mut id = 0;
+        let mut allocation_error = None;
         let completed = walk(self.value().unwrap(), &mut |value| {
             if id % 1024 == 0 && cancelled() {
                 return false;
@@ -531,14 +714,23 @@ impl Document {
                         .capacity()
                         .max(1024)
                         .min(self.nodes.len() - matches.len());
-                    matches.reserve_exact(extra);
+                    if let Err(error) = matches.reserve_exact(extra) {
+                        allocation_error = Some(error);
+                        return false;
+                    }
                 }
                 // The document index has already validated every ID fits u32.
-                matches.push(id as u32);
+                if let Err(error) = matches.push(id as u32) {
+                    allocation_error = Some(error);
+                    return false;
+                }
             }
             id += 1;
             true
         });
+        if let Some(error) = allocation_error {
+            return Err(error);
+        }
         if completed {
             Ok(matches)
         } else {
@@ -549,12 +741,15 @@ impl Document {
         dead_code,
         reason = "Convenience entry for tests and standalone benchmarks"
     )]
-    pub fn visible(&self, expanded: &[bool]) -> NodeIds {
-        let mut rows = Vec::new();
-        self.visible_into(expanded, &mut rows);
-        rows
+    pub fn visible(&self, expanded: &[bool]) -> Result<NodeIds, String> {
+        let mut rows = NodeIds::new(&self.budget);
+        self.visible_into(expanded, &mut rows)?;
+        Ok(rows)
     }
-    pub fn visible_into(&self, expanded: &[bool], rows: &mut NodeIds) {
+    pub fn visible_into(&self, expanded: &[bool], rows: &mut NodeIds) -> Result<(), String> {
+        if expanded.len() != self.nodes.len() {
+            return Err("Expansion state does not match document".into());
+        }
         let next = |id: usize| {
             if self.nodes[id].container() && !expanded[id] {
                 self.nodes[id].end()
@@ -569,20 +764,21 @@ impl Document {
             id = next(id);
         }
         if rows.capacity() > count.saturating_mul(2).max(4096) {
-            *rows = Vec::new();
+            rows.release();
         }
-        rows.clear();
         if count > rows.capacity() {
             let capacity = count
                 .saturating_add((count / 8).min(65_536))
                 .min(self.nodes.len());
-            rows.reserve_exact(capacity);
+            rows.reserve_exact(capacity.saturating_sub(rows.len()))?;
         }
+        rows.clear();
         let mut id = 0;
         while id < self.nodes.len() {
-            rows.push(id as u32);
+            rows.push(id as u32)?;
             id = next(id);
         }
+        Ok(())
     }
     fn direct_children(&self, id: usize) -> impl Iterator<Item = usize> + '_ {
         let mut next = id + 1;
@@ -643,7 +839,18 @@ fn short(text: &str, length: usize) -> String {
     result
 }
 // Bound serialization by output bytes, rather than by the size of the whole document.
-fn bounded_preview(serialize: impl FnOnce(&mut dyn Write) -> serde_json::Result<()>) -> String {
+fn bounded_preview(
+    budget: &BudgetManager,
+    serialize: impl FnOnce(&mut dyn Write) -> serde_json::Result<()>,
+) -> String {
+    let _workspace = match budget.reserve(
+        Resource::Memory,
+        1024 * 1024,
+        "preview formatting workspace",
+    ) {
+        Ok(lease) => lease,
+        Err(error) => return format!("Cannot format preview: {error}"),
+    };
     struct PreviewWriter {
         bytes: Vec<u8>,
         truncated: bool,
@@ -690,15 +897,15 @@ mod tests {
     fn visible_ids_reuse_capacity_and_release_large_collapsed_arrays() {
         let doc = Document::parse(&serde_json::json!(vec![0; 10_000]).to_string()).unwrap();
         let mut expanded = vec![true; doc.nodes.len()];
-        let mut rows = Vec::new();
-        doc.visible_into(&expanded, &mut rows);
+        let mut rows = NodeIds::default();
+        doc.visible_into(&expanded, &mut rows).unwrap();
         assert_eq!(rows.len(), doc.nodes.len());
         assert_eq!(rows.capacity(), doc.nodes.len());
         let allocation = rows.as_ptr();
-        doc.visible_into(&expanded, &mut rows);
+        doc.visible_into(&expanded, &mut rows).unwrap();
         assert_eq!(rows.as_ptr(), allocation);
         expanded[0] = false;
-        doc.visible_into(&expanded, &mut rows);
+        doc.visible_into(&expanded, &mut rows).unwrap();
         assert_eq!(rows, vec![0]);
         assert!(rows.capacity() <= 4096);
     }
@@ -864,9 +1071,9 @@ mod tests {
         let d = Document::parse(r#"{"a":[1,{"b":2}],"c":3}"#).unwrap();
         let mut expanded = vec![true; d.nodes.len()];
         expanded[1] = false;
-        assert_eq!(d.visible(&expanded), vec![0, 1, 5]);
+        assert_eq!(d.visible(&expanded).unwrap(), vec![0, 1, 5]);
         expanded[0] = false;
-        assert_eq!(d.visible(&expanded), vec![0]);
+        assert_eq!(d.visible(&expanded).unwrap(), vec![0]);
     }
     #[test]
     fn invalid_json_and_precision() {

@@ -1,4 +1,9 @@
 //! Validated file-range backend. No memory mapping and no whole-document Value.
+use crate::engine::{
+    budget::{BudgetManager, Reservation, Resource, reserve_vec},
+    session::SessionId,
+};
+
 use super::{Document, Kind, Node, NodeIds, SearchScope, Storage, compact, short};
 use regex::RegexBuilder;
 use serde_json::Value;
@@ -50,6 +55,8 @@ struct Snapshot {
     file: Mutex<Option<File>>,
     path: Option<PathBuf>,
     len: u64,
+    _disk: Reservation,
+    budget: BudgetManager,
 }
 impl Drop for Snapshot {
     fn drop(&mut self) {
@@ -67,6 +74,7 @@ impl Snapshot {
         path: &Path,
         cancelled: &impl Fn() -> bool,
         progress: &LoadProgress,
+        budget: &BudgetManager,
     ) -> Result<Self, String> {
         let mut input_options = OpenOptions::new();
         input_options.read(true);
@@ -83,6 +91,13 @@ impl Snapshot {
         progress.total.store(before.len(), Ordering::Relaxed);
         progress.done.store(0, Ordering::Relaxed);
         progress.phase.store(0, Ordering::Relaxed);
+        let disk = budget.reserve(
+            Resource::Disk,
+            usize::try_from(before.len()).map_err(|_| "Snapshot size overflow")?,
+            "file snapshot",
+        )?;
+        let mut disk = Some(disk);
+        let _buffer = budget.reserve(Resource::Memory, BLOCK, "snapshot copy buffer")?;
         let mut result = None;
         for _ in 0..100 {
             let path = std::env::temp_dir().join(format!(
@@ -112,6 +127,8 @@ impl Snapshot {
                         file: Mutex::new(Some(file)),
                         path: Some(path),
                         len: 0,
+                        _disk: disk.take().unwrap(),
+                        budget: budget.clone(),
                     });
                     #[cfg(unix)]
                     if let Some(snapshot) = &mut result {
@@ -135,6 +152,14 @@ impl Snapshot {
             if count == 0 {
                 break;
             }
+            snapshot._disk.resize(
+                snapshot._disk.bytes().max(
+                    usize::try_from(snapshot.len)
+                        .map_err(|_| "Snapshot size overflow")?
+                        .checked_add(count)
+                        .ok_or("Snapshot size overflow")?,
+                ),
+            )?;
             snapshot
                 .file
                 .get_mut()
@@ -182,6 +207,7 @@ impl Snapshot {
 struct Reader<'a> {
     source: &'a Snapshot,
     buffer: Vec<u8>,
+    _buffer_reservation: Reservation,
     start: u64,
     count: usize,
     pos: u64,
@@ -189,16 +215,20 @@ struct Reader<'a> {
     column: u64,
 }
 impl<'a> Reader<'a> {
-    fn new(source: &'a Snapshot) -> Self {
-        Self {
+    fn new(source: &'a Snapshot) -> Result<Self, String> {
+        let lease = source
+            .budget
+            .reserve(Resource::Memory, BLOCK, "reader buffer")?;
+        Ok(Self {
             source,
+            _buffer_reservation: lease,
             buffer: vec![0; BLOCK],
             start: 0,
             count: 0,
             pos: 0,
             line: 1,
             column: 0,
-        }
+        })
     }
     fn error(&self, message: &str) -> String {
         format!(
@@ -319,6 +349,13 @@ impl<'a> Reader<'a> {
             serde_json::from_slice(&self.buffer[start..start + (range.end - range.start) as usize])
                 .map_err(|e| e.to_string())
         } else {
+            // Bound transient decode/serde work before reading. Retained payload is charged
+            // separately and survives eviction while callers retain an Arc.
+            let _workspace = self.source.budget.reserve(
+                Resource::Memory,
+                SUBTREE_LIMIT * 32,
+                "subtree decode workspace",
+            )?;
             let mut bytes = vec![0; (range.end - range.start) as usize];
             self.source
                 .read(range.start, &mut bytes)
@@ -334,16 +371,37 @@ struct Range {
 }
 #[derive(Default)]
 struct Cache {
-    entries: HashMap<usize, (Arc<Value>, usize)>,
+    entries: HashMap<usize, (Arc<Subtree>, usize)>,
     order: VecDeque<usize>,
     bytes: usize,
 }
+pub struct Subtree {
+    value: Value,
+    _reservation: Reservation,
+}
+impl std::ops::Deref for Subtree {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.value
+    }
+}
+impl std::fmt::Debug for Subtree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
+impl serde::Serialize for Subtree {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
 pub(super) struct Store {
     source: Snapshot,
     ranges: Vec<Range>,
     cache: Mutex<Cache>,
 }
-fn value_cost(value: &Value) -> usize {
+pub(super) fn value_cost(value: &Value) -> usize {
     std::mem::size_of::<Value>()
         + match value {
             Value::String(text) => text.capacity(),
@@ -366,7 +424,7 @@ impl Store {
     pub(super) fn range_bytes(&self) -> usize {
         self.ranges.capacity() * std::mem::size_of::<Range>()
     }
-    pub(super) fn subtree(&self, doc: &Document, id: usize) -> Result<Arc<Value>, String> {
+    pub(super) fn subtree(&self, doc: &Document, id: usize) -> Result<Arc<Subtree>, String> {
         let range = self.ranges.get(id).ok_or("Invalid node ID")?;
         if range.end - range.start > SUBTREE_LIMIT as u64 || doc.nodes[id].end() - id > 16_384 {
             return Err("Subtree exceeds the bounded parse limit (256 KiB / 16,384 nodes); use range preview or export".into());
@@ -380,13 +438,28 @@ impl Store {
                 return Ok(value);
             }
         }
+        // Bound transient decode/serde work before reading. Retained payload is charged
+        // separately and survives eviction while callers retain an Arc.
+        let _workspace = doc.budget.reserve(
+            Resource::Memory,
+            SUBTREE_LIMIT * 32,
+            "subtree decode workspace",
+        )?;
         let mut bytes = vec![0; (range.end - range.start) as usize];
         self.source
             .read(range.start, &mut bytes)
             .map_err(|e| e.to_string())?;
         let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         let cost = value_cost(&value);
-        let value = Arc::new(value);
+        let reservation = doc.budget.reserve(
+            Resource::Memory,
+            cost + 128,
+            "subtree payload and cache metadata estimate",
+        )?;
+        let value = Arc::new(Subtree {
+            value,
+            _reservation: reservation,
+        });
         let mut cache = self.cache.lock().map_err(|_| "Subtree cache poisoned")?;
         if let Some((old, _)) = cache.entries.get(&id) {
             return Ok(Arc::clone(old));
@@ -409,7 +482,7 @@ impl Store {
             Kind::Object => Ok(format!("{{ {} keys }}", node.child_count)),
             Kind::Array => Ok(format!("[ {} items ]", node.child_count)),
             Kind::String => {
-                let mut reader = Reader::new(&self.source);
+                let mut reader = Reader::new(&self.source)?;
                 reader.pos = self.ranges[id].start;
                 reader.expect(b'"')?;
                 let mut text = String::new();
@@ -495,7 +568,7 @@ impl Store {
                 Ok(())
             }
         }
-        let mut reader = Reader::new(&self.source);
+        let mut reader = Reader::new(&self.source).map_err(io::Error::other)?;
         if array {
             output.write_all(b"[")?;
         }
@@ -543,6 +616,9 @@ impl Store {
         .case_insensitive(!case)
         .build()
         .map_err(|e| format!("Invalid regular expression: {e}"))?;
+        let _keys_workspace =
+            doc.budget
+                .reserve(Resource::Memory, doc.keys.len(), "search key matches")?;
         let mut keys = Vec::new();
         if scope != SearchScope::Values {
             keys.reserve(doc.keys.len());
@@ -554,8 +630,8 @@ impl Store {
             }
         }
         let array_keys = regex || term.bytes().all(|byte| byte.is_ascii_digit());
-        let mut reader = Reader::new(&self.source);
-        let mut ids = Vec::new();
+        let mut reader = Reader::new(&self.source)?;
+        let mut ids = NodeIds::new(&doc.budget);
         for (id, node) in doc.nodes.iter().enumerate() {
             if id % 1024 == 0 && cancelled() {
                 return Err("Search cancelled".into());
@@ -620,9 +696,9 @@ impl Store {
             };
             if key_match || value_match {
                 if ids.len() == ids.capacity() {
-                    ids.reserve_exact(ids.capacity().max(1024).min(doc.nodes.len() - ids.len()));
+                    ids.reserve_exact(ids.capacity().max(1024).min(doc.nodes.len() - ids.len()))?;
                 }
-                ids.push(id as u32);
+                ids.push(id as u32)?;
             }
         }
         Ok(ids)
@@ -642,8 +718,16 @@ struct Parser<'a, F> {
     key_bytes: usize,
     allocated: usize,
     duplicates: bool,
+    budget: BudgetManager,
+    resources: Vec<Reservation>,
+    key_reservation: Reservation,
 }
-fn grow<T>(values: &mut Vec<T>, allocated: &mut usize) -> Result<(), String> {
+fn grow<T>(
+    values: &mut Vec<T>,
+    allocated: &mut usize,
+    budget: &BudgetManager,
+    resources: &mut Vec<Reservation>,
+) -> Result<(), String> {
     if values.len() == values.capacity() {
         let extra = (values.capacity() / 2).clamp(1024, 1_048_576);
         let bytes = extra * std::mem::size_of::<T>();
@@ -653,10 +737,20 @@ fn grow<T>(values: &mut Vec<T>, allocated: &mut usize) -> Result<(), String> {
         {
             return Err("Indexed structural capacity exceeds 1.5 GiB budget".into());
         }
+        let mut lease = budget.reserve(Resource::Memory, bytes, "indexed structure growth")?;
+        let _overlap = budget.reserve(
+            Resource::Memory,
+            values.capacity() * std::mem::size_of::<T>(),
+            "index realloc overlap",
+        )?;
+        let previous = values.capacity();
         values
             .try_reserve_exact(extra)
             .map_err(|e| format!("Cannot allocate index: {e}"))?;
-        *allocated += bytes;
+        let actual = (values.capacity() - previous) * std::mem::size_of::<T>();
+        lease.resize(actual)?;
+        resources.push(lease);
+        *allocated += actual;
     }
     Ok(())
 }
@@ -708,6 +802,13 @@ impl<F: Fn() -> bool> Parser<'_, F> {
             );
         }
         let id = compact(self.keys.len())?;
+        let extra = self.key_buffer.len() + 2 * std::mem::size_of::<Arc<str>>() + 192;
+        self.key_reservation.resize(
+            self.key_reservation
+                .bytes()
+                .checked_add(extra)
+                .ok_or("Key size overflow")?,
+        )?;
         let key: Arc<str> = Arc::from(self.key_buffer.as_str());
         self.key_bytes += key.len();
         self.key_ids.insert(Arc::clone(&key), id);
@@ -767,8 +868,18 @@ impl<F: Fn() -> bool> Parser<'_, F> {
         };
         let id = compact(self.nodes.len())?;
         compact(self.nodes.len() + 1)?;
-        grow(&mut self.nodes, &mut self.allocated)?;
-        grow(&mut self.ranges, &mut self.allocated)?;
+        grow(
+            &mut self.nodes,
+            &mut self.allocated,
+            &self.budget,
+            &mut self.resources,
+        )?;
+        grow(
+            &mut self.ranges,
+            &mut self.allocated,
+            &self.budget,
+            &mut self.resources,
+        )?;
         self.nodes.push(Node {
             parent,
             depth,
@@ -801,6 +912,12 @@ impl<F: Fn() -> bool> Parser<'_, F> {
                 self.reader.next()?;
                 self.space()?;
                 let mut direct: Vec<u32> = Vec::new();
+                let mut direct_lease =
+                    self.budget
+                        .reserve(Resource::Memory, 0, "container temporary children")?;
+                let mut positions_lease =
+                    self.budget
+                        .reserve(Resource::Memory, 0, "duplicate-key map estimate")?;
                 let mut positions: Option<HashMap<u32, usize>> = None;
                 if self.reader.peek()? != Some(close) {
                     loop {
@@ -832,6 +949,13 @@ impl<F: Fn() -> bool> Parser<'_, F> {
                             if let Some(positions) = &mut positions {
                                 positions.insert(child_segment, direct.len());
                             }
+                            if direct.len() == direct.capacity() {
+                                let extra = direct.capacity().max(64);
+                                reserve_vec(&mut direct, extra, &mut direct_lease)?;
+                            }
+                            if object {
+                                positions_lease.resize((direct.len() + 1) * 64)?;
+                            }
                             direct.push(child);
                             if object && direct.len() == 64 {
                                 positions = Some(
@@ -854,7 +978,12 @@ impl<F: Fn() -> bool> Parser<'_, F> {
                 self.nodes[id as usize].child_start = compact(self.children.len())?;
                 self.nodes[id as usize].child_count = compact(direct.len())?;
                 for child in direct {
-                    grow(&mut self.children, &mut self.allocated)?;
+                    grow(
+                        &mut self.children,
+                        &mut self.allocated,
+                        &self.budget,
+                        &mut self.resources,
+                    )?;
                     self.children.push(child);
                 }
             }
@@ -866,18 +995,24 @@ impl<F: Fn() -> bool> Parser<'_, F> {
     }
 }
 
-pub(super) fn open(
+pub(super) fn open_with_budget(
     path: &Path,
     cancelled: impl Fn() -> bool,
     progress: &LoadProgress,
+    budget: BudgetManager,
 ) -> Result<Document, String> {
-    let source = Snapshot::copy(path, &cancelled, progress)?;
+    let source = Snapshot::copy(path, &cancelled, progress, &budget)?;
     let bytes =
         usize::try_from(source.len).map_err(|_| "File size exceeds platform address range")?;
     progress.phase.store(1, Ordering::Relaxed);
     progress.done.store(0, Ordering::Relaxed);
+    let _workspace = budget.reserve(
+        Resource::Memory,
+        BLOCK + 2 * 1024 * 1024,
+        "scanner workspace",
+    )?;
     let mut parser = Parser {
-        reader: Reader::new(&source),
+        reader: Reader::new(&source)?,
         cancelled: &cancelled,
         progress,
         nodes: Vec::new(),
@@ -889,6 +1024,9 @@ pub(super) fn open(
         key_bytes: 0,
         allocated: 0,
         duplicates: false,
+        budget: budget.clone(),
+        resources: Vec::new(),
+        key_reservation: budget.reserve(Resource::Memory, 0, "shared key estimate")?,
     };
     while parser.reader.peek()? == Some(0xef) {
         parser.reader.expect(0xef)?;
@@ -910,8 +1048,11 @@ pub(super) fn open(
         key_ids,
         duplicates,
         allocated,
+        mut resources,
+        key_reservation,
         ..
     } = parser;
+    resources.push(key_reservation);
     if duplicates {
         let extra = nodes.len() * 48;
         if allocated
@@ -962,6 +1103,13 @@ pub(super) fn open(
             nodes[new_id as usize].end = compact(nodes.len())?;
             Ok(new_id)
         }
+        resources.push(budget.reserve(
+            Resource::Memory,
+            nodes.len() * std::mem::size_of::<Node>()
+                + ranges.len() * std::mem::size_of::<Range>()
+                + children.len() * 4,
+            "duplicate key compaction",
+        )?);
         let mut canonical = Vec::with_capacity(nodes.len());
         let mut spans = Vec::with_capacity(nodes.len());
         let mut edges = Vec::with_capacity(children.len());
@@ -975,6 +1123,7 @@ pub(super) fn open(
         nodes = canonical;
         ranges = spans;
         children = edges;
+        resources.retain(|lease| lease.label() != "indexed structure growth");
     }
     for (id, node) in nodes.iter().enumerate() {
         if id % 1024 == 0 && cancelled() {
@@ -991,6 +1140,9 @@ pub(super) fn open(
         return Err("Loading cancelled".into());
     }
     Ok(Document {
+        session: SessionId::fresh(),
+        budget,
+        _resources: resources,
         storage: Storage::Indexed(Store {
             source,
             ranges,
@@ -1017,9 +1169,9 @@ fn result_id(result: &mut NodeIds, id: usize) -> Result<(), String> {
         return Err("Indexed query exceeds 256 MiB result-ID budget; narrow the expression".into());
     }
     if result.len() == result.capacity() {
-        result.reserve_exact(result.capacity().max(1024).min(LIMIT - result.len()));
+        result.reserve_exact(result.capacity().max(1024).min(LIMIT - result.len()))?;
     }
-    result.push(id as u32);
+    result.push(id as u32)?;
     Ok(())
 }
 fn unsupported() -> String {
@@ -1181,9 +1333,10 @@ pub(super) fn query(
         segments.push((recursive, selectors(&expression[start..position])?));
         position += 1;
     }
-    let mut current = vec![0];
+    let mut current = NodeIds::new(&doc.budget);
+    current.push(0)?;
     for (recursive, selectors) in segments {
-        let mut result = Vec::new();
+        let mut result = NodeIds::new(&doc.budget);
         for &base in &current {
             let end = if recursive {
                 doc.nodes[base as usize].end()
@@ -1515,7 +1668,15 @@ mod tests {
         assert!(progress.done.load(Ordering::Relaxed) < text.len() as u64);
         let mut values: Vec<Node> = Vec::new();
         let mut budget = INDEX_BUDGET;
-        assert!(grow(&mut values, &mut budget).is_err());
+        assert!(
+            grow(
+                &mut values,
+                &mut budget,
+                &BudgetManager::default(),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
         assert_eq!(values.capacity(), 0);
         let text = serde_json::to_string(&"x".repeat(SUBTREE_LIMIT + 1)).unwrap();
         let input = Input::new(text.as_bytes());

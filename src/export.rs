@@ -1,4 +1,5 @@
 use crate::document::{Document, NodeIds};
+use crate::engine::budget::{BudgetManager, Reservation, Resource, reserve_vec};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
@@ -33,6 +34,7 @@ impl Selection {
             bytes: Vec<u8>,
             limit: usize,
             exceeded: bool,
+            reservation: Reservation,
         }
         impl Write for Buffer {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -45,7 +47,9 @@ impl Selection {
                     let capacity = needed
                         .max(self.bytes.capacity().saturating_mul(2))
                         .min(self.limit);
-                    self.bytes.reserve_exact(capacity - self.bytes.len());
+                    let extra = capacity - self.bytes.len();
+                    reserve_vec(&mut self.bytes, extra, &mut self.reservation)
+                        .map_err(io::Error::other)?;
                 }
                 self.bytes.extend_from_slice(bytes);
                 Ok(bytes.len())
@@ -58,6 +62,10 @@ impl Selection {
             bytes: Vec::new(),
             limit: limit.unwrap_or(usize::MAX),
             exceeded: false,
+            reservation: doc
+                .budget()
+                .reserve(Resource::Memory, 0, "clipboard serialization")
+                .map_err(CopyError::Serialization)?,
         };
         if let Err(error) = self.write(doc, &mut buffer) {
             return Err(if buffer.exceeded {
@@ -115,9 +123,19 @@ pub fn atomic_write(
     cancelled: &AtomicBool,
     serialize: impl FnOnce(&mut dyn Write) -> serde_json::Result<()>,
 ) -> Result<(), String> {
+    atomic_write_with_budget(target, cancelled, &BudgetManager::default(), serialize)
+}
+
+pub fn atomic_write_with_budget(
+    target: &Path,
+    cancelled: &AtomicBool,
+    budget: &BudgetManager,
+    serialize: impl FnOnce(&mut dyn Write) -> serde_json::Result<()>,
+) -> Result<(), String> {
     struct CancelWriter<'a> {
         output: &'a mut dyn Write,
         cancelled: &'a AtomicBool,
+        disk: &'a mut Reservation,
     }
     impl Write for CancelWriter<'_> {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -125,6 +143,14 @@ pub fn atomic_write(
                 if self.cancelled.load(Ordering::Relaxed) {
                     return Err(io::Error::other("Export cancelled"));
                 }
+                self.disk
+                    .resize(
+                        self.disk
+                            .bytes()
+                            .checked_add(chunk.len())
+                            .ok_or_else(|| io::Error::other("Export size overflow"))?,
+                    )
+                    .map_err(io::Error::other)?;
                 self.output.write_all(chunk)?;
             }
             Ok(bytes.len())
@@ -139,12 +165,15 @@ pub fn atomic_write(
     if cancelled.load(Ordering::Relaxed) {
         return Err("Export cancelled".into());
     }
+    let _buffer_lease = budget.reserve(Resource::Memory, 64 * 1024, "export buffer")?;
+    let mut disk = budget.reserve(Resource::Disk, 0, "export temporary file")?;
     let (file, mut temp) = temporary(target).map_err(|e| e.to_string())?;
     let mut output = BufWriter::with_capacity(64 * 1024, file);
     {
         let mut writer = CancelWriter {
             output: &mut output,
             cancelled,
+            disk: &mut disk,
         };
         serialize(&mut writer).map_err(|e| e.to_string())?;
         writer.flush().map_err(|e| e.to_string())?;
@@ -240,7 +269,7 @@ mod tests {
             Err(CopyError::TooLarge)
         );
         assert_eq!(selection.json(&doc, Some(0)), Err(CopyError::TooLarge));
-        let empty = Selection::Results(Arc::new(Vec::new()));
+        let empty = Selection::Results(Arc::new(NodeIds::default()));
         assert_eq!(empty.json(&doc, Some(2)).unwrap(), "[]");
     }
 }
