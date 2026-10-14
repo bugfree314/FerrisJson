@@ -1,7 +1,7 @@
 //! S3 CLI prototype, deliberately separate from the shipping GUI/CLI backend.
 use FerrisJson::engine::{
     budget::{BudgetManager, Limits},
-    sparse::{Kind, SparseIndex},
+    sparse::{Kind, OpenOptions, SparseIndex, open_progressive},
 };
 use std::{
     io::{self, Write},
@@ -15,13 +15,17 @@ fn number(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<usize, 
 }
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let path = PathBuf::from(args.next().ok_or("Usage: sparse_index FILE [--pointer /path] [--memory-mib N] [--disk-mib N] [--expect-count N] [--check-array] [--raw]")?);
+    let path = PathBuf::from(args.next().ok_or("Usage: sparse_index FILE [--pointer /path] [--memory-mib N] [--disk-mib N] [--expect-count N] [--check-array] [--raw] [--cache-dir DIR] [--events] [--stop-after-page | --crash-after-page]")?);
     let mut pointer = String::new();
     let mut memory = 8usize;
     let mut disk = 4096usize;
     let mut expect = None;
     let mut check_array = false;
     let mut raw = false;
+    let mut cache_dir = None;
+    let mut events = false;
+    let mut stop_after_page = false;
+    let mut crash_after_page = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--pointer" => {
@@ -35,6 +39,12 @@ fn run() -> Result<(), String> {
             "--expect-count" => expect = Some(number(&mut args, &flag)? as u64),
             "--check-array" => check_array = true,
             "--raw" => raw = true,
+            "--cache-dir" => {
+                cache_dir = Some(PathBuf::from(args.next().ok_or("Missing cache directory")?))
+            }
+            "--events" => events = true,
+            "--stop-after-page" => stop_after_page = true,
+            "--crash-after-page" => crash_after_page = true,
             _ => return Err(format!("Unknown option: {flag}")),
         }
     }
@@ -44,7 +54,50 @@ fn run() -> Result<(), String> {
             .ok_or("Memory quota overflow")?,
         disk: disk.checked_mul(1024 * 1024).ok_or("Disk quota overflow")?,
     });
-    let mut index = SparseIndex::open(&path, budget.clone(), &|| false)?;
+    let cancelled = std::cell::Cell::new(false);
+    let started = std::time::Instant::now();
+    let mut index = if cache_dir.is_some() || events || stop_after_page || crash_after_page {
+        open_progressive(
+            &path,
+            budget.clone(),
+            OpenOptions {
+                cache_dir,
+                ..Default::default()
+            },
+            1,
+            &|| cancelled.get(),
+            &mut |event| {
+                if events {
+                    eprintln!(
+                        "state={:?} scanned={} total={} commit={} reused={} resumed={} page={} elapsed_ms={:.3}",
+                        event.status,
+                        event.scanned,
+                        event.total_bytes,
+                        event.commit_sequence,
+                        event.reused,
+                        event.resumed,
+                        event.page.as_ref().map_or(0, |p| p.nodes.len()),
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                if stop_after_page
+                    && event.status == FerrisJson::engine::session::SessionStatus::Validating
+                    && event.page.is_some()
+                {
+                    cancelled.set(true);
+                }
+                if crash_after_page
+                    && event.status == FerrisJson::engine::session::SessionStatus::Validating
+                    && event.page.is_some()
+                {
+                    std::process::exit(9);
+                }
+                Ok(())
+            },
+        )?
+    } else {
+        SparseIndex::open(&path, budget.clone(), &|| false)?
+    };
     let selected = index.pointer(&pointer, &|| false)?;
     if expect.is_some_and(|count| count != selected.child_count()) {
         return Err("Unexpected child count".into());

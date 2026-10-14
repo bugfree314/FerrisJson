@@ -68,6 +68,26 @@ impl Drop for Snapshot {
     }
 }
 impl Snapshot {
+    /// A cache snapshot is immutable while this handle is open. Its disk space
+    /// is charged by the cache owner, independently of this reader's lifetime.
+    pub(crate) fn cached(path: &Path, budget: &BudgetManager) -> Result<Self, String> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(1);
+        }
+        let file = options.open(path).map_err(|e| e.to_string())?;
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        Ok(Self {
+            file: FileSource::new(file),
+            path: None,
+            len,
+            _disk: budget.reserve(Resource::Disk, 0, "cache snapshot reader")?,
+            budget: budget.clone(),
+        })
+    }
     pub(crate) fn copy(
         path: &Path,
         cancelled: &impl Fn() -> bool,

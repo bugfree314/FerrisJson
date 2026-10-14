@@ -32,6 +32,81 @@ impl Drop for Store {
     }
 }
 impl Store {
+    /// Immutable checkpoint copy. The caller reserves persistent disk space
+    /// before entering; the scratch copy and live index remain separately charged.
+    pub(super) fn save(
+        &mut self,
+        path: &std::path::Path,
+        budget: &BudgetManager,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        let _lease = budget.reserve(Resource::Memory, 64 * 1024, "index checkpoint buffer")?;
+        let mut options = OpenOptions::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        let mut bytes = vec![0; 64 * 1024];
+        let mut pos = 0;
+        while pos < self.len {
+            super::check(cancelled)?;
+            let n = bytes.len().min((self.len - pos) as usize);
+            self.read_at(pos, &mut bytes[..n], cancelled)?;
+            with_io_slot(cancelled, || output.write_all(&bytes[..n])).map_err(|e| e.to_string())?;
+            pos += n as u64;
+        }
+        output.sync_all().map_err(|e| e.to_string())
+    }
+    pub(super) fn restore(
+        &mut self,
+        path: &std::path::Path,
+        expected: u64,
+        budget: &BudgetManager,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        let mut input = File::open(path).map_err(|e| e.to_string())?;
+        if input.metadata().map_err(|e| e.to_string())?.len() != expected
+            || expected < BASE
+            || !(expected - BASE).is_multiple_of(RECORD)
+        {
+            return Err("Invalid checkpoint index length".into());
+        }
+        self.lease
+            .resize(usize::try_from(expected).map_err(|_| "Index length overflow")?)?;
+        let _lease = budget.reserve(Resource::Memory, 64 * 1024, "index restore buffer")?;
+        let mut bytes = vec![0; 64 * 1024];
+        self.len = expected;
+        let mut pos = 0;
+        while pos < expected {
+            super::check(cancelled)?;
+            let n = bytes.len().min((expected - pos) as usize);
+            with_io_slot(cancelled, || input.read_exact(&mut bytes[..n]))
+                .map_err(|e| e.to_string())?;
+            self.write_at(pos, &bytes[..n], cancelled)?;
+            pos += n as u64;
+        }
+        self.file
+            .as_mut()
+            .unwrap()
+            .set_len(expected)
+            .map_err(|e| e.to_string())?;
+        // Check every bucket/record before trusting a restored generation.
+        for bucket in 0..BUCKETS {
+            self.head(bucket, cancelled)?;
+        }
+        let mut offset = BASE;
+        while offset < expected {
+            self.get(offset, cancelled)?;
+            offset += RECORD;
+        }
+        Ok(())
+    }
     pub(super) fn new(
         budget: &BudgetManager,
         cancelled: &dyn Fn() -> bool,

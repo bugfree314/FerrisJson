@@ -1,5 +1,7 @@
 //! Experimental S3 scanner. Only containers/checkpoints/fields live on disk;
 //! scalar array elements have no permanent record. No GUI/default-backend integration.
+mod cache;
+mod progressive;
 mod store;
 use crate::{
     document::{
@@ -12,6 +14,7 @@ use crate::{
         session::SessionId,
     },
 };
+pub use progressive::{CopiedValue, Event, OpenOptions, PublishedPage, open_progressive};
 use std::{io::Write, path::Path};
 use store::{Record, Store};
 const NONE: u64 = u64::MAX;
@@ -117,6 +120,7 @@ pub struct SparseIndex {
     root: Node,
     header: [u64; 8],
     _state: Reservation,
+    _cache: Option<cache::Cache>,
 }
 impl SparseIndex {
     pub fn open(
@@ -158,6 +162,7 @@ impl SparseIndex {
             root,
             header,
             _state: state,
+            _cache: None,
         })
     }
     pub fn root(&self) -> Node {
@@ -516,6 +521,7 @@ fn keys_equal(
         }
     }
 }
+#[derive(Clone)]
 struct Frame {
     record: Record,
     offset: u64,
@@ -533,6 +539,7 @@ struct Scanner<'a> {
     index: bool,
     stack: Vec<Frame>,
     _stack: Reservation,
+    progress: Option<&'a std::sync::atomic::AtomicU64>,
 }
 impl<'a> Scanner<'a> {
     fn new(
@@ -560,6 +567,7 @@ impl<'a> Scanner<'a> {
             index,
             stack,
             _stack: lease,
+            progress: None,
         })
     }
     fn string(&mut self) -> Result<u64, String> {
@@ -571,6 +579,9 @@ impl<'a> Scanner<'a> {
             hash = hash_update(hash, c.encode_utf8(&mut bytes).as_bytes());
             if self.reader.pos / 4096 != boundary {
                 boundary = self.reader.pos / 4096;
+                if let Some(progress) = self.progress {
+                    progress.store(self.reader.pos, std::sync::atomic::Ordering::Relaxed);
+                }
                 check(self.cancelled)?;
             }
         }
@@ -580,6 +591,9 @@ impl<'a> Scanner<'a> {
         while matches!(self.reader.peek()?, Some(b'0'..=b'9')) {
             self.reader.next()?;
             if self.reader.pos.is_multiple_of(4096) {
+                if let Some(progress) = self.progress {
+                    progress.store(self.reader.pos, std::sync::atomic::Ordering::Relaxed);
+                }
                 check(self.cancelled)?;
             }
         }
@@ -750,9 +764,53 @@ impl<'a> Scanner<'a> {
         frame.phase = 2;
         Ok(())
     }
-    fn run(mut self, position: u64) -> Result<Node, String> {
+    fn run(self, position: u64) -> Result<Node, String> {
+        self.run_internal(position, None, false)
+    }
+    fn run_progressive(
+        self,
+        publisher: &mut progressive::Publisher<'_>,
+        resumed: bool,
+    ) -> Result<Node, String> {
+        let position = self.reader.pos;
+        self.run_internal(position, Some(publisher), resumed)
+    }
+    fn run_internal(
+        mut self,
+        position: u64,
+        mut publisher: Option<&mut progressive::Publisher<'_>>,
+        resumed: bool,
+    ) -> Result<Node, String> {
         self.reader.pos = position;
-        let mut completed = self.begin()?;
+        if !resumed {
+            whitespace(&mut self.reader, self.cancelled)?;
+            let kind = match self.reader.peek()? {
+                Some(b'{') => Some(Kind::Object),
+                Some(b'[') => Some(Kind::Array),
+                Some(b'"') => Some(Kind::String),
+                Some(b'-' | b'0'..=b'9') => Some(Kind::Number),
+                Some(b't' | b'f') => Some(Kind::Boolean),
+                Some(b'n') => Some(Kind::Null),
+                _ => None,
+            };
+            if let Some(p) = publisher.as_mut() {
+                p.event(
+                    self.snapshot,
+                    crate::engine::session::SessionStatus::Validating,
+                    position,
+                    kind,
+                    None,
+                    None,
+                )?;
+            }
+        }
+        let mut completed = if resumed { None } else { self.begin()? };
+        if !resumed
+            && completed.is_none()
+            && let Some(p) = publisher.as_mut()
+        {
+            p.safe(&mut self, None, true)?;
+        }
         loop {
             check(self.cancelled)?;
             if let Some(node) = completed.take() {
@@ -760,6 +818,9 @@ impl<'a> Scanner<'a> {
                     return Ok(node);
                 }
                 self.attach(node)?;
+                if let Some(p) = publisher.as_mut() {
+                    p.safe(&mut self, Some(node), false)?;
+                }
             }
             whitespace(&mut self.reader, self.cancelled)?;
             let frame = self.stack.last().unwrap();
@@ -825,5 +886,7 @@ impl<'a> Scanner<'a> {
     }
 }
 
+#[cfg(test)]
+mod progressive_tests;
 #[cfg(test)]
 mod tests;

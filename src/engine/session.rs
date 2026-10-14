@@ -25,7 +25,11 @@ pub struct TaskId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionStatus {
+    Preparing,
+    Validating,
     Ready,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug)]

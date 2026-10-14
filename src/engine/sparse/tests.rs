@@ -7,9 +7,9 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
-struct Input(PathBuf);
+pub(super) struct Input(pub(super) PathBuf);
 impl Input {
-    fn new(bytes: impl AsRef<[u8]>) -> Self {
+    pub(super) fn new(bytes: impl AsRef<[u8]>) -> Self {
         static SERIAL: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "FerrisJson-S3-test-{}-{}.tmp",
@@ -25,7 +25,7 @@ impl Drop for Input {
         let _ = fs::remove_file(&self.0);
     }
 }
-fn budget() -> BudgetManager {
+pub(super) fn budget() -> BudgetManager {
     BudgetManager::new(Limits {
         memory: 1024 * 1024,
         disk: 32 * 1024 * 1024,
@@ -34,7 +34,7 @@ fn budget() -> BudgetManager {
 fn open(input: &Input, budget: &BudgetManager) -> SparseIndex {
     SparseIndex::open(&input.0, budget.clone(), &|| false).unwrap()
 }
-fn raw(index: &mut SparseIndex, node: Node) -> String {
+pub(super) fn raw(index: &mut SparseIndex, node: Node) -> String {
     let mut bytes = Vec::new();
     index.write_raw(node, &mut bytes, &|| false).unwrap();
     String::from_utf8(bytes).unwrap()
