@@ -550,6 +550,7 @@ mod tests {
             reused: false,
             resumed: false,
             message: None,
+            view: None,
         })
     }
     #[test]

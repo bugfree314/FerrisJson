@@ -1,8 +1,8 @@
 # FerrisJson
 
-当前版本：**0.7.0**。
+当前版本：**0.7.1**。
 
-0.7.0 实现 **S4 渐进打开、持久缓存与恢复**（本次版本提交，基于 0.6.2 / `139c540`）。新增实验性的 `--sparse` 有限页浏览器和 `--cache-dir` 持久缓存入口，自动验证及 Windows Release 构建已完成；GUI 人工验收、其他平台和 1–10 GB 验收尚未完成。S0 保持暂停，专项结果见 [S4 优化记录](docs/performance-optimization.md#24-s4--渐进打开持久缓存与恢复工作区实现)。
+0.7.0 / `46b149c` 已提交 S4 渐进打开、持久缓存与恢复，并创建本地 tag。本次版本提交 **0.7.1** 收录 S5 分页树与异步预览：`--sparse` 使用真正分页的树，原 S4 有限页界面移至 `--sparse-pages`；`--paged-tree` 可用同一树模型查看旧后端。S5 自动及专项验收、剩余限制见 [S5 记录](docs/performance-optimization.md#25-s5--分页树与异步预览工作区)。S0 保持暂停。
 
 已提交的 0.6.2 新增 `.` 快捷键：输入框外按下时聚焦 JSONPath 栏，保留查询内容且不插入句点；输入框内正常输入，弹窗打开时不触发。按 Esc 仍可取消待完成的 Vim 按键序列。帮助速查页同步更新；该提交无新的性能优化或性能测量，S0 保持暂停。
 
@@ -10,7 +10,7 @@
 
 0.6.1 完成 **S3 独立稀疏索引 CLI 原型**：容器、数组检查点和对象字段目录落盘，提供 JSON Pointer 与有界子节点页。用户将本阶段验收改为 50/100/500 MB；两种数组结构在固定 1 MiB 受管理内存预算下通过扫描与首/中/末定位，账本数据不等于进程 RSS。0.6.1 提交时原型尚未接入 GUI、持久缓存、搜索或 JSONPath；使用及历史限制见 [S3 优化记录](docs/performance-optimization.md#22-s3--固定内存扫描与稀疏索引-cli-原型)。S0 保持暂停。
 
-面向 1–10 GB 文件的架构与验收计划见 [大文件分步重构方案](docs/large-file-refactor-plan.md)。0.5.2 完成 S1 的公共引擎接口、会话标识和共享资源预算；默认两个后端仍采用完整索引。S3/S4 的稀疏引擎采用独立实验入口，完整分页树与默认策略分别属于 S5/S8。
+面向 1–10 GB 文件的架构与验收计划见 [大文件分步重构方案](docs/large-file-refactor-plan.md)。0.5.2 完成 S1 的公共引擎接口、会话标识和共享资源预算；默认两个后端仍采用完整索引。S3–S5 的稀疏引擎采用独立实验入口；S5 已接入分页树，默认策略调整仍属 S8。
 
 0.5.2 将 GUI、CLI 和基准统一到公共引擎库，新增会话/节点/任务标识及子节点分页接口；共享预算在超限时明确报错，并跟随结果/子树引用释放。默认过渡配额为受管理内存 8 GiB、临时磁盘 64 GiB，尚无 GUI 配额控件；预算含估算及预留池，不是总进程 RSS 上限，部分 serde/JSONPath/GUI 内部分配仍需实测观察。
 
@@ -159,22 +159,30 @@ macOS 打包使用系统自带的 `sips`、`iconutil`、`plutil` 和 `codesign`�
 
 完整结构索引仍驻留内存：结构数组容量预算 1.5 GiB，共享键解码字节预算 64 MiB，单键最多 1 MiB、最多一百万种键；索引查询的单个中间结果数组最多 256 MiB。超过预算会报错。缓存、索引和结果预算都不是总进程内存上限；数组扩容、旧/新结果、后台引用和系统文件缓存另占空间。尚未实现磁盘分页或自动按文件大小切换。
 
-### S4 实验性渐进浏览与持久缓存（0.7.0）
+### 实验性分页树与持久缓存（S5，0.7.1）
 
 ```powershell
-cargo run --release --offline --locked --bin FerrisJson -- your-file.json --sparse --cache-dir target/my-s4-cache
-cargo run --release --offline --locked --example sparse_index -- your-file.json --cache-dir target/my-s4-cache --events --pointer /items/0 --raw
+cargo run --release --offline --locked --bin FerrisJson -- your-file.json --sparse --cache-dir target/my-s5-cache
+# 旧 S4 有限页界面
+cargo run --release --offline --locked --bin FerrisJson -- your-file.json --sparse-pages
+# 同一分页树查看旧内存 / 完整文件索引后端
+cargo run --release --offline --locked --bin FerrisJson -- your-file.json --paged-tree
+cargo run --release --offline --locked --bin FerrisJson -- your-file.json --paged-tree --indexed
+cargo run --release --offline --locked --example sparse_index -- your-file.json --cache-dir target/my-s5-cache --events --pointer /items/0 --raw
 ```
 
 缓存目录应专用于一个当前输入；切换到内容不同的文件会安全重建。省略 `--cache-dir` 可关闭持久缓存，仍使用私有快照渐进扫描。默认查看器和 `--indexed` 的入口保持原样；`--sparse` 只接受文件并打开实验浏览器，不接受 stdin 或现有 CLI 查询选项。
 
-新建会话先完成快照复制，随后后台扫描：根概要先交付，数组首个完整元素及最多 64 项的首批预览可先显示；对象字段在容器闭合、重复键定稿后显示。首屏遇到巨大值或根对象时可以只有概要与进度。未完成总数显示未知；界面在 Ready 后开放 Pointer 定位、64 项翻页、子容器浏览、完整复制（最多 8 MiB）和后台流式导出。预览只截取 160 个原文字节，可能不是完整 JSON；复制/导出使用完整原文范围。末尾错误会转 Failed，取消会转 Cancelled，保留的预览明确标为未完成校验，不能继续导航或导出。
+新建会话先复制快照，再后台扫描。数组已提交的完整元素可在全量校验前导航；对象字段在容器闭合、重复键定稿后可读。总数未定时显示下界；G、超过已提交范围的行跳转和路径可等待 Ready，Esc 或新的跳转可取消等待。末尾错误转 Failed 并清空树，禁止继续输出。
 
+每次交付最多 64 个真实节点，页缓存最多 8×64 个节点；不会建立完整 rows/expanded 数组或把范围概要当作 JSON 节点。展开例外和祖先权重保存在临时磁盘树，`zR/zM` 切换逻辑策略。`hjkl`/方向键、数字前缀、`gg/G`、H/M/L、翻页、历史和 Row 整数跳转可用；滚轮移动局部窗口，不将全局行数转换为 egui 浮点高度。稀疏模式的 Path 接受 JSON Pointer（例如 `/items/0`）；旧后端保留已有定位支持范围，`.`/Ctrl+F 聚焦；全文搜索、n/N 和一般 JSONPath 待 S6/S7，使用默认旧界面可继续使用现有搜索/查询。
+
+预览、行摘要和路径由独立后台交互线程准备，内容、主题、宽度、Wrap 与 DPI 决定布局缓存。选中预览最多显示 16 KiB，可能不是完整 JSON；Ready 后复制/导出使用独立快照范围和完整值，复制最多 8 MiB，超限提示使用 Export。输出线程与导航分离，后续选择不改变已提交输出。旧后端使用相同 Provider，但仍承担旧完整 DOM/索引的存储成本。
 缓存保存源快照、两代结构索引和解析栈检查点；严格复用逐字节比较整个源文件与快照，并检查索引记录。复用仍有完整读取成本，不能保证比重新扫描快。恢复只使用已经提交的结构边界，可退回最后检查点重扫；对象重复键处理状态一并恢复。目录由系统文件锁限制单会话访问，异常退出后可重新获取锁；不兼容或损坏的状态回退重建，配额不足明确报错。
 
 当前只实现稳定快照和严格复用，没有采样快速复用或直接原文件读取。Windows 打开源时拒绝并发写入/删除；Unix 的复制/比较前后大小与时间检查不能排除绕过元数据检测的并发改写，应在源文件静止时操作。持久目录包含原始 JSON 内容；活动会话核算该目录的受管理文件，关闭后目录保留，下次重新计费。没有跨目录的全局缓存淘汰。GUI 配额为受管理内存 256 MiB、磁盘 64 GiB，均不是总 RSS 或整个磁盘空间上限。
 
-检查点目前复制完整索引，首次缓存构建还会复制已有快照，因此额外 I/O 和磁盘开销需要计入。S4 是有限页浏览器；完整 Vim 树导航、搜索和 JSONPath 迁移属于 S5–S7。专项测量脚本未纳入本版本；上方 CLI 可检查局部交付、缓存复用及 Pointer 输出。`--stop-after-page` 可检查取消恢复，`--crash-after-page` 可模拟异常退出；大输入和报告只保存本地。
+磁盘索引/检查点格式升级为 v2，不兼容的旧缓存安全重建。数组检查点和对象序号由磁盘 AVL 目录定位，容器跳转不重扫整个容器；对象键哈希碰撞仍可能退化。检查点和后台只读视图目前复制完整索引，首次缓存构建还复制已有快照，额外 I/O/磁盘开销需要计入；高节点密度和单个巨大标量另有成本，不能保证任意 10 GB 文件即时打开。S5 测量使用过本地 `scripts/verify-s5.py`，该脚本目前不在工作区且未纳入本版本；历史结果保持实际测量版本 0.7.0。headless egui CPU 数据不代表原生窗口/GPU 帧率；人工及跨平台未验收。上方 CLI 可检查局部交付、缓存复用及 Pointer 输出。`--stop-after-page` 可检查取消恢复，`--crash-after-page` 可模拟异常退出；大输入和报告只保存本地。
 
 ## 配色设置
 

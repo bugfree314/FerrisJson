@@ -303,3 +303,197 @@ fn sparse_export_cancellation_keeps_existing_destination_and_success_is_complete
     index.export_value(root, &target, &flag).unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"[1,2,3]");
 }
+
+#[test]
+fn immutable_live_view_can_navigate_while_builder_is_still_validating() {
+    let i = Input::new(b"[0,{\"x\":1,\"x\":2},2,3]");
+    let b = budget();
+    let mut views = Vec::new();
+    let mut ready = false;
+    let index = open_progressive(
+        &i.0,
+        b.clone(),
+        OpenOptions {
+            live_views: true,
+            ..Default::default()
+        },
+        4,
+        &|| false,
+        &mut |mut e| {
+            ready |= e.status == SessionStatus::Ready;
+            if let Some(mut view) = e.view.take() {
+                assert!(!ready);
+                assert!(!view.complete());
+                let root = view.root();
+                assert!(!view.output_selection(root, &|| false).is_ok());
+                if root.child_count() > 0 {
+                    let child = view.child(root, 0, &|| false).unwrap();
+                    assert_eq!(view.tree_preview(child, 160, &|| false).unwrap(), "0");
+                }
+                views.push(view);
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    let mut first = views
+        .into_iter()
+        .find(|v| v.root().child_count() == 1)
+        .unwrap();
+    assert_eq!(first.root().child_count(), 1);
+    assert!(
+        first
+            .pointer_edges("/1", &|| false)
+            .unwrap_err()
+            .contains("Pending")
+    );
+    drop(index);
+    let n = first.child(first.root(), 0, &|| false).unwrap();
+    assert_eq!(first.tree_preview(n, 160, &|| false).unwrap(), "0");
+    drop(first);
+    assert_eq!(b.usage().memory, 0);
+    assert_eq!(b.usage().disk, 0);
+}
+#[test]
+fn output_snapshot_keeps_its_disk_charge_after_index_closes() {
+    let i = Input::new(b"[1,2,3]");
+    let b = budget();
+    let mut index = open_progressive(
+        &i.0,
+        b.clone(),
+        OpenOptions::default(),
+        0,
+        &|| false,
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    let node = index.child(index.root(), 1, &|| false).unwrap();
+    let selection = index.output_selection(node, &|| false).unwrap();
+    drop(index);
+    assert!(b.usage().disk > 0);
+    assert_eq!(selection.copy(&|| false).unwrap().text, "2");
+    drop(selection);
+    assert_eq!(b.usage().disk, 0);
+    assert_eq!(b.usage().memory, 0);
+}
+#[test]
+fn old_manifest_format_is_rebuilt_without_reuse() {
+    let i = Input::new(b"[1,{\"x\":2}]");
+    let d = Dir::new();
+    let index =
+        open_progressive(&i.0, budget(), d.options(), 1, &|| false, &mut |_| Ok(())).unwrap();
+    drop(index);
+    let path = d.0.join("manifest.bin");
+    let mut bytes = fs::read(&path).unwrap();
+    for entry in bytes.chunks_mut(32) {
+        entry[..8].copy_from_slice(b"FJCM0001");
+    }
+    fs::write(path, bytes).unwrap();
+    let mut reused = false;
+    let mut index = open_progressive(&i.0, budget(), d.options(), 2, &|| false, &mut |e| {
+        reused |= e.reused || e.resumed;
+        Ok(())
+    })
+    .unwrap();
+    assert!(!reused);
+    let node = index.pointer("/1/x", &|| false).unwrap();
+    assert_eq!(raw(&mut index, node), "2");
+}
+#[test]
+fn pending_end_runs_after_ready_and_a_later_jump_cancels_it() {
+    use crate::engine::{
+        tree::SparseProvider,
+        tree_navigation::{Navigation, Navigator},
+    };
+    let i = Input::new(b"[1,2,3]");
+    for cancel_pending in [false, true] {
+        let mut nav = None;
+        let ready = open_progressive(
+            &i.0,
+            BudgetManager::new(crate::engine::budget::Limits {
+                memory: 256 * 1024 * 1024,
+                disk: 1024 * 1024 * 1024,
+            }),
+            OpenOptions {
+                live_views: true,
+                ..Default::default()
+            },
+            5,
+            &|| false,
+            &mut |mut e| {
+                if nav.is_none()
+                    && let Some(view) = e.view.take()
+                    && view.root().child_count() == 1
+                {
+                    let mut n =
+                        Navigator::new(Box::new(SparseProvider::new(*view).unwrap()), &|| false)
+                            .unwrap();
+                    assert!(
+                        n.apply(Navigation::Last, &|| false)
+                            .unwrap_err()
+                            .contains("Pending")
+                    );
+                    assert!(n.pending());
+                    if cancel_pending {
+                        n.apply(Navigation::First, &|| false).unwrap();
+                        assert!(!n.pending());
+                    }
+                    nav = Some(n);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut nav = nav.unwrap();
+        nav.replace(Box::new(SparseProvider::new(ready).unwrap()), &|| false)
+            .unwrap();
+        assert!(!nav.pending());
+        assert_eq!(
+            nav.frame(&|| false).unwrap().selected_rank,
+            if cancel_pending { 0 } else { 3 }
+        );
+    }
+}
+#[test]
+fn resumed_root_object_keeps_draft_duplicate_fields_hidden_until_ready() {
+    let mut text = String::from("{\"k\":1,\"payload\":\"");
+    text.extend(std::iter::repeat_n('x', 17 * 1024 * 1024));
+    text.push_str("\",\"k\":2}");
+    let i = Input::new(text);
+    let d = Dir::new();
+    let stop = Cell::new(false);
+    let b = || {
+        BudgetManager::new(crate::engine::budget::Limits {
+            memory: 1024 * 1024,
+            disk: 128 * 1024 * 1024,
+        })
+    };
+    let options = || OpenOptions {
+        cache_dir: Some(d.0.clone()),
+        live_views: true,
+        ..Default::default()
+    };
+    assert!(
+        open_progressive(&i.0, b(), options(), 1, &|| stop.get(), &mut |e| {
+            if e.status == SessionStatus::Validating && e.committed_frontier > 16 * 1024 * 1024 {
+                stop.set(true);
+            }
+            Ok(())
+        })
+        .is_err()
+    );
+    assert!(stop.get());
+    let mut resumed = false;
+    let mut index = open_progressive(&i.0, b(), options(), 2, &|| false, &mut |e| {
+        resumed |= e.resumed;
+        if e.status == SessionStatus::Validating {
+            assert!(e.view.is_none());
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(resumed);
+    assert_eq!(index.root().child_count(), 2);
+    let last = index.pointer("/k", &|| false).unwrap();
+    assert_eq!(raw(&mut index, last), "2");
+}

@@ -3,6 +3,8 @@ pub mod budget;
 pub mod file_source;
 pub mod ids;
 pub mod session;
+pub mod tree;
+pub mod tree_navigation;
 
 /// S1 sessions use the existing complete-index document as their adapter.
 pub use crate::document::Document as Session;

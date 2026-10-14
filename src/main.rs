@@ -6,6 +6,8 @@
 
 mod app;
 mod sparse_app;
+mod tree_app;
+mod tree_worker;
 use FerrisJson::{document, engine, export, loading};
 mod fonts;
 mod palette;
@@ -49,13 +51,15 @@ fn run() -> Result<(), String> {
     let mut pretty = false;
     let mut indexed = false;
     let mut sparse = false;
+    let mut sparse_pages = false;
+    let mut paged_tree = false;
     let mut cache_dir = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --indexed      File snapshot/range backend (limited JSONPath; no full Value)\n  --sparse       Experimental progressive finite-page GUI (file only)\n  --cache-dir D  S4 persistent snapshot/index cache; requires --sparse\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported in in-memory mode.",
+                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --indexed      File snapshot/range backend (limited JSONPath; no full Value)\n  --sparse       Experimental progressive paged tree GUI (file only)\n  --sparse-pages  S4 finite-page browser fallback\n  --paged-tree    Paged renderer for legacy backends (file only)\n  --cache-dir D  S4 persistent snapshot/index cache; requires --sparse\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported in in-memory mode.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
@@ -70,6 +74,11 @@ fn run() -> Result<(), String> {
             "--pretty" => pretty = true,
             "--indexed" => indexed = true,
             "--sparse" => sparse = true,
+            "--sparse-pages" => {
+                sparse = true;
+                sparse_pages = true;
+            }
+            "--paged-tree" => paged_tree = true,
             "--cache-dir" => {
                 cache_dir = Some(PathBuf::from(
                     args.next().ok_or("--cache-dir requires a directory")?,
@@ -91,6 +100,17 @@ fn run() -> Result<(), String> {
     }
     let use_stdin = file.as_ref().is_some_and(|f| f.as_os_str() == "-")
         || (file.is_none() && stdin_redirected());
+    if paged_tree
+        && (sparse
+            || use_stdin
+            || get.is_some()
+            || query.is_some()
+            || search.is_some()
+            || pretty
+            || file.is_none())
+    {
+        return Err("--paged-tree requires a file and opens the experimental tree renderer".into());
+    }
     if cache_dir.is_some() && !sparse {
         return Err("--cache-dir requires --sparse".into());
     }
@@ -103,7 +123,7 @@ fn run() -> Result<(), String> {
             || pretty
             || file.is_none())
     {
-        return Err("--sparse requires a file and opens the experimental page browser; use the sparse_index example for CLI queries".into());
+        return Err("--sparse requires a file and opens the experimental paged tree; use the sparse_index example for CLI queries".into());
     }
     if indexed && use_stdin {
         return Err("--indexed requires a file; stdin keeps the in-memory backend".into());
@@ -173,6 +193,23 @@ fn run() -> Result<(), String> {
         "FerrisJson",
         options,
         Box::new(move |cc| {
+            if paged_tree {
+                return Ok(Box::new(tree_app::Viewer::new(
+                    cc,
+                    file.unwrap(),
+                    tree_worker::Backend::Legacy(indexed),
+                )) as Box<dyn eframe::App>);
+            }
+            if sparse && !sparse_pages {
+                return Ok(Box::new(tree_app::Viewer::new(
+                    cc,
+                    file.unwrap(),
+                    tree_worker::Backend::Sparse(engine::sparse::OpenOptions {
+                        cache_dir,
+                        ..Default::default()
+                    }),
+                )) as Box<dyn eframe::App>);
+            }
             if sparse {
                 return Ok(Box::new(sparse_app::Viewer::new(
                     cc,

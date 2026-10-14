@@ -68,6 +68,15 @@ impl Drop for Snapshot {
     }
 }
 impl Snapshot {
+    pub(crate) fn cached_with_disk(
+        path: &Path,
+        budget: &BudgetManager,
+        disk: Reservation,
+    ) -> Result<Self, String> {
+        let mut snapshot = Self::cached(path, budget)?;
+        snapshot._disk = disk;
+        Ok(snapshot)
+    }
     /// A cache snapshot is immutable while this handle is open. Its disk space
     /// is charged by the cache owner, independently of this reader's lifetime.
     pub(crate) fn cached(path: &Path, budget: &BudgetManager) -> Result<Self, String> {

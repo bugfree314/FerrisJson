@@ -11,16 +11,23 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub(super) const HEADER: u64 = 80;
+pub(crate) const HEADER: u64 = 80;
 const BUCKETS: u64 = 65_536;
 const RECORD: u64 = 104;
 const BASE: u64 = HEADER + BUCKETS * 16;
-pub(super) type Record = [u64; 12];
+pub(crate) type Record = [u64; 12];
 
-pub(super) struct Store {
+pub(crate) struct Store {
     file: Option<File>,
     path: Option<PathBuf>,
     len: u64,
+    lease: Reservation,
+    _directory_stack: Reservation,
+    undo: Option<Undo>,
+}
+struct Undo {
+    initial_len: u64,
+    records: Vec<(u64, Record)>,
     lease: Reservation,
 }
 impl Drop for Store {
@@ -34,7 +41,7 @@ impl Drop for Store {
 impl Store {
     /// Immutable checkpoint copy. The caller reserves persistent disk space
     /// before entering; the scratch copy and live index remain separately charged.
-    pub(super) fn save(
+    pub(crate) fn save(
         &mut self,
         path: &std::path::Path,
         budget: &BudgetManager,
@@ -63,7 +70,7 @@ impl Store {
         }
         output.sync_all().map_err(|e| e.to_string())
     }
-    pub(super) fn restore(
+    pub(crate) fn restore(
         &mut self,
         path: &std::path::Path,
         expected: u64,
@@ -107,7 +114,7 @@ impl Store {
         }
         Ok(())
     }
-    pub(super) fn new(
+    pub(crate) fn new(
         budget: &BudgetManager,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, String> {
@@ -155,6 +162,12 @@ impl Store {
             path: Some(path),
             len: BASE,
             lease,
+            _directory_stack: budget.reserve(
+                Resource::Memory,
+                64 * 1024,
+                "bounded directory operation stack",
+            )?,
+            undo: None,
         };
         #[cfg(unix)]
         if fs::remove_file(store.path.as_ref().unwrap()).is_ok() {
@@ -175,7 +188,7 @@ impl Store {
         Ok(store)
     }
     fn read_at(
-        &mut self,
+        &self,
         pos: u64,
         bytes: &mut [u8],
         cancelled: &dyn Fn() -> bool,
@@ -186,12 +199,35 @@ impl Store {
         {
             return Err("Sparse index range out of bounds".into());
         }
-        with_io_slot(cancelled, || {
-            let file = self.file.as_mut().unwrap();
-            file.seek(SeekFrom::Start(pos))?;
-            file.read_exact(bytes)
-        })
-        .map_err(|e| e.to_string())
+        let file = self.file.as_ref().unwrap();
+        let mut offset = pos;
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            super::check(cancelled)?;
+            let n = with_io_slot(cancelled, || {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::FileExt;
+                    file.seek_read(remaining, offset)
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    file.read_at(remaining, offset)
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    Err(std::io::Error::other("Positioned index reads unavailable"))
+                }
+            })
+            .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("Index truncated".into());
+            }
+            offset += n as u64;
+            remaining = &mut remaining[n..];
+        }
+        Ok(())
     }
     fn write_at(
         &mut self,
@@ -206,10 +242,10 @@ impl Store {
         })
         .map_err(|e| e.to_string())
     }
-    pub(super) fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.len
     }
-    pub(super) fn head(&mut self, hash: u64, cancelled: &dyn Fn() -> bool) -> Result<u64, String> {
+    pub(crate) fn head(&self, hash: u64, cancelled: &dyn Fn() -> bool) -> Result<u64, String> {
         let mut bytes = [0; 16];
         self.read_at(HEADER + hash % BUCKETS * 16, &mut bytes, cancelled)?;
         if hash_bytes(&bytes[..8]) != u64::from_le_bytes(bytes[8..].try_into().unwrap()) {
@@ -217,7 +253,7 @@ impl Store {
         }
         Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
     }
-    pub(super) fn set_head(
+    pub(crate) fn set_head(
         &mut self,
         hash: u64,
         head: u64,
@@ -229,7 +265,7 @@ impl Store {
         bytes[8..].copy_from_slice(&sum.to_le_bytes());
         self.write_at(HEADER + hash % BUCKETS * 16, &bytes, cancelled)
     }
-    pub(super) fn append(
+    pub(crate) fn append(
         &mut self,
         record: Record,
         cancelled: &dyn Fn() -> bool,
@@ -252,11 +288,7 @@ impl Store {
                 .checked_add(RECORD)
                 .is_some_and(|end| end <= self.len)
     }
-    pub(super) fn get(
-        &mut self,
-        offset: u64,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<Record, String> {
+    pub(crate) fn get(&self, offset: u64, cancelled: &dyn Fn() -> bool) -> Result<Record, String> {
         if !self.valid_offset(offset) {
             return Err("Invalid sparse record offset".into());
         }
@@ -269,7 +301,7 @@ impl Store {
             u64::from_le_bytes(bytes[n * 8..n * 8 + 8].try_into().unwrap())
         }))
     }
-    pub(super) fn put(
+    pub(crate) fn put(
         &mut self,
         offset: u64,
         record: Record,
@@ -277,6 +309,19 @@ impl Store {
     ) -> Result<(), String> {
         if !self.valid_offset(offset) {
             return Err("Invalid sparse record offset".into());
+        }
+        if self
+            .undo
+            .as_ref()
+            .is_some_and(|log| offset < log.initial_len)
+        {
+            let previous = self.get(offset, cancelled)?;
+            let log = self.undo.as_mut().unwrap();
+            if log.records.len() * std::mem::size_of::<(u64, Record)>() >= 8 * 1024 * 1024 {
+                return Err("Tree state undo budget exceeded".into());
+            }
+            crate::engine::budget::reserve_vec(&mut log.records, 1, &mut log.lease)?;
+            log.records.push((offset, previous));
         }
         let mut bytes = [0; RECORD as usize];
         for (n, value) in record.iter().enumerate() {
@@ -286,13 +331,71 @@ impl Store {
         bytes[96..].copy_from_slice(&sum.to_le_bytes());
         self.write_at(offset, &bytes, cancelled)
     }
-    pub(super) fn commit(
+    pub(crate) fn in_transaction(&self) -> bool {
+        self.undo.is_some()
+    }
+    pub(crate) fn transaction(&mut self, budget: &BudgetManager) -> Result<(), String> {
+        if self.undo.is_some() {
+            return Err("Nested tree transaction".into());
+        }
+        self.undo = Some(Undo {
+            initial_len: self.len,
+            records: Vec::new(),
+            lease: budget.reserve(Resource::Memory, 0, "tree state undo log")?,
+        });
+        Ok(())
+    }
+    pub(crate) fn finish_transaction(&mut self, commit: bool) -> Result<(), String> {
+        let Some(log) = self.undo.take() else {
+            return Err("No tree transaction".into());
+        };
+        if commit {
+            return Ok(());
+        }
+        crate::engine::file_source::with_io_context(
+            crate::engine::file_source::Priority::Interactive,
+            crate::engine::file_source::Cancellation::Any(Vec::new()),
+            || {
+                for (id, record) in log.records.iter().rev() {
+                    self.put(*id, *record, &|| false)?;
+                }
+                self.file
+                    .as_ref()
+                    .unwrap()
+                    .set_len(log.initial_len)
+                    .map_err(|e| e.to_string())?;
+                self.len = log.initial_len;
+                self.lease.resize(log.initial_len as usize)
+            },
+        )
+    }
+    pub(crate) fn fork(
+        &self,
+        budget: &BudgetManager,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, String> {
+        let mut copy = Self::new(budget, cancelled)?;
+        copy.lease.resize(self.len as usize)?;
+        copy.len = self.len;
+        let _memory = budget.reserve(Resource::Memory, 64 * 1024, "immutable index view copy")?;
+        let mut bytes = vec![0; 64 * 1024];
+        let mut pos = 0;
+        while pos < self.len {
+            super::super::file_source::check_cancelled().map_err(|e| e.to_string())?;
+            let n = (self.len - pos).min(bytes.len() as u64) as usize;
+            self.read_at(pos, &mut bytes[..n], cancelled)?;
+            copy.write_at(pos, &bytes[..n], cancelled)?;
+            pos += n as u64;
+        }
+        Ok(copy)
+    }
+    pub(crate) fn commit(
         &mut self,
         words: [u64; 8],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
         let mut bytes = [0; HEADER as usize];
-        bytes[..8].copy_from_slice(b"FJSPRS01");
+        bytes[..8].copy_from_slice(b"FJSPRS02");
         for (n, word) in words.iter().enumerate() {
             bytes[8 + n * 8..16 + n * 8].copy_from_slice(&word.to_le_bytes());
         }
@@ -300,14 +403,14 @@ impl Store {
         bytes[72..].copy_from_slice(&sum.to_le_bytes());
         self.write_at(0, &bytes, cancelled)
     }
-    pub(super) fn verify(
-        &mut self,
+    pub(crate) fn verify(
+        &self,
         words: [u64; 8],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
         let mut bytes = [0; HEADER as usize];
         self.read_at(0, &mut bytes, cancelled)?;
-        if &bytes[..8] != b"FJSPRS01"
+        if &bytes[..8] != b"FJSPRS02"
             || hash_bytes(&bytes[..72]) != u64::from_le_bytes(bytes[72..].try_into().unwrap())
         {
             return Err("Invalid sparse index header".into());
@@ -320,7 +423,7 @@ impl Store {
         Ok(())
     }
     #[cfg(test)]
-    pub(super) fn corrupt(&mut self, offset: u64) {
+    pub(crate) fn corrupt(&mut self, offset: u64) {
         self.write_at(offset, &[0xaa], &|| false).unwrap();
     }
 }

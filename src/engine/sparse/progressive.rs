@@ -8,11 +8,13 @@ pub struct OpenOptions {
     pub cache_dir: Option<PathBuf>,
     /// Byte progress inside giant scalar values; it is not a committed frontier.
     pub progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Publish independent immutable read views for the S5 interactive lane.
+    pub live_views: bool,
 }
 
 pub struct CopiedValue {
     pub text: String,
-    _lease: Reservation,
+    pub(super) _lease: Reservation,
 }
 
 pub struct PublishedPage {
@@ -37,6 +39,7 @@ pub struct Event {
     pub reused: bool,
     pub resumed: bool,
     pub message: Option<String>,
+    pub view: Option<Box<SparseIndex>>,
 }
 pub(super) struct Checkpoint {
     pub source_len: u64,
@@ -48,10 +51,10 @@ pub(super) struct Checkpoint {
 impl Checkpoint {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(64 * 1024);
-        bytes.extend_from_slice(b"FJST0001");
+        bytes.extend_from_slice(b"FJST0002");
         let mut word = |n: u64| bytes.extend_from_slice(&n.to_le_bytes());
         for n in [
-            1,
+            2,
             self.source_len,
             self.index_len,
             self.position,
@@ -84,7 +87,7 @@ impl Checkpoint {
         bytes
     }
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() < 56 || &bytes[..8] != b"FJST0001" {
+        if bytes.len() < 56 || &bytes[..8] != b"FJST0002" {
             return Err("Invalid checkpoint format".into());
         }
         let mut pos = 8;
@@ -93,7 +96,7 @@ impl Checkpoint {
             pos += 8;
             Ok(u64::from_le_bytes(b.try_into().unwrap()))
         };
-        if word()? != 1 {
+        if word()? != 2 {
             return Err("Unsupported scanner semantics".into());
         }
         let source_len = word()?;
@@ -186,6 +189,9 @@ pub(super) struct Publisher<'a> {
     pub first: Vec<Node>,
     pub resumed: bool,
     pub reused: bool,
+    pub source: &'a std::sync::Arc<Snapshot>,
+    pub live: bool,
+    pub pending_view: Option<Box<SparseIndex>>,
 }
 impl Publisher<'_> {
     pub(super) fn event(
@@ -214,6 +220,7 @@ impl Publisher<'_> {
             reused: self.reused,
             resumed: self.resumed,
             message,
+            view: self.pending_view.take(),
         })
     }
     pub(super) fn safe(
@@ -255,6 +262,12 @@ impl Publisher<'_> {
             self.last_commit = pos;
         }
         if first_page || force || pos.saturating_sub(self.last_progress) >= 1024 * 1024 {
+            if self.live
+                && root_kind == Some(Kind::Array)
+                && (force || first_page || self.last_commit == pos)
+            {
+                self.pending_view = Some(Box::new(self.freeze(scanner)?));
+            }
             let page = if first_page {
                 Some(published(
                     scanner.snapshot,
@@ -279,11 +292,58 @@ impl Publisher<'_> {
         }
         Ok(())
     }
+    fn freeze(&self, scanner: &Scanner<'_>) -> Result<SparseIndex, String> {
+        let frame = scanner.stack.first().ok_or("No progressive root frame")?;
+        let mut record = frame.record;
+        record[3] = scanner.reader.pos;
+        let mut store = scanner.store.fork(self.budget, scanner.cancelled)?;
+        store.put(frame.offset, record, scanner.cancelled)?;
+        let root = Node {
+            session: self.session,
+            start: record[2],
+            end: record[3],
+            kind: Kind::decode(record[1])?,
+            container: frame.offset,
+            count: record[4],
+        };
+        let header = [
+            2,
+            2,
+            self.source.len,
+            root.kind.code(),
+            root.start,
+            root.end,
+            root.container,
+            root.count,
+        ];
+        store.commit(header, scanner.cancelled)?;
+        let state = self.budget.reserve(
+            Resource::Memory,
+            64 * 1024,
+            "immutable interactive session metadata",
+        )?;
+        Ok(SparseIndex {
+            snapshot: self.source.clone(),
+            store,
+            budget: self.budget.clone(),
+            root,
+            header,
+            _state: state,
+            _cache: None,
+            complete: false,
+        })
+    }
     pub(super) fn restored_page(&mut self, scanner: &mut Scanner<'_>) -> Result<(), String> {
         let Some(frame) = scanner.stack.first() else {
             return Ok(());
         };
-        if Kind::decode(frame.record[1])? != Kind::Array || frame.record[4] == 0 {
+        if Kind::decode(frame.record[1])? != Kind::Array {
+            return Ok(());
+        }
+        if self.live {
+            self.pending_view = Some(Box::new(self.freeze(scanner)?));
+        }
+        if frame.record[4] == 0 {
             return Ok(());
         }
         let count = frame.record[4].min(64);
@@ -422,27 +482,13 @@ impl SparseIndex {
                 *label = format!("[{}]", start + i as u64);
             }
         } else if parent.kind == Kind::Object {
-            let container = self.store.get(parent.container, cancelled)?;
-            let mut cursor = container[5];
-            for ordinal in 0..start + published.nodes.len() as u64 {
-                let record = self.store.get(cursor, cancelled)?;
-                if ordinal >= start {
-                    let mut reader = Reader::new(&self.snapshot)?.with_cancellation(cancelled);
-                    reader.pos = record[9];
-                    reader.expect(b'"')?;
-                    let mut label = String::with_capacity(644);
-                    for _ in 0..160 {
-                        match reader.character()? {
-                            Some(c) => label.push(c),
-                            None => break,
-                        }
-                    }
-                    if reader.pos < record[10] {
-                        label.push('…');
-                    }
-                    published.labels[(ordinal - start) as usize] = label;
+            for (i, label) in published.labels.iter_mut().enumerate() {
+                let (mut text, truncated) =
+                    self.key_at(parent, start + i as u64, 640, cancelled)?;
+                if truncated {
+                    text.push('…');
                 }
-                cursor = record[5];
+                *label = text;
             }
         }
         Ok(published)
@@ -488,6 +534,7 @@ pub fn open_progressive(
         reused: false,
         resumed: false,
         message: None,
+        view: None,
     })?;
     let result = build(path, budget, options, session, generation, cancelled, emit);
     if let Err(error) = &result {
@@ -508,6 +555,7 @@ pub fn open_progressive(
             reused: false,
             resumed: false,
             message: Some(error.clone()),
+            view: None,
         });
     }
     result
@@ -537,17 +585,18 @@ fn build(
             checkpoint = cache.load(cancelled)?;
         }
         if checkpoint.is_some() {
-            Snapshot::cached(&cache.source_path(), &budget)?
+            Snapshot::cached_with_disk(&cache.source_path(), &budget, cache.detach_source()?)?
         } else {
             cache.reset()?;
             let temp = Snapshot::copy(path, &|| cancelled(), &LoadProgress::default(), &budget)?;
             cache.save_source(&temp, cancelled)?;
             drop(temp);
-            Snapshot::cached(&cache.source_path(), &budget)?
+            Snapshot::cached_with_disk(&cache.source_path(), &budget, cache.detach_source()?)?
         }
     } else {
         Snapshot::copy(path, &|| cancelled(), &LoadProgress::default(), &budget)?
     };
+    let snapshot = std::sync::Arc::new(snapshot);
     let mut store = Store::new(&budget, cancelled)?;
     if let Some(cp) = &checkpoint
         && (cp.source_len != snapshot.len
@@ -575,6 +624,9 @@ fn build(
         first: Vec::with_capacity(64),
         resumed,
         reused,
+        source: &snapshot,
+        live: options.live_views,
+        pending_view: None,
     };
     let root = if let Some(cp) = checkpoint.as_mut().filter(|cp| cp.root.is_some()) {
         let mut root = cp.root.unwrap();
@@ -613,8 +665,8 @@ fn build(
         return Err(tail.error("trailing characters"));
     }
     let header = [
-        1,
-        1,
+        2,
+        2,
         snapshot.len,
         root.kind.code(),
         root.start,
@@ -643,13 +695,14 @@ fn build(
     }
     drop(tail);
     let mut index = SparseIndex {
-        snapshot,
+        snapshot: snapshot.clone(),
         store,
         budget: budget.clone(),
         root,
         header,
         _state: state,
         _cache: None,
+        complete: true,
     };
     let page = if root.kind.container() {
         index.published_children(root, 0, cancelled)?

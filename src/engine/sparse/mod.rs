@@ -1,8 +1,11 @@
 //! Experimental S3 scanner. Only containers/checkpoints/fields live on disk;
 //! scalar array elements have no permanent record. No GUI/default-backend integration.
 mod cache;
+mod directory;
+mod navigation;
+pub use navigation::RawSelection;
 mod progressive;
-mod store;
+pub(crate) mod store;
 use crate::{
     document::{
         LoadProgress,
@@ -114,13 +117,14 @@ impl Page {
 }
 
 pub struct SparseIndex {
-    snapshot: Snapshot,
+    snapshot: std::sync::Arc<Snapshot>,
     store: Store,
     budget: BudgetManager,
     root: Node,
     header: [u64; 8],
     _state: Reservation,
     _cache: Option<cache::Cache>,
+    complete: bool,
 }
 impl SparseIndex {
     pub fn open(
@@ -133,7 +137,12 @@ impl SparseIndex {
             std::mem::size_of::<Self>() + 1024,
             "sparse session metadata",
         )?;
-        let snapshot = Snapshot::copy(path, &|| cancelled(), &LoadProgress::default(), &budget)?;
+        let snapshot = std::sync::Arc::new(Snapshot::copy(
+            path,
+            &|| cancelled(),
+            &LoadProgress::default(),
+            &budget,
+        )?);
         let mut store = Store::new(&budget, cancelled)?;
         let session = SessionId::fresh();
         let root =
@@ -145,8 +154,8 @@ impl SparseIndex {
             return Err(tail.error("trailing characters"));
         }
         let header = [
-            1,
-            1,
+            2,
+            2,
             snapshot.len,
             root.kind.code(),
             root.start,
@@ -163,6 +172,7 @@ impl SparseIndex {
             header,
             _state: state,
             _cache: None,
+            complete: true,
         })
     }
     pub fn root(&self) -> Node {
@@ -174,7 +184,7 @@ impl SparseIndex {
     pub fn source_bytes(&self) -> u64 {
         self.snapshot.len
     }
-    fn validate(&mut self, node: Node, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+    fn validate(&self, node: Node, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
         if node.session != self.root.session {
             return Err("Node belongs to a different sparse session".into());
         }
@@ -311,65 +321,29 @@ impl SparseIndex {
         nodes.try_reserve_exact(count).map_err(|e| e.to_string())?;
         let mut lease = lease;
         lease.resize(nodes.capacity() * std::mem::size_of::<Node>())?;
-        let container = self.store.get(parent.container, cancelled)?;
         if count != 0 && parent.kind == Kind::Object {
-            let mut cursor = container[5];
-            for index in 0..ordinal + count as u64 {
-                let r = self.store.get(cursor, cancelled)?;
-                if r[0] != 3 || r[8] != parent.container || r[6] != index {
-                    return Err("Invalid sparse object page link".into());
-                }
-                if index >= ordinal {
-                    nodes.push(self.field_node(r, cancelled)?);
-                }
-                cursor = r[5];
+            for index in ordinal..ordinal + count as u64 {
+                let r = self.object_record(parent, index, cancelled)?;
+                nodes.push(self.field_node(r, cancelled)?);
             }
         } else if count != 0 {
-            let mut cursor = container[5];
-            let mut position = parent.start + 1;
-            let mut index = 0;
-            let mut previous = None;
-            while cursor != NONE {
-                let r = self.store.get(cursor, cancelled)?;
-                if r[0] != 2
-                    || r[8] != parent.container
-                    || r[4] >= parent.count
-                    || (previous.is_none() && r[4] != 0)
-                    || previous.is_some_and(|n| r[4] <= n)
-                    || r[2] < parent.start
-                    || r[2] >= parent.end
-                {
-                    return Err("Invalid sparse array checkpoint".into());
-                }
-                if r[4] > ordinal {
-                    break;
-                }
-                previous = Some(r[4]);
-                index = r[4];
-                position = r[2];
-                cursor = r[5];
-            }
+            let (mut position, mut index, _) =
+                self.array_boundary(parent, ordinal, false, cancelled)?;
+            let mut scan = Scanner::new(
+                &self.snapshot,
+                &mut self.store,
+                &self.budget,
+                self.root.session,
+                cancelled,
+                false,
+            )?;
             while index < ordinal + count as u64 {
-                let node = Scanner::new(
-                    &self.snapshot,
-                    &mut self.store,
-                    &self.budget,
-                    self.root.session,
-                    cancelled,
-                    false,
-                )?
-                .run(position)?;
+                let node = scan.indexed_node(position)?;
                 if index >= ordinal {
-                    nodes.push(self.resolve(node, cancelled)?);
+                    nodes.push(node);
                 }
+                position = scan.next_array_boundary(node, parent, index)?;
                 index += 1;
-                let mut reader = Reader::new(&self.snapshot)?.with_cancellation(cancelled);
-                reader.pos = node.end;
-                whitespace(&mut reader, cancelled)?;
-                if index < parent.count {
-                    reader.expect(b',')?;
-                }
-                position = reader.pos;
             }
         }
         let end = ordinal + count as u64;
@@ -438,6 +412,9 @@ impl SparseIndex {
         output: &mut dyn Write,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
+        if !self.complete {
+            return Err("Pending: complete document validation is required for output".into());
+        }
         self.validate(node, cancelled)?;
         let _lease =
             self.budget
@@ -653,6 +630,10 @@ impl<'a> Scanner<'a> {
             record[5] = NONE;
             record[6] = NONE;
             record[7] = NONE;
+            record[8] = self.stack.last().map_or(NONE, |f| f.offset);
+            record[9] = 1;
+            record[10] = NONE;
+            record[11] = self.stack.last().map_or(0, |f| f.record[4]);
             let offset = if self.index {
                 let hash = container_hash(start);
                 record[7] = self.store.head(hash, self.cancelled)?;
@@ -699,6 +680,11 @@ impl<'a> Scanner<'a> {
         }))
     }
     fn attach(&mut self, node: Node) -> Result<(), String> {
+        let weight = if self.index && node.kind.container() {
+            self.store.get(node.container, self.cancelled)?[9]
+        } else {
+            1
+        };
         let frame = self.stack.last_mut().unwrap();
         if frame.record[1] == Kind::Object.code() && self.index {
             let [key_start, key_end, hash] = frame.key;
@@ -724,6 +710,27 @@ impl<'a> Scanner<'a> {
                         self.cancelled,
                     )?
                 {
+                    let previous = self
+                        .store
+                        .directory_find(frame.record[10], r[6], false, self.cancelled)?
+                        .ok_or("Missing object ordinal")?;
+                    if previous[1] != r[6] {
+                        return Err("Object ordinal mismatch".into());
+                    }
+                    frame.record[9] = frame.record[9]
+                        .checked_sub(previous[7])
+                        .and_then(|n| n.checked_add(weight))
+                        .ok_or("Subtree count overflow")?;
+                    frame.record[10] = self.store.directory_put(
+                        frame.record[10],
+                        [r[6], cursor, weight, 0, 0],
+                        self.cancelled,
+                    )?;
+                    if node.kind.container() {
+                        let mut child = self.store.get(node.container, self.cancelled)?;
+                        child[11] = r[6];
+                        self.store.put(node.container, child, self.cancelled)?;
+                    }
                     r[1] = node.kind.code();
                     r[2] = node.start;
                     r[3] = node.end;
@@ -757,7 +764,15 @@ impl<'a> Scanner<'a> {
                 self.store.put(frame.record[6], last, self.cancelled)?;
             }
             frame.record[6] = offset;
+            frame.record[10] = self.store.directory_put(
+                frame.record[10],
+                [r[6], offset, weight, 0, 0],
+                self.cancelled,
+            )?;
         }
+        frame.record[9] = frame.record[9]
+            .checked_add(weight)
+            .ok_or("Subtree count overflow")?;
         frame.record[4] = frame.record[4]
             .checked_add(1)
             .ok_or("Sparse child count overflow")?;
@@ -863,11 +878,17 @@ impl<'a> Scanner<'a> {
                 {
                     let mut r = [0; 12];
                     r[0] = 2;
+                    r[1] = frame.record[9] - 1;
                     r[2] = self.reader.pos;
                     r[4] = frame.record[4];
                     r[5] = NONE;
                     r[8] = frame.offset;
                     let offset = self.store.append(r, self.cancelled)?;
+                    frame.record[10] = self.store.directory_put(
+                        frame.record[10],
+                        [r[4], offset, 0, r[1], 0],
+                        self.cancelled,
+                    )?;
                     if frame.record[6] == NONE {
                         frame.record[5] = offset;
                     } else {

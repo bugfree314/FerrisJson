@@ -141,6 +141,22 @@ impl Cache {
     pub(super) fn source_path(&self) -> PathBuf {
         self.dir.join("source.bin")
     }
+    pub(super) fn detach_source(&mut self) -> Result<Reservation, String> {
+        let bytes = fs::metadata(self.source_path())
+            .map_err(|e| e.to_string())?
+            .len() as usize;
+        let mut lease =
+            self.budget
+                .reserve(Resource::Disk, 0, "shared persistent source snapshot")?;
+        self.disk.resize(
+            self.disk
+                .bytes()
+                .checked_sub(bytes)
+                .ok_or("Cache source accounting mismatch")?,
+        )?;
+        lease.resize(bytes)?;
+        Ok(lease)
+    }
     /// Byte-for-byte equality is stronger than metadata or sampling, and costs
     /// one full source/cache read. The cache snapshot stays open for the session.
     pub(super) fn matches(
@@ -247,7 +263,7 @@ impl Cache {
         let mut entries = [(0u64, 0usize, 0u64); 2];
         for (slot, entry) in entries.iter_mut().enumerate() {
             let b = &bytes[slot * 32..slot * 32 + 32];
-            if &b[..8] == b"FJCM0001"
+            if &b[..8] == b"FJCM0002"
                 && hash_bytes(&b[..24]) == u64::from_le_bytes(b[24..].try_into().unwrap())
             {
                 *entry = (
@@ -351,7 +367,7 @@ impl Cache {
             .checked_add(1)
             .ok_or("Cache commit sequence overflow")?;
         let mut entry = [0u8; 32];
-        entry[..8].copy_from_slice(b"FJCM0001");
+        entry[..8].copy_from_slice(b"FJCM0002");
         entry[8..16].copy_from_slice(&seq.to_le_bytes());
         entry[16..24].copy_from_slice(&hash_bytes(&bytes).to_le_bytes());
         let sum = hash_bytes(&entry[..24]);
