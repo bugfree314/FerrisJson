@@ -5,6 +5,7 @@
 )]
 
 mod app;
+mod search_worker;
 mod sparse_app;
 mod tree_app;
 mod tree_worker;

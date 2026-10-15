@@ -11,3 +11,5 @@ pub use crate::document::Document as Session;
 
 /// Experimental S3 disk-backed sparse scanner; not used by the GUI.
 pub mod sparse;
+
+pub mod search;

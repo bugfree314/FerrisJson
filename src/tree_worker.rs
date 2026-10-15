@@ -1,4 +1,4 @@
-//! One builder, one interactive lane, one output lane. Latest read view/frame,
+//! One builder, one interactive lane, one search lane, one output lane. Latest read view/frame,
 //! bounded commands, independent output; never a thread per click.
 use crate::{
     document::{Document, LoadProgress},
@@ -42,11 +42,26 @@ pub struct Status {
 enum Request {
     Navigation(Navigation),
     Output(Location, Option<PathBuf>, bool),
+    SearchWake,
+    SearchPage(u64, u64),
+    SearchExport(
+        PathBuf,
+        bool,
+        Option<u64>,
+        crate::engine::search::ResultStore,
+    ),
 }
 enum Job {
     Copy(OutputSelection),
     Export(OutputSelection, PathBuf),
     Path(String, Reservation),
+    Search(
+        crate::engine::search::Input,
+        crate::engine::search::ResultStore,
+        PathBuf,
+        bool,
+        Option<u64>,
+    ),
 }
 struct Inbox {
     provider: Option<Box<dyn Provider>>,
@@ -58,10 +73,12 @@ struct Inbox {
     path_copy: Option<(String, Reservation)>,
     notice: String,
     output_busy: bool,
+    search_page: Option<SearchPage>,
     _queues: Reservation,
 }
 type Shared = Arc<(Mutex<Inbox>, Condvar)>;
 pub struct Task {
+    pub search: crate::search_worker::SearchHub,
     shared: Shared,
     pub epoch: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -69,7 +86,20 @@ pub struct Task {
     threads: Vec<JoinHandle<()>>,
     budget: BudgetManager,
 }
+pub struct SearchRow {
+    pub index: u64,
+    pub path: String,
+    pub preview: String,
+}
+pub struct SearchPage {
+    pub generation: u64,
+    pub start: u64,
+    pub count: u64,
+    pub rows: Vec<SearchRow>,
+    _lease: Reservation,
+}
 pub struct Poll {
+    pub search_page: Option<SearchPage>,
     pub frame: Option<(u64, Result<TreeFrame, String>)>,
     pub status: Status,
     pub clipboard: Option<Clipboard>,
@@ -105,6 +135,7 @@ impl Task {
                 path_copy: None,
                 notice: String::new(),
                 output_busy: false,
+                search_page: None,
                 _queues: queues,
             }),
             Condvar::new(),
@@ -112,6 +143,13 @@ impl Task {
         let epoch = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU64::new(0));
+        let wake_shared = shared.clone();
+        let (search, search_thread) = crate::search_worker::SearchHub::new(
+            &budget,
+            stop.clone(),
+            ctx.clone(),
+            Arc::new(move || wake_shared.1.notify_all()),
+        )?;
         let build_shared = shared.clone();
         let build_epoch = epoch.clone();
         let build_stop = stop.clone();
@@ -262,6 +300,7 @@ impl Task {
         let worker_epoch = epoch.clone();
         let worker_stop = stop.clone();
         let worker_ctx = ctx.clone();
+        let worker_search = search.clone();
         let interactive = std::thread::spawn(move || {
             let mut navigator: Option<Navigator> = None;
             loop {
@@ -269,6 +308,7 @@ impl Task {
                     let mut inbox = worker_shared.0.lock().unwrap();
                     while inbox.provider.is_none()
                         && (inbox.commands.is_empty() || navigator.is_none())
+                        && !worker_search.selection_ready()
                         && !worker_stop.load(Ordering::Relaxed)
                         && !matches!(
                             inbox.status.state,
@@ -336,6 +376,60 @@ impl Task {
                                 )
                             );
                             let result = match command {
+                                Request::SearchWake => Ok(()),
+                                Request::SearchPage(generation, start) => (|| {
+                                    if *generation != worker_search.generation() {
+                                        return Ok(());
+                                    }
+                                    let store = worker_search.store().ok_or("No search results")?;
+                                    let count = store.state().count;
+                                    let lease = nav.tree.provider.budget().reserve(
+                                        Resource::Memory,
+                                        64 * 1024,
+                                        "bounded search result presentation page",
+                                    )?;
+                                    let mut rows = Vec::with_capacity(16);
+                                    let page_cancel =
+                                        || cancelled() || *generation != worker_search.generation();
+                                    for index in *start..start.saturating_add(16).min(count) {
+                                        let loc = store.location(index, &page_cancel)?;
+                                        let loc = nav.tree.normalize(&loc, &page_cancel)?;
+                                        rows.push(SearchRow {
+                                            index,
+                                            path: nav.tree.path(&loc, 512, false, &page_cancel)?,
+                                            preview: nav.tree.provider.preview(
+                                                loc.node,
+                                                160,
+                                                &page_cancel,
+                                            )?,
+                                        });
+                                    }
+                                    if !page_cancel() {
+                                        worker_shared.0.lock().unwrap().search_page =
+                                            Some(SearchPage {
+                                                generation: *generation,
+                                                start: *start,
+                                                count,
+                                                rows,
+                                                _lease: lease,
+                                            });
+                                    }
+                                    Ok(())
+                                })(
+                                ),
+                                Request::SearchExport(path, paths, prefix, store) => (|| {
+                                    let input = nav.tree.provider.search_input()?;
+                                    worker_shared.0.lock().unwrap().job = Some(Job::Search(
+                                        input,
+                                        store.clone(),
+                                        path.clone(),
+                                        *paths,
+                                        *prefix,
+                                    ));
+                                    worker_shared.1.notify_all();
+                                    Ok(())
+                                })(
+                                ),
                                 Request::Navigation(command) => {
                                     if reset {
                                         with_io_context(
@@ -420,11 +514,32 @@ impl Task {
                             }
                             if let Err(e) = result {
                                 inbox.notice = bounded(e);
-                                if matches!(command, Request::Output(..)) {
+                                if matches!(
+                                    command,
+                                    Request::Output(..) | Request::SearchExport(..)
+                                ) {
                                     inbox.output_busy = false;
                                 }
                             }
                             drop(inbox);
+                        }
+                        if worker_search.pending() && nav.tree.provider.complete() {
+                            worker_search.dispatch(nav.tree.provider.search_input()?);
+                        }
+                        if let Some((generation, index, store)) = worker_search.take_selection() {
+                            let selection_cancel =
+                                || cancelled() || worker_search.generation() != generation;
+                            let result = store.location(index, &selection_cancel).and_then(|loc| {
+                                nav.apply(Navigation::Reveal(loc), &selection_cancel)
+                            });
+                            if result.is_ok() {
+                                worker_search.accept(generation, index);
+                            } else if selection_cancel() {
+                                return Ok(None);
+                            } else {
+                                worker_search.cancel_selection();
+                                return result.map(|_| None);
+                            }
                         }
                         if cancelled() {
                             return Ok(None);
@@ -486,6 +601,31 @@ impl Task {
                     Priority::User,
                     Cancellation::Flag(output_stop.clone()),
                     || match job {
+                        Job::Search(input, store, path, paths, prefix) => {
+                            crate::engine::search::output::export(
+                                input,
+                                &store,
+                                &path,
+                                paths,
+                                prefix,
+                                &output_stop,
+                            )
+                            .map(|()| {
+                                (
+                                    None,
+                                    None,
+                                    format!(
+                                        "Exported {} search results to {}",
+                                        if prefix.is_some() {
+                                            "partial"
+                                        } else {
+                                            "complete"
+                                        },
+                                        path.display()
+                                    ),
+                                )
+                            })
+                        }
                         Job::Copy(selection) => selection
                             .copy(&cancelled)
                             .map(|clip| (Some(clip), None, "Copied complete JSON".into())),
@@ -514,18 +654,98 @@ impl Task {
             }
         });
         Ok(Self {
+            search,
             shared,
             epoch,
             stop,
             progress,
-            threads: vec![builder, interactive, output],
+            threads: vec![builder, interactive, output, search_thread],
             budget,
         })
     }
     pub fn budget(&self) -> BudgetManager {
         self.budget.clone()
     }
+    pub fn search_query(
+        &self,
+        query: crate::engine::search::Query,
+        reverse: bool,
+    ) -> Result<(), String> {
+        self.search.request(query, reverse)?;
+        let mut b = self.shared.0.lock().unwrap();
+        b.commands
+            .retain(|(_, c)| matches!(c, Request::Output(..) | Request::SearchExport(..)));
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        b.commands
+            .push_back((epoch, Request::Navigation(Navigation::CancelPending)));
+        b.commands.push_back((epoch, Request::SearchWake));
+        drop(b);
+        self.shared.1.notify_all();
+        Ok(())
+    }
+    pub fn search_match(&self, forward: bool, count: u64) {
+        self.search.next(forward, count);
+    }
+    pub fn search_select(&self, index: u64) {
+        self.search.select(index);
+    }
+    pub fn search_page(&self, start: u64) {
+        let mut b = self.shared.0.lock().unwrap();
+        b.commands
+            .retain(|(_, c)| !matches!(c, Request::SearchPage(..)));
+        if b.commands.len() < 16 {
+            let epoch = self.epoch.load(Ordering::Relaxed);
+            b.commands
+                .push_back((epoch, Request::SearchPage(self.search.generation(), start)));
+        }
+        drop(b);
+        self.shared.1.notify_all();
+    }
+    pub fn search_export(&self, path: PathBuf, paths: bool, partial: bool) -> Result<(), String> {
+        let store = self.search.store().ok_or("No search results")?;
+        let prefix = partial.then(|| store.state().count);
+        let mut b = self.shared.0.lock().unwrap();
+        if b.output_busy || b.commands.len() >= 16 {
+            return Err("Output lane is busy".into());
+        }
+        b.output_busy = true;
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        b.commands
+            .push_back((epoch, Request::SearchExport(path, paths, prefix, store)));
+        drop(b);
+        self.shared.1.notify_all();
+        Ok(())
+    }
+    pub fn search_clear(&self, cancel: bool) {
+        if cancel {
+            self.search.cancel();
+        } else {
+            self.search.clear();
+        }
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+        let mut b = self.shared.0.lock().unwrap();
+        b.search_page = None;
+        b.commands
+            .retain(|(_, c)| !matches!(c, Request::SearchPage(..)));
+        drop(b);
+        self.shared.1.notify_all();
+    }
     pub fn command(&self, command: Navigation) -> Result<(), String> {
+        if matches!(
+            command,
+            Navigation::Select(_)
+                | Navigation::Move(_)
+                | Navigation::First
+                | Navigation::Last
+                | Navigation::Row(_)
+                | Navigation::Left(_)
+                | Navigation::Right(_)
+                | Navigation::History(_)
+                | Navigation::CancelPending
+        ) {
+            self.search.cancel_selection();
+        }
+
         let mut inbox = self.shared.0.lock().unwrap();
         if matches!(
             inbox.status.state,
@@ -544,7 +764,7 @@ impl Task {
         ) {
             inbox
                 .commands
-                .retain(|(_, c)| matches!(c, Request::Output(..)));
+                .retain(|(_, c)| matches!(c, Request::Output(..) | Request::SearchExport(..)));
         }
         if matches!(command, Navigation::Anchor(_)) {
             inbox
@@ -591,6 +811,7 @@ impl Task {
             status.done = status.done.max(self.progress.load(Ordering::Relaxed));
         }
         Poll {
+            search_page: inbox.search_page.take(),
             frame: inbox.frame.take(),
             status,
             clipboard: inbox.clipboard.take(),
@@ -600,6 +821,7 @@ impl Task {
     }
     pub fn cancel(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.search.stop();
         self.epoch.fetch_add(1, Ordering::Relaxed);
         let mut inbox = self.shared.0.lock().unwrap();
         inbox.status.state = SessionStatus::Cancelled;
@@ -693,6 +915,199 @@ mod tests {
             assert!(Instant::now() < deadline, "worker timed out: {}", p.notice);
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    #[test]
+    fn search_backpressure_latest_query_navigation_pages_and_retirement() {
+        let input = Input::new(format!(
+            "[{}]",
+            std::iter::repeat_n("0", 10_000)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        let task = Task::new(
+            input.0.clone(),
+            Backend::Sparse(OpenOptions::default()),
+            egui::Context::default(),
+        )
+        .unwrap();
+        let frame = wait(&task, |f| f.exact);
+        drop(frame);
+        task.search_query(
+            crate::engine::search::Query {
+                term: "0".into(),
+                case: true,
+                regex: false,
+                scope: crate::document::SearchScope::Values,
+            },
+            false,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while task.search.store().is_none_or(|s| s.state().count < 385) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        let snap = task.search.poll();
+        assert_eq!(snap.queue_peak, 4);
+        assert_eq!(
+            snap.state.unwrap().status,
+            crate::engine::search::Status::Scanning
+        );
+        for _ in 0..100 {
+            task.search_match(true, 1);
+        }
+        loop {
+            task.search.poll();
+            if let Some((_, Ok(frame))) = task.poll().frame
+                && frame.selection.path == "$[100]"
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        task.search_select(20_000);
+        task.command(Navigation::First).unwrap();
+        task.search_page(9990);
+        loop {
+            let snap = task.search.poll();
+            if snap
+                .state
+                .is_some_and(|s| s.status == crate::engine::search::Status::Completed)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        task.search_page(9990);
+        loop {
+            if let Some(page) = task.poll().search_page
+                && page.count == 10_000
+            {
+                assert_eq!(page.rows.len(), 10);
+                assert_eq!(page.rows[9].path, "$[9999]");
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        task.command(Navigation::First).unwrap();
+        drop(wait(&task, |f| f.selection.path == "$"));
+        task.search_query(crate::engine::search::Query::literal("absent"), true)
+            .unwrap();
+        let generation = task.search.generation();
+        loop {
+            let snap = task.search.poll();
+            assert_eq!(snap.generation, generation);
+            if let Some(state) = snap.state
+                && state.status == crate::engine::search::Status::Completed
+            {
+                assert_eq!(state.count, 0);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let b = task.budget();
+        task.retire().join().unwrap();
+        assert_eq!(b.usage().memory, 0);
+        assert_eq!(b.usage().disk, 0);
+    }
+    #[test]
+    fn cancel_search_while_event_queue_is_full_preserves_partial_and_joins() {
+        let input = Input::new(format!(
+            "[{}]",
+            std::iter::repeat_n("1", 10_000)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        let task = Task::new(
+            input.0.clone(),
+            Backend::Sparse(OpenOptions::default()),
+            egui::Context::default(),
+        )
+        .unwrap();
+        drop(wait(&task, |f| f.exact));
+        task.search_query(crate::engine::search::Query::literal("1"), false)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while task.search.store().is_none_or(|s| s.state().count < 385) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        task.search_clear(true);
+        let store = task.search.store().unwrap();
+        assert_eq!(
+            store.state().status,
+            crate::engine::search::Status::Cancelled
+        );
+        assert!(store.location(0, &|| false).is_ok());
+        let b = task.budget();
+        task.retire().join().unwrap();
+        drop(store);
+        assert_eq!(b.usage().memory, 0);
+        assert_eq!(b.usage().disk, 0);
+    }
+    #[test]
+    fn reverse_matches_wrap_completed_results_and_full_export_runs_in_output_lane() {
+        let input = Input::new(r#"["yes",0,"yes",{"a":"yes"}]"#);
+        let task = Task::new(
+            input.0.clone(),
+            Backend::Sparse(OpenOptions::default()),
+            egui::Context::default(),
+        )
+        .unwrap();
+        drop(wait(&task, |f| f.exact));
+        task.search_query(
+            crate::engine::search::Query {
+                term: "yes".into(),
+                case: true,
+                regex: false,
+                scope: crate::document::SearchScope::Values,
+            },
+            true,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            task.search.poll();
+            if let Some((_, Ok(frame))) = task.poll().frame
+                && frame.selection.path == r#"$[3]["a"]"#
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        task.search_match(true, 1);
+        drop(wait(&task, |f| f.selection.path == "$[0]"));
+        let destination = Input::new("old");
+        task.search_export(destination.0.clone(), false, false)
+            .unwrap();
+        task.search_query(crate::engine::search::Query::literal("0"), false)
+            .unwrap();
+        task.command(Navigation::Last).unwrap();
+        loop {
+            task.search.poll();
+            let poll = task.poll();
+            if poll.notice.starts_with("Exported complete") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", poll.notice);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&destination.0).unwrap(),
+            r#"["yes","yes","yes"]"#
+        );
+        task.search_clear(false);
+        assert!(task.search.store().is_none());
+        let b = task.budget();
+        task.retire().join().unwrap();
+        assert_eq!(b.usage().memory, 0);
+        assert_eq!(b.usage().disk, 0);
     }
     #[test]
     fn legacy_input_budget_rejects_large_files_before_allocating_text() {

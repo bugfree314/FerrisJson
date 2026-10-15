@@ -5,8 +5,7 @@ use crate::engine::{
     session::SessionId,
 };
 
-use super::{Document, Kind, Node, NodeIds, SearchScope, Storage, compact, short};
-use regex::RegexBuilder;
+use super::{Document, Kind, Node, NodeIds, Storage, compact, short};
 use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
@@ -377,33 +376,6 @@ impl<'a> Reader<'a> {
         };
         Ok(Some(character))
     }
-    fn scalar(&mut self, range: Range) -> Result<Value, String> {
-        if range.end - range.start > SUBTREE_LIMIT as u64 {
-            return Err(
-                "Indexed scalar parsing exceeds 256 KiB; use in-memory mode for this search".into(),
-            );
-        }
-        self.pos = range.start;
-        self.peek()?;
-        if range.end <= self.start + self.count as u64 {
-            let start = (range.start - self.start) as usize;
-            serde_json::from_slice(&self.buffer[start..start + (range.end - range.start) as usize])
-                .map_err(|e| e.to_string())
-        } else {
-            // Bound transient decode/serde work before reading. Retained payload is charged
-            // separately and survives eviction while callers retain an Arc.
-            let _workspace = self.source.budget.reserve(
-                Resource::Memory,
-                SUBTREE_LIMIT * 32,
-                "subtree decode workspace",
-            )?;
-            let mut bytes = vec![0; (range.end - range.start) as usize];
-            self.source
-                .read(range.start, &mut bytes)
-                .map_err(|e| e.to_string())?;
-            serde_json::from_slice(&bytes).map_err(|e| e.to_string())
-        }
-    }
 }
 #[derive(Clone, Copy)]
 struct Range {
@@ -637,112 +609,36 @@ impl Store {
         }
         Ok(())
     }
-    pub(super) fn search(
+    pub(super) fn search_visit(
         &self,
         doc: &Document,
-        term: &str,
-        case: bool,
-        regex: bool,
-        scope: SearchScope,
-        cancelled: impl Fn() -> bool,
-    ) -> Result<NodeIds, String> {
-        if term.len() > 1024 * 1024 {
-            return Err("Indexed search term exceeds 1 MiB budget".into());
-        }
-        let matcher = RegexBuilder::new(&if regex {
-            term.to_owned()
-        } else {
-            regex::escape(term)
-        })
-        .case_insensitive(!case)
-        .build()
-        .map_err(|e| format!("Invalid regular expression: {e}"))?;
-        let _keys_workspace =
-            doc.budget
-                .reserve(Resource::Memory, doc.keys.len(), "search key matches")?;
-        let mut keys = Vec::new();
-        if scope != SearchScope::Values {
-            keys.reserve(doc.keys.len());
-            for (index, key) in doc.keys.iter().enumerate() {
-                if index % 1024 == 0 && cancelled() {
-                    return Err("Search cancelled".into());
-                }
-                keys.push(matcher.is_match(key));
-            }
-        }
-        let array_keys = regex || term.bytes().all(|byte| byte.is_ascii_digit());
-        let mut reader = Reader::new(&self.source)?.with_cancellation(&cancelled);
-        let mut ids = NodeIds::new(&doc.budget);
+        matcher: &crate::engine::search::Matcher,
+        cancel: &dyn Fn() -> bool,
+        visit: &mut dyn FnMut(usize, bool) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut reader = Reader::new(&self.source)?.with_cancellation(cancel);
         for (id, node) in doc.nodes.iter().enumerate() {
-            if id % 1024 == 0 && cancelled() {
+            if cancel() {
                 return Err("Search cancelled".into());
             }
-            let key_match = scope != SearchScope::Values
-                && match node.parent() {
-                    None => matcher.is_match("$"),
-                    Some(parent) if matches!(doc.nodes[parent].kind, Kind::Array) => {
-                        array_keys && matcher.is_match(&node.segment.to_string())
-                    }
-                    _ => keys[node.segment as usize],
-                };
-            let value_match = if key_match || scope == SearchScope::Keys {
+            let key = matcher.keys() && matcher.text(&doc.key(id));
+            let value = if key || !matcher.values() {
                 false
             } else {
                 match node.kind {
                     Kind::Object | Kind::Array => false,
-                    Kind::Null => matcher.is_match("null"),
-                    Kind::Boolean | Kind::Number => {
-                        let value = reader.scalar(self.ranges[id])?;
-                        match &value {
-                            Value::Number(number) => matcher.is_match(number.as_str()),
-                            _ => matcher.is_match(&value.to_string()),
-                        }
-                    }
-                    Kind::String if regex => {
-                        if self.ranges[id].end - self.ranges[id].start > SUBTREE_LIMIT as u64 {
-                            return Err("Indexed regex search requires strings <=256 KiB; use in-memory mode for larger values".into());
-                        }
-                        let value = reader.scalar(self.ranges[id])?;
-                        matcher.is_match(value.as_str().unwrap())
-                    }
-                    Kind::String => {
-                        reader.pos = self.ranges[id].start;
-                        reader.expect(b'"')?;
-                        let mut window = String::new();
-                        let mut added = 0;
-                        let overlap = term.chars().count() * 4;
-                        let mut matched = false;
-                        while let Some(character) = reader.character()? {
-                            window.push(character);
-                            added += character.len_utf8();
-                            if added >= BLOCK {
-                                if cancelled() {
-                                    return Err("Search cancelled".into());
-                                }
-                                if matcher.is_match(&window) {
-                                    matched = true;
-                                    break;
-                                }
-                                let mut start = window.len().saturating_sub(overlap);
-                                while !window.is_char_boundary(start) {
-                                    start -= 1;
-                                }
-                                window.drain(..start);
-                                added = 0;
-                            }
-                        }
-                        matched || matcher.is_match(&window)
-                    }
+                    Kind::Boolean | Kind::Null | Kind::Number | Kind::String => matcher.range(
+                        &mut reader,
+                        self.ranges[id].start,
+                        self.ranges[id].end,
+                        matches!(node.kind, Kind::String),
+                        cancel,
+                    )?,
                 }
             };
-            if key_match || value_match {
-                if ids.len() == ids.capacity() {
-                    ids.reserve_exact(ids.capacity().max(1024).min(doc.nodes.len() - ids.len()))?;
-                }
-                ids.push(id as u32)?;
-            }
+            visit(id, key || value)?;
         }
-        Ok(ids)
+        Ok(())
     }
 }
 
@@ -1467,6 +1363,7 @@ pub(super) fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::SearchScope;
     struct Input(PathBuf);
     impl Input {
         fn new(bytes: &[u8]) -> Self {

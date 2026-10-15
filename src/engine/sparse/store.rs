@@ -8,7 +8,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 pub(crate) const HEADER: u64 = 80;
@@ -19,9 +22,9 @@ pub(crate) type Record = [u64; 12];
 
 pub(crate) struct Store {
     file: Option<File>,
-    path: Option<PathBuf>,
+    owner: Arc<Owner>,
     len: u64,
-    lease: Reservation,
+    readonly: bool,
     _directory_stack: Reservation,
     undo: Option<Undo>,
 }
@@ -30,15 +33,43 @@ struct Undo {
     records: Vec<(u64, Record)>,
     lease: Reservation,
 }
-impl Drop for Store {
+struct Owner {
+    path: Option<PathBuf>,
+    disk: Mutex<Reservation>,
+}
+impl Drop for Owner {
     fn drop(&mut self) {
-        self.file.take();
         if let Some(path) = &self.path {
             let _ = fs::remove_file(path);
         }
     }
 }
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.file.take();
+    }
+}
 impl Store {
+    pub(crate) fn read_view(&self, budget: &BudgetManager) -> Result<Self, String> {
+        Ok(Self {
+            file: Some(
+                self.file
+                    .as_ref()
+                    .unwrap()
+                    .try_clone()
+                    .map_err(|e| e.to_string())?,
+            ),
+            owner: self.owner.clone(),
+            len: self.len,
+            readonly: true,
+            _directory_stack: budget.reserve(
+                Resource::Memory,
+                64 * 1024,
+                "independent index reader workspace",
+            )?,
+            undo: None,
+        })
+    }
     /// Immutable checkpoint copy. The caller reserves persistent disk space
     /// before entering; the scratch copy and live index remain separately charged.
     pub(crate) fn save(
@@ -84,7 +115,10 @@ impl Store {
         {
             return Err("Invalid checkpoint index length".into());
         }
-        self.lease
+        self.owner
+            .disk
+            .lock()
+            .unwrap()
             .resize(usize::try_from(expected).map_err(|_| "Index length overflow")?)?;
         let _lease = budget.reserve(Resource::Memory, 64 * 1024, "index restore buffer")?;
         let mut bytes = vec![0; 64 * 1024];
@@ -159,9 +193,12 @@ impl Store {
         let (file, path) = result.ok_or("Cannot create sparse index")?;
         let mut store = Self {
             file: Some(file),
-            path: Some(path),
+            owner: Arc::new(Owner {
+                path: Some(path),
+                disk: Mutex::new(lease),
+            }),
             len: BASE,
-            lease,
+            readonly: false,
             _directory_stack: budget.reserve(
                 Resource::Memory,
                 64 * 1024,
@@ -170,8 +207,8 @@ impl Store {
             undo: None,
         };
         #[cfg(unix)]
-        if fs::remove_file(store.path.as_ref().unwrap()).is_ok() {
-            store.path = None;
+        if fs::remove_file(store.owner.path.as_ref().unwrap()).is_ok() {
+            Arc::get_mut(&mut store.owner).unwrap().path = None;
         }
         store.write_at(0, &[0; HEADER as usize], cancelled)?;
         let mut buffer = vec![0; 64 * 1024];
@@ -235,6 +272,10 @@ impl Store {
         bytes: &[u8],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
+        if self.readonly {
+            return Err("Read-only index view".into());
+        }
+
         with_io_slot(cancelled, || {
             let file = self.file.as_mut().unwrap();
             file.seek(SeekFrom::Start(pos))?;
@@ -274,7 +315,7 @@ impl Store {
         let next = offset
             .checked_add(RECORD)
             .ok_or("Sparse index size overflow")?;
-        self.lease.resize(
+        self.owner.disk.lock().unwrap().resize(
             usize::try_from(next).map_err(|_| "Sparse index exceeds platform disk accounting")?,
         )?;
         self.len = next;
@@ -365,7 +406,11 @@ impl Store {
                     .set_len(log.initial_len)
                     .map_err(|e| e.to_string())?;
                 self.len = log.initial_len;
-                self.lease.resize(log.initial_len as usize)
+                self.owner
+                    .disk
+                    .lock()
+                    .unwrap()
+                    .resize(log.initial_len as usize)
             },
         )
     }
@@ -375,7 +420,7 @@ impl Store {
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, String> {
         let mut copy = Self::new(budget, cancelled)?;
-        copy.lease.resize(self.len as usize)?;
+        copy.owner.disk.lock().unwrap().resize(self.len as usize)?;
         copy.len = self.len;
         let _memory = budget.reserve(Resource::Memory, 64 * 1024, "immutable index view copy")?;
         let mut bytes = vec![0; 64 * 1024];

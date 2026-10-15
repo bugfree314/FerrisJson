@@ -123,6 +123,17 @@ pub struct Viewer {
     total_bytes: u64,
     kind: Option<&'static str>,
     frame_epoch: u64,
+    search_term: String,
+    search_case: bool,
+    search_regex: bool,
+    search_scope: crate::document::SearchScope,
+    search_reverse: bool,
+    focus_search: bool,
+    search_due: Option<Instant>,
+    search: Option<crate::search_worker::Snapshot>,
+    search_page: Option<crate::tree_worker::SearchPage>,
+    search_start: u64,
+    page_request: Option<(u64, u64, u64)>,
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, path: PathBuf, backend: Backend) -> Self {
@@ -166,6 +177,17 @@ impl Viewer {
             total_bytes: 0,
             kind: None,
             frame_epoch: 0,
+            search_term: String::new(),
+            search_case: false,
+            search_regex: false,
+            search_scope: crate::document::SearchScope::All,
+            search_reverse: false,
+            focus_search: false,
+            search_due: None,
+            search: None,
+            search_page: None,
+            search_start: 0,
+            page_request: None,
         }
     }
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -173,6 +195,11 @@ impl Viewer {
             self.retiring = Some(previous.retire());
         }
         self.frame = None;
+        self.search = None;
+        self.search_page = None;
+        self.search_due = None;
+        self.search_start = 0;
+        self.page_request = None;
         self.status = SessionStatus::Preparing;
         self.path = path.clone();
         self.notice.clear();
@@ -206,6 +233,7 @@ impl Viewer {
         };
     }
     fn command(&mut self, command: Navigation) {
+        self.page_request = None;
         if let Some(task) = &self.task
             && let Err(e) = task.command(command)
         {
@@ -223,6 +251,27 @@ impl Viewer {
             }
         }
     }
+    fn start_search(&mut self) {
+        self.search_due = None;
+        self.search_page = None;
+        self.search_start = 0;
+        self.page_request = None;
+        if let Some(task) = &self.task {
+            if self.search_term.is_empty() {
+                task.search_clear(false);
+                return;
+            }
+            let q = crate::engine::search::Query {
+                term: self.search_term.clone(),
+                case: self.search_case,
+                regex: self.search_regex,
+                scope: self.search_scope,
+            };
+            if let Err(e) = task.search_query(q, self.search_reverse) {
+                self.notice = e;
+            }
+        }
+    }
     fn keyboard(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(Key::F1)) {
             self.help = !self.help;
@@ -231,7 +280,10 @@ impl Viewer {
             self.vim.cancel();
             self.command(Navigation::CancelPending);
             self.help = false;
-            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("paged_path")));
+            ctx.memory_mut(|m| {
+                m.surrender_focus(egui::Id::new("paged_path"));
+                m.surrender_focus(egui::Id::new("paged_search"));
+            });
         }
         if self.help {
             return;
@@ -295,9 +347,20 @@ impl Viewer {
                             self.output(None, path);
                             None
                         }
-                        Action::Search(_) | Action::Match(_) => {
-                            self.notice =
-                                "Sparse search and match navigation are pending S6.".into();
+                        Action::Search(reverse) => {
+                            self.search_reverse = reverse;
+                            self.focus_search = true;
+                            ctx.input_mut(|i| {
+                                i.events.retain(
+                                    |e| !matches!(e, egui::Event::Text(t) if t == "/" || t == "?"),
+                                )
+                            });
+                            None
+                        }
+                        Action::Match(reverse) => {
+                            if let Some(task) = &self.task {
+                                task.search_match(!(reverse ^ self.search_reverse), count);
+                            }
                             None
                         }
                     };
@@ -379,7 +442,7 @@ impl Viewer {
                 self.output(None, true);
             }
             if shortcuts.7 {
-                self.focus_path = true;
+                self.focus_search = true;
             }
         }
     }
@@ -395,6 +458,41 @@ impl Viewer {
         }
         if let Some(task) = &self.task {
             let poll = task.poll();
+            let previous_cursor = self.search.as_ref().and_then(|s| s.cursor);
+            self.search = Some(task.search.poll());
+            if let Some(cursor) = self.search.as_ref().and_then(|s| s.cursor)
+                && previous_cursor != Some(cursor)
+                && (cursor < self.search_start || cursor >= self.search_start.saturating_add(16))
+            {
+                self.search_start = cursor / 16 * 16;
+                self.search_page = None;
+                self.page_request = None;
+            }
+            if let Some(page) = poll.search_page
+                && page.generation == task.search.generation()
+                && page.start == self.search_start
+                && self
+                    .page_request
+                    .is_none_or(|(_, _, count)| page.count >= count)
+            {
+                self.search_page = Some(page);
+            }
+            if let Some(snapshot) = &self.search {
+                if !snapshot.error.is_empty() {
+                    self.notice = snapshot.error.clone();
+                }
+                if let Some(state) = &snapshot.state {
+                    let key = (
+                        snapshot.generation,
+                        self.search_start,
+                        state.count.min(self.search_start.saturating_add(16)),
+                    );
+                    if state.count > self.search_start && self.page_request != Some(key) {
+                        task.search_page(self.search_start);
+                        self.page_request = Some(key);
+                    }
+                }
+            }
             self.status = poll.status.state;
             self.done = poll.status.done;
             self.total_bytes = poll.status.total;
@@ -436,6 +534,19 @@ impl Viewer {
                 self.frame = None;
                 self.layout = LayoutCache::new();
             }
+        }
+        if self.search_due.is_some_and(|due| Instant::now() >= due) {
+            self.start_search();
+        }
+        if self.search_due.is_some()
+            || self.search.as_ref().is_some_and(|s| {
+                s.waiting
+                    || s.state
+                        .as_ref()
+                        .is_some_and(|st| st.status == crate::engine::search::Status::Scanning)
+            })
+        {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
         self.keyboard(ctx);
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()))
@@ -520,6 +631,73 @@ impl Viewer {
                     }
                 }
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(if self.search_reverse {
+                    "Search ?"
+                } else {
+                    "Search /"
+                });
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.search_term)
+                        .id(egui::Id::new("paged_search"))
+                        .char_limit(16 * 1024)
+                        .desired_width(220.0),
+                );
+                if self.focus_search {
+                    response.request_focus();
+                    self.focus_search = false;
+                }
+                let mut changed = response.changed();
+                changed |= ui.checkbox(&mut self.search_case, "Case").changed();
+                changed |= ui.checkbox(&mut self.search_regex, "Regex").changed();
+                egui::ComboBox::from_id_salt("paged_search_scope")
+                    .selected_text(format!("{:?}", self.search_scope))
+                    .show_ui(ui, |ui| {
+                        for scope in [
+                            crate::document::SearchScope::All,
+                            crate::document::SearchScope::Keys,
+                            crate::document::SearchScope::Values,
+                        ] {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.search_scope,
+                                    scope,
+                                    format!("{scope:?}"),
+                                )
+                                .changed();
+                        }
+                    });
+                if ui.checkbox(&mut self.colors.live_search, "Live").changed() {
+                    changed = true;
+                }
+                if changed {
+                    if let Some(task) = &self.task {
+                        task.search_clear(false);
+                    }
+                    self.search_page = None;
+                    self.page_request = None;
+                    self.search_due = if self.colors.live_search && !self.search_term.is_empty() {
+                        Some(Instant::now() + Duration::from_millis(200))
+                    } else {
+                        None
+                    };
+                }
+                if (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
+                    || ui.button("Search").clicked()
+                {
+                    self.start_search();
+                }
+                if ui.button("Clear").clicked() {
+                    self.search_term.clear();
+                    self.start_search();
+                }
+                if ui.button("Stop search").clicked()
+                    && let Some(task) = &self.task
+                {
+                    task.search_clear(true);
+                    self.page_request = None;
+                }
+            });
             ui.horizontal(|ui| {
                 if ui.button("Expand all · zR").clicked() {
                     self.command(Navigation::ExpandAll);
@@ -536,6 +714,98 @@ impl Viewer {
             });
         });
         egui::TopBottomPanel::bottom("paged_status").show(ctx,|ui|{ui.horizontal_wrapped(|ui|{ui.label(format!("{:?}",self.status));if let Some(frame)=&self.frame{ui.monospace(format!("Ln {}/{}{} · {}",frame.selected_rank+1,if frame.exact{""}else{"≥"},frame.total,self.vim.display()));}ui.label(&self.notice);});if self.status==SessionStatus::Validating{ui.label("Browsing committed content; final counts and complete output are pending validation.");}});
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|s| s.state.is_some() || s.waiting)
+        {
+            egui::SidePanel::left("paged_search_results")
+                .default_width(260.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.heading("Search results");
+                    if let Some(snapshot) = &self.search {
+                        if let Some(state) = &snapshot.state {
+                            ui.label(format!(
+                                "{:?} · {}{} matches · {} scanned · queue {}/4",
+                                state.status,
+                                if state.status == crate::engine::search::Status::Completed {
+                                    ""
+                                } else {
+                                    "≥"
+                                },
+                                state.count,
+                                state.scanned,
+                                snapshot.queue_peak
+                            ));
+                            if !state.error.is_empty() {
+                                ui.label(&state.error);
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("Prev").clicked() {
+                                    self.search_start = self.search_start.saturating_sub(16);
+                                    self.page_request = None;
+                                    self.search_page = None;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        self.search_start.saturating_add(16) < state.count,
+                                        egui::Button::new("Next"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.search_start += 16;
+                                    self.page_request = None;
+                                    self.search_page = None;
+                                }
+                            });
+                        } else {
+                            ui.label("Preparing search / waiting for source validation…");
+                        }
+                    }
+                    if let Some(page) = &self.search_page {
+                        ui.label(format!(
+                            "From {} · {} committed",
+                            page.start + 1,
+                            page.count
+                        ));
+                        egui::ScrollArea::vertical()
+                            .max_height((ui.available_height() - 110.0).max(40.0))
+                            .show(ui, |ui| {
+                                for row in &page.rows {
+                                    if ui
+                                        .selectable_label(
+                                            self.search.as_ref().and_then(|s| s.cursor)
+                                                == Some(row.index),
+                                            format!("{} {}", row.index + 1, row.path),
+                                        )
+                                        .clicked()
+                                        && let Some(task) = &self.task
+                                    {
+                                        task.search_select(row.index);
+                                    }
+                                    ui.add(egui::Label::new(&row.preview).truncate());
+                                }
+                            });
+                    }
+                    for (label, paths, partial) in [
+                        ("Export all values", false, false),
+                        ("Export all paths", true, false),
+                        ("Export partial values", false, true),
+                        ("Export partial paths", true, true),
+                    ] {
+                        if ui.button(label).clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .add_filter("JSON", &["json"])
+                                .save_file()
+                            && let Some(task) = &self.task
+                            && let Err(e) = task.search_export(path, paths, partial)
+                        {
+                            self.notice = e;
+                        }
+                    }
+                });
+        }
         egui::SidePanel::right("paged_inspector")
             .resizable(true)
             .default_width(420.0)
@@ -671,9 +941,9 @@ impl Viewer {
                     "PageUp / PageDown: page; Ctrl+U / D: half page; Ctrl+B / E: page",
                     "za / zo / zc: toggle / open / close; zR / zM: expand / collapse all",
                     "[ / ]: history; yy / Ctrl+C: copy JSON; yp / Ctrl+P: copy path",
-                    ". / Ctrl+F: focus Path (JSON Pointer, e.g. /items/0)",
+                    ".: focus Path (JSON Pointer, e.g. /items/0)",
                     "F5: reload; F1: help; Esc: cancel pending jump and key sequence",
-                    "Search and match navigation are pending S6; general JSONPath is pending S7.",
+                    "Search: / ? or Ctrl+F; n / N with counts; general JSONPath is pending S7.",
                     "During validation, only committed content is browsable; complete output waits for Ready.",
                 ] { ui.label(line); }
             });
@@ -721,6 +991,125 @@ impl eframe::App for Viewer {
     dead_code,
     reason = "Called by the tree_bench example which reuses this renderer"
 )]
+pub fn benchmark_search(path: PathBuf, expected: u64) -> Result<serde_json::Value, String> {
+    let ctx = egui::Context::default();
+    ctx.set_fonts(crate::fonts::definitions());
+    let mut viewer = Viewer::empty(
+        path.clone(),
+        Backend::Sparse(crate::engine::sparse::OpenOptions::default()),
+    );
+    viewer.open(path.clone(), &ctx);
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 900.0),
+        )),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(600);
+    while viewer.status != SessionStatus::Ready || viewer.frame.as_ref().is_none_or(|f| !f.exact) {
+        let output = ctx.run(input(), |ctx| viewer.draw(ctx));
+        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        if viewer.status == SessionStatus::Failed {
+            return Err(viewer.notice.clone());
+        }
+        if Instant::now() > deadline {
+            return Err("Search benchmark build timeout".into());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let ready_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let budget = viewer.task.as_ref().unwrap().budget();
+    let mut reports = Vec::new();
+    viewer.search_scope = crate::document::SearchScope::Values;
+    viewer.search_case = true;
+    for (term, matches) in [("NEEDLE", 3), ("x", expected)] {
+        viewer.search_term = term.into();
+        let start = Instant::now();
+        viewer.start_search();
+        let mut first = None;
+        let mut frames = Vec::new();
+        let mut ticks = 0;
+        loop {
+            let tick = Instant::now();
+            let output = ctx.run(input(), |ctx| viewer.draw(ctx));
+            let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+            if frames.len() < 8192 {
+                frames.push(tick.elapsed().as_secs_f64() * 1000.0);
+            }
+            ticks += 1;
+            if ticks % 20 == 0 {
+                viewer.command(Navigation::First);
+            }
+            if let Some(s) = &viewer.search
+                && let Some(state) = &s.state
+            {
+                if state.count > 0 && first.is_none() {
+                    first = Some(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                if state.status != crate::engine::search::Status::Scanning {
+                    if state.status != crate::engine::search::Status::Completed
+                        || state.count != matches
+                    {
+                        return Err(format!(
+                            "Unexpected search result {state:?}; expected {matches}"
+                        ));
+                    }
+                    let store = viewer
+                        .task
+                        .as_ref()
+                        .unwrap()
+                        .search
+                        .store()
+                        .ok_or("Missing completed result store")?;
+                    for hit in [0, matches / 2, matches - 1] {
+                        let loc = store.location(hit, &|| false)?;
+                        let expected_ordinal = if term == "NEEDLE" {
+                            [0, expected / 2, expected - 1][hit as usize]
+                        } else {
+                            hit
+                        };
+                        if loc
+                            .ancestors
+                            .first()
+                            .is_none_or(|e| e.ordinal != expected_ordinal)
+                        {
+                            return Err("First/middle/last result location mismatch".into());
+                        }
+                    }
+                    frames.sort_by(f64::total_cmp);
+                    let p95 = frames[(frames.len() - 1) * 95 / 100];
+                    reports.push(serde_json::json!({"term":term,"matches":state.count,"scanned":state.scanned,"first_observed_ms":first,"complete_observed_ms":start.elapsed().as_secs_f64()*1000.0,"gui_cpu_p95_ms":p95,"gui_cpu_max_ms":frames.last(),"gui_frames":frames.len(),"queue_peak":s.queue_peak,"budget":budget.usage()}));
+                    break;
+                }
+            }
+            if Instant::now() > deadline {
+                return Err("Search benchmark timeout".into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    viewer.search_page = None;
+    viewer.frame = None;
+    viewer.layout = LayoutCache::new();
+    viewer
+        .task
+        .take()
+        .unwrap()
+        .retire()
+        .join()
+        .map_err(|_| "Search task join failed")?;
+    drop(viewer);
+    let after = budget.usage();
+    if after.disk != 0 {
+        return Err(format!("Search files leaked: {after:?}"));
+    }
+    Ok(
+        serde_json::json!({"file":path.display().to_string(),"bytes":std::fs::metadata(path).map_err(|e|e.to_string())?.len(),"ready_ms":ready_ms,"searches":reports,"after_retirement":after,"scope":"headless egui CPU+tessellation; no native window/GPU/RSS claim"}),
+    )
+}
+#[allow(dead_code, reason = "Standalone CPU benchmark entry")]
 pub fn benchmark_live(
     path: PathBuf,
     expected: u64,
@@ -1043,5 +1432,40 @@ mod tests {
         );
         assert!(!v.focus_path);
         assert!(v.query.contains('.'));
+    }
+    #[test]
+    fn search_triggers_preserve_term_consume_trigger_and_reverse_direction() {
+        let ctx = egui::Context::default();
+        let mut v = Viewer::empty(PathBuf::new(), Backend::Legacy(false));
+        v.search_term = "existing".into();
+        for (text, reverse) in [("/", false), ("?", true)] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Text(text.into())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    v.keyboard(ctx);
+                    assert!(ctx.input(|i| {
+                        i.events
+                            .iter()
+                            .all(|e| !matches!(e, egui::Event::Text(t) if t == text))
+                    }));
+                },
+            );
+            assert!(v.focus_search);
+            assert_eq!(v.search_reverse, reverse);
+            assert_eq!(v.search_term, "existing");
+            v.focus_search = false;
+        }
+        v.help = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Text("/".into())],
+                ..Default::default()
+            },
+            |ctx| v.keyboard(ctx),
+        );
+        assert!(!v.focus_search);
     }
 }

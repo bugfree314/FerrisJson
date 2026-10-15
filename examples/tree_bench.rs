@@ -11,6 +11,9 @@ mod fonts;
 #[path = "../src/palette.rs"]
 mod palette;
 #[cfg(not(test))]
+#[path = "../src/search_worker.rs"]
+mod search_worker;
+#[cfg(not(test))]
 #[path = "../src/shutdown.rs"]
 mod shutdown;
 #[cfg(not(test))]

@@ -1,4 +1,3 @@
-use regex::RegexBuilder;
 use serde_json::Value;
 use serde_json_path::{JsonPath, PathElement};
 use std::{
@@ -750,6 +749,45 @@ impl Document {
     ) -> Result<NodeIds, String> {
         self.search_cancellable(term, case, regex, scope, || false)
     }
+    pub(crate) fn search_visit(
+        &self,
+        matcher: &crate::engine::search::Matcher,
+        cancel: &dyn Fn() -> bool,
+        visit: &mut dyn FnMut(usize, bool) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if let Storage::Indexed(store) = &self.storage {
+            return store.search_visit(self, matcher, cancel, visit);
+        }
+        let mut id = 0;
+        let mut error = None;
+        walk(self.value().unwrap(), &mut |value| {
+            if cancel() {
+                error = Some("Search cancelled".into());
+                return false;
+            }
+            let key = matcher.keys() && matcher.text(&self.key(id));
+            let matched = key
+                || (matcher.values()
+                    && match value {
+                        Value::String(s) => matcher.text(s),
+                        Value::Number(n) => matcher.text(n.as_str()),
+                        Value::Bool(b) => matcher.text(if *b { "true" } else { "false" }),
+                        Value::Null => matcher.text("null"),
+                        _ => false,
+                    });
+            match visit(id, matched) {
+                Ok(()) => {
+                    id += 1;
+                    true
+                }
+                Err(e) => {
+                    error = Some(e);
+                    false
+                }
+            }
+        });
+        if let Some(e) = error { Err(e) } else { Ok(()) }
+    }
     pub fn search_cancellable(
         &self,
         term: &str,
@@ -758,91 +796,24 @@ impl Document {
         scope: SearchScope,
         cancelled: impl Fn() -> bool,
     ) -> Result<NodeIds, String> {
-        if term.is_empty() {
-            return Ok(NodeIds::new(&self.budget));
-        }
-        if let Storage::Indexed(store) = &self.storage {
-            return store.search(self, term, case, regex, scope, cancelled);
-        }
-        let pattern = if regex {
-            term.to_owned()
-        } else {
-            regex::escape(term)
-        };
-        let matcher = RegexBuilder::new(&pattern)
-            .case_insensitive(!case)
-            .build()
-            .map_err(|e| format!("Invalid regular expression: {e}"))?;
-        // Repeated object keys are tested once. Array keys contain only ASCII
-        // digits, so a literal containing other characters cannot match them.
-        let _key_workspace =
-            self.budget
-                .reserve(Resource::Memory, self.keys.len(), "search key matches")?;
-        let mut key_matches = Vec::new();
-        if scope != SearchScope::Values {
-            key_matches.reserve(self.keys.len());
-            for (index, key) in self.keys.iter().enumerate() {
-                if index % 1024 == 0 && cancelled() {
-                    return Err("Search cancelled".into());
-                }
-                key_matches.push(matcher.is_match(key));
-            }
-        }
-        let match_array_keys = regex || term.bytes().all(|byte| byte.is_ascii_digit());
-        let root_match = scope != SearchScope::Values && matcher.is_match("$");
+        let matcher = crate::engine::search::Matcher::new(
+            crate::engine::search::Query {
+                term: term.into(),
+                case,
+                regex,
+                scope,
+            },
+            &self.budget,
+        )?;
         let mut matches = NodeIds::new(&self.budget);
-        let mut id = 0;
-        let mut allocation_error = None;
-        let completed = walk(self.value().unwrap(), &mut |value| {
-            if id % 1024 == 0 && cancelled() {
-                return false;
+        self.search_visit(&matcher, &cancelled, &mut |id, matched| {
+            if matched {
+                if matches.len() >= 65_536 { return Err("Compatibility search is limited to 65536 matches; use --paged-tree or --sparse for streaming search".into()); }
+                matches.push(id as u32)?;
             }
-            let node = &self.nodes[id];
-            let key_match = scope != SearchScope::Values
-                && match node.parent() {
-                    None => root_match,
-                    Some(parent) if matches!(self.nodes[parent].kind, Kind::Array) => {
-                        match_array_keys && matcher.is_match(&node.segment.to_string())
-                    }
-                    Some(_) => key_matches[node.segment as usize],
-                };
-            let value_match = !key_match
-                && scope != SearchScope::Keys
-                && match value {
-                    Value::String(s) => matcher.is_match(s),
-                    Value::Number(n) => matcher.is_match(n.as_str()),
-                    Value::Bool(b) => matcher.is_match(if *b { "true" } else { "false" }),
-                    Value::Null => matcher.is_match("null"),
-                    _ => false,
-                };
-            if key_match || value_match {
-                if matches.len() == matches.capacity() {
-                    let extra = matches
-                        .capacity()
-                        .max(1024)
-                        .min(self.nodes.len() - matches.len());
-                    if let Err(error) = matches.reserve_exact(extra) {
-                        allocation_error = Some(error);
-                        return false;
-                    }
-                }
-                // The document index has already validated every ID fits u32.
-                if let Err(error) = matches.push(id as u32) {
-                    allocation_error = Some(error);
-                    return false;
-                }
-            }
-            id += 1;
-            true
-        });
-        if let Some(error) = allocation_error {
-            return Err(error);
-        }
-        if completed {
-            Ok(matches)
-        } else {
-            Err("Search cancelled".into())
-        }
+            Ok(())
+        })?;
+        Ok(matches)
     }
     #[allow(
         dead_code,
@@ -924,7 +895,7 @@ fn walk(value: &Value, visit: &mut impl FnMut(&Value) -> bool) -> bool {
         _ => true,
     }
 }
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchScope {
     All,
     Keys,

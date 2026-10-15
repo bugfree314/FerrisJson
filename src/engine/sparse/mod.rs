@@ -3,6 +3,7 @@
 mod cache;
 mod directory;
 mod navigation;
+mod search;
 pub use navigation::RawSelection;
 mod progressive;
 pub(crate) mod store;
@@ -89,6 +90,31 @@ pub struct Node {
     count: u64,
 }
 impl Node {
+    pub(crate) fn session(self) -> SessionId {
+        self.session
+    }
+    pub(crate) fn words(self) -> [u64; 5] {
+        [
+            self.end,
+            self.kind.code(),
+            self.container,
+            self.count,
+            self.start,
+        ]
+    }
+    pub(crate) fn restore(session: SessionId, w: [u64; 5]) -> Result<Self, String> {
+        if w[4] > w[0] {
+            return Err("Invalid saved node range".into());
+        }
+        Ok(Self {
+            session,
+            start: w[4],
+            end: w[0],
+            kind: Kind::decode(w[1])?,
+            container: w[2],
+            count: w[3],
+        })
+    }
     pub fn start(self) -> u64 {
         self.start
     }

@@ -24,6 +24,68 @@ pub struct TreeNode {
     token: Token,
 }
 impl TreeNode {
+    pub(crate) fn from_sparse(n: Node, full_rows: u64) -> Self {
+        Self {
+            reference: NodeRef {
+                session: n.session(),
+                address: n.start(),
+            },
+            kind: n.kind().name(),
+            children: n.child_count(),
+            full_rows,
+            token: Token::Sparse(n),
+        }
+    }
+    pub(crate) fn words(self) -> [u64; 8] {
+        match self.token {
+            Token::Legacy(id) => [
+                0,
+                self.reference.address,
+                id as u64,
+                kind_code(self.kind),
+                0,
+                0,
+                self.children,
+                self.full_rows,
+            ],
+            Token::Sparse(n) => {
+                let w = n.words();
+                [
+                    1,
+                    self.reference.address,
+                    w[0],
+                    w[1],
+                    w[2],
+                    w[3],
+                    self.children,
+                    self.full_rows,
+                ]
+            }
+        }
+    }
+    pub(crate) fn restore(session: super::session::SessionId, w: [u64; 8]) -> Result<Self, String> {
+        let (token, kind) = match w[0] {
+            0 => (
+                Token::Legacy(usize::try_from(w[2]).map_err(|_| "Saved ID overflow")?),
+                kind_name(w[3])?,
+            ),
+            1 => {
+                let n = Node::restore(session, [w[2], w[3], w[4], w[5], w[1]])?;
+                (Token::Sparse(n), n.kind().name())
+            }
+            _ => return Err("Invalid result node tag".into()),
+        };
+        Ok(Self {
+            reference: NodeRef {
+                session,
+                address: w[1],
+            },
+            kind,
+            children: w[6],
+            full_rows: w[7],
+            token,
+        })
+    }
     pub fn container(self) -> bool {
         matches!(self.kind, "array" | "object")
     }
@@ -44,7 +106,32 @@ pub struct Location {
     pub node: TreeNode,
     pub ancestors: Vec<Edge>,
 }
+fn kind_code(kind: &str) -> u64 {
+    match kind {
+        "object" => 0,
+        "array" => 1,
+        "string" => 2,
+        "number" => 3,
+        "boolean" => 4,
+        _ => 5,
+    }
+}
+fn kind_name(n: u64) -> Result<&'static str, String> {
+    match n {
+        0 => Ok("object"),
+        1 => Ok("array"),
+        2 => Ok("string"),
+        3 => Ok("number"),
+        4 => Ok("boolean"),
+        5 => Ok("null"),
+        _ => Err("Invalid saved kind".into()),
+    }
+}
 pub trait Provider: Send {
+    fn search_input(&self) -> Result<super::search::Input, String> {
+        Err("Search unavailable for this provider".into())
+    }
+
     fn budget(&self) -> BudgetManager;
     fn root(&mut self, cancel: &dyn Fn() -> bool) -> Result<TreeNode, String>;
     fn child(
@@ -157,7 +244,7 @@ pub trait Provider: Send {
 }
 pub struct LegacyProvider(pub Arc<Document>);
 impl LegacyProvider {
-    fn node(&self, id: usize) -> TreeNode {
+    pub(crate) fn node(&self, id: usize) -> TreeNode {
         let n = self.0.node_info(id);
         TreeNode {
             reference: n.reference,
@@ -176,6 +263,9 @@ impl LegacyProvider {
     }
 }
 impl Provider for LegacyProvider {
+    fn search_input(&self) -> Result<super::search::Input, String> {
+        Ok(super::search::Input::Legacy(self.0.clone()))
+    }
     fn output(
         &mut self,
         node: TreeNode,
@@ -337,6 +427,11 @@ impl SparseProvider {
     }
 }
 impl Provider for SparseProvider {
+    fn search_input(&self) -> Result<super::search::Input, String> {
+        Ok(super::search::Input::Sparse(Box::new(
+            self.index.read_view()?,
+        )))
+    }
     fn output(
         &mut self,
         node: TreeNode,
@@ -454,6 +549,23 @@ pub struct Clipboard {
     _lease: Reservation,
 }
 impl OutputSelection {
+    pub fn write(
+        &self,
+        writer: &mut dyn std::io::Write,
+        cancel: &dyn Fn() -> bool,
+    ) -> serde_json::Result<()> {
+        if cancel() {
+            return Err(serde_json::Error::io(std::io::Error::other(
+                "Export cancelled",
+            )));
+        }
+        match self {
+            Self::Legacy(doc, id) => doc.write_node(writer, *id),
+            Self::Sparse(raw) => raw
+                .write(writer, cancel)
+                .map_err(|e| serde_json::Error::io(std::io::Error::other(e))),
+        }
+    }
     pub fn budget(&self) -> BudgetManager {
         match self {
             Self::Legacy(doc, _) => doc.budget().clone(),
