@@ -123,6 +123,7 @@ pub struct Viewer {
     total_bytes: u64,
     kind: Option<&'static str>,
     frame_epoch: u64,
+    query_results: bool,
     search_term: String,
     search_case: bool,
     search_regex: bool,
@@ -177,6 +178,7 @@ impl Viewer {
             total_bytes: 0,
             kind: None,
             frame_epoch: 0,
+            query_results: false,
             search_term: String::new(),
             search_case: false,
             search_regex: false,
@@ -195,6 +197,7 @@ impl Viewer {
             self.retiring = Some(previous.retire());
         }
         self.frame = None;
+        self.query_results = false;
         self.search = None;
         self.search_page = None;
         self.search_due = None;
@@ -252,6 +255,7 @@ impl Viewer {
         }
     }
     fn start_search(&mut self) {
+        self.query_results = false;
         self.search_due = None;
         self.search_page = None;
         self.search_start = 0;
@@ -270,6 +274,20 @@ impl Viewer {
             if let Err(e) = task.search_query(q, self.search_reverse) {
                 self.notice = e;
             }
+        }
+    }
+    fn start_query(&mut self) {
+        self.query_results = true;
+        self.search_reverse = false;
+        self.search = None;
+        self.search_due = None;
+        self.search_page = None;
+        self.search_start = 0;
+        self.page_request = None;
+        if let Some(task) = &self.task
+            && let Err(e) = task.path_query(self.query.clone())
+        {
+            self.notice = e;
         }
     }
     fn keyboard(&mut self, ctx: &egui::Context) {
@@ -603,11 +621,11 @@ impl Viewer {
                 ));
             }
             ui.horizontal(|ui| {
-                ui.label("Path");
+                ui.label("Path / JSONPath");
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .id(egui::Id::new("paged_path"))
-                        .char_limit(4096),
+                        .char_limit(16 * 1024),
                 );
                 if self.focus_path {
                     response.request_focus();
@@ -616,7 +634,21 @@ impl Viewer {
                 if (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
                     || ui.button("Go").clicked()
                 {
-                    self.command(Navigation::Locate(self.query.clone()));
+                    if self.query.starts_with('/') {
+                        self.command(Navigation::Locate(self.query.clone()));
+                    } else {
+                        self.start_query();
+                    }
+                }
+                if ui.button("Query JSONPath").clicked() {
+                    self.start_query();
+                }
+                if ui.button("Clear results").clicked() {
+                    if let Some(task) = &self.task {
+                        task.search_clear(false);
+                    }
+                    self.search_page = None;
+                    self.page_request = None;
                 }
                 ui.label("Row");
                 ui.add(
@@ -691,7 +723,7 @@ impl Viewer {
                     self.search_term.clear();
                     self.start_search();
                 }
-                if ui.button("Stop search").clicked()
+                if ui.button("Stop results").clicked()
                     && let Some(task) = &self.task
                 {
                     task.search_clear(true);
@@ -723,11 +755,15 @@ impl Viewer {
                 .default_width(260.0)
                 .resizable(true)
                 .show(ctx, |ui| {
-                    ui.heading("Search results");
+                    ui.heading(if self.query_results {
+                        "JSONPath results"
+                    } else {
+                        "Search results"
+                    });
                     if let Some(snapshot) = &self.search {
                         if let Some(state) = &snapshot.state {
                             ui.label(format!(
-                                "{:?} · {}{} matches · {} scanned · queue {}/4",
+                                "{:?} · {}{} results · {} visited · queue {}/4",
                                 state.status,
                                 if state.status == crate::engine::search::Status::Completed {
                                     ""
@@ -760,7 +796,7 @@ impl Viewer {
                                 }
                             });
                         } else {
-                            ui.label("Preparing search / waiting for source validation…");
+                            ui.label("Preparing operation / waiting for source validation…");
                         }
                     }
                     if let Some(page) = &self.search_page {
@@ -943,7 +979,7 @@ impl Viewer {
                     "[ / ]: history; yy / Ctrl+C: copy JSON; yp / Ctrl+P: copy path",
                     ".: focus Path (JSON Pointer, e.g. /items/0)",
                     "F5: reload; F1: help; Esc: cancel pending jump and key sequence",
-                    "Search: / ? or Ctrl+F; n / N with counts; general JSONPath is pending S7.",
+                    "Search: / ? or Ctrl+F; Query JSONPath: evaluate Path; n/N browse active results.",
                     "During validation, only committed content is browsable; complete output waits for Ready.",
                 ] { ui.label(line); }
             });
@@ -986,6 +1022,139 @@ impl eframe::App for Viewer {
     }
 }
 
+#[allow(dead_code, reason = "Standalone query CPU benchmark entry")]
+pub fn benchmark_query(
+    path: PathBuf,
+    expected: u64,
+    nested: bool,
+) -> Result<serde_json::Value, String> {
+    let ctx = egui::Context::default();
+    ctx.set_fonts(crate::fonts::definitions());
+    let mut viewer = Viewer::empty(
+        path.clone(),
+        Backend::Sparse(crate::engine::sparse::OpenOptions::default()),
+    );
+    viewer.open(path.clone(), &ctx);
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 900.0),
+        )),
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(600);
+    while viewer.status != SessionStatus::Ready || viewer.frame.as_ref().is_none_or(|f| !f.exact) {
+        let output = ctx.run(input(), |ctx| viewer.draw(ctx));
+        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        if viewer.status == SessionStatus::Failed {
+            return Err(viewer.notice.clone());
+        }
+        if Instant::now() > deadline {
+            return Err("Query benchmark build timeout".into());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let ready_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let budget = viewer.task.as_ref().unwrap().budget();
+    let mut reports = Vec::new();
+    viewer.search_scope = crate::document::SearchScope::Values;
+    viewer.search_case = true;
+    for (term, matches) in [
+        (
+            if nested {
+                "$[?(@.hit==true)].id"
+            } else {
+                "$[?(@==1)]"
+            },
+            3,
+        ),
+        (if nested { "$[*].id" } else { "$[*]" }, expected),
+    ] {
+        viewer.query = term.into();
+        let start = Instant::now();
+        viewer.start_query();
+        let mut first = None;
+        let mut frames = Vec::new();
+        let mut ticks = 0;
+        loop {
+            let tick = Instant::now();
+            let output = ctx.run(input(), |ctx| viewer.draw(ctx));
+            let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+            if frames.len() < 8192 {
+                frames.push(tick.elapsed().as_secs_f64() * 1000.0);
+            }
+            ticks += 1;
+            if ticks % 20 == 0 {
+                viewer.command(Navigation::First);
+            }
+            if let Some(s) = &viewer.search
+                && let Some(state) = &s.state
+            {
+                if state.count > 0 && first.is_none() {
+                    first = Some(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                if state.status != crate::engine::search::Status::Scanning {
+                    if state.status != crate::engine::search::Status::Completed
+                        || state.count != matches
+                    {
+                        return Err(format!(
+                            "Unexpected query result {state:?}; expected {matches}"
+                        ));
+                    }
+                    let store = viewer
+                        .task
+                        .as_ref()
+                        .unwrap()
+                        .search
+                        .store()
+                        .ok_or("Missing completed result store")?;
+                    for hit in [0, matches / 2, matches - 1] {
+                        let loc = store.location(hit, &|| false)?;
+                        let expected_ordinal = if matches == 3 {
+                            [0, expected / 2, expected - 1][hit as usize]
+                        } else {
+                            hit
+                        };
+                        if loc
+                            .ancestors
+                            .first()
+                            .is_none_or(|e| e.ordinal != expected_ordinal)
+                        {
+                            return Err("First/middle/last result location mismatch".into());
+                        }
+                    }
+                    frames.sort_by(f64::total_cmp);
+                    let p95 = frames[(frames.len() - 1) * 95 / 100];
+                    reports.push(serde_json::json!({"query":term,"matches":state.count,"scanned":state.scanned,"first_observed_ms":first,"complete_observed_ms":start.elapsed().as_secs_f64()*1000.0,"gui_cpu_p95_ms":p95,"gui_cpu_max_ms":frames.last(),"gui_frames":frames.len(),"queue_peak":s.queue_peak,"budget":budget.usage()}));
+                    break;
+                }
+            }
+            if Instant::now() > deadline {
+                return Err("Query benchmark timeout".into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    viewer.search_page = None;
+    viewer.frame = None;
+    viewer.layout = LayoutCache::new();
+    viewer
+        .task
+        .take()
+        .unwrap()
+        .retire()
+        .join()
+        .map_err(|_| "Query task join failed")?;
+    drop(viewer);
+    let after = budget.usage();
+    if after.disk != 0 || after.memory != 0 {
+        return Err(format!("Query files leaked: {after:?}"));
+    }
+    Ok(
+        serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"nested":nested,"file":path.display().to_string(),"bytes":std::fs::metadata(path).map_err(|e|e.to_string())?.len(),"ready_ms":ready_ms,"queries":reports,"after_retirement":after,"scope":"headless egui CPU+tessellation; no native window/GPU/RSS claim"}),
+    )
+}
 /// Development harness: measures CPU UI preparation, not native/GPU FPS.
 #[allow(
     dead_code,
@@ -1282,6 +1451,69 @@ pub fn benchmark_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn query_results_render_and_counted_navigation_uses_query_order() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("target/s7-ui-{}.tmp", std::process::id()));
+        std::fs::write(&path, r#"[{"n":0},{"n":1},{"n":2}]"#).unwrap();
+        let ctx = egui::Context::default();
+        let mut v = Viewer::empty(
+            path.clone(),
+            Backend::Sparse(crate::engine::sparse::OpenOptions::default()),
+        );
+        v.open(path.clone(), &ctx);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while v.status != SessionStatus::Ready || v.frame.as_ref().is_none_or(|f| !f.exact) {
+            let _ = ctx.run(Default::default(), |ctx| v.draw(ctx));
+            assert!(Instant::now() < deadline, "{}", v.notice);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        v.search_reverse = true;
+        v.query = "$[::-1].n".into();
+        v.start_query();
+        assert!(!v.search_reverse);
+        assert!(v.query_results);
+        loop {
+            let _ = ctx.run(Default::default(), |ctx| v.draw(ctx));
+            if v.search_page.as_ref().is_some_and(|p| p.rows.len() == 3)
+                && v.frame
+                    .as_ref()
+                    .is_some_and(|f| f.selection.path == r#"$[2]["n"]"#)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", v.notice);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Text("2n".into())],
+                ..Default::default()
+            },
+            |ctx| v.keyboard(ctx),
+        );
+        loop {
+            let _ = ctx.run(Default::default(), |ctx| v.draw(ctx));
+            if v.search.as_ref().and_then(|s| s.cursor) == Some(2)
+                && v.frame
+                    .as_ref()
+                    .is_some_and(|f| f.selection.path == r#"$[0]["n"]"#)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", v.notice);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let budget = v.task.as_ref().unwrap().budget();
+        v.frame = None;
+        v.search_page = None;
+        v.layout = LayoutCache::new();
+        v.task.take().unwrap().retire().join().unwrap();
+        drop(v);
+        assert_eq!(budget.usage().memory, 0);
+        assert_eq!(budget.usage().disk, 0);
+        std::fs::remove_file(path).unwrap();
+    }
     use crate::engine::{
         budget::Limits,
         tree::{LegacyProvider, PagedTree},

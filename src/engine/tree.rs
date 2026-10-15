@@ -128,6 +128,23 @@ fn kind_name(n: u64) -> Result<&'static str, String> {
     }
 }
 pub trait Provider: Send {
+    fn query_field(
+        &mut self,
+        parent: TreeNode,
+        name: &str,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<(u64, TreeNode)>, String> {
+        if parent.kind != "object" {
+            return Ok(None);
+        }
+        for ordinal in 0..parent.children {
+            let (key, truncated) = self.key(parent, ordinal, name.len() + 1, cancel)?;
+            if !truncated && key == name {
+                return Ok(Some((ordinal, self.child(parent, ordinal, cancel)?)));
+            }
+        }
+        Ok(None)
+    }
     fn search_input(&self) -> Result<super::search::Input, String> {
         Err("Search unavailable for this provider".into())
     }
@@ -245,7 +262,10 @@ pub trait Provider: Send {
 pub struct LegacyProvider(pub Arc<Document>);
 impl LegacyProvider {
     pub(crate) fn node(&self, id: usize) -> TreeNode {
-        let n = self.0.node_info(id);
+        Self::document_node(&self.0, id)
+    }
+    pub(crate) fn document_node(doc: &Document, id: usize) -> TreeNode {
+        let n = doc.node_info(id);
         TreeNode {
             reference: n.reference,
             kind: n.kind,
@@ -263,6 +283,30 @@ impl LegacyProvider {
     }
 }
 impl Provider for LegacyProvider {
+    fn query_field(
+        &mut self,
+        parent: TreeNode,
+        name: &str,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<(u64, TreeNode)>, String> {
+        if parent.kind != "object" {
+            return Ok(None);
+        }
+        let Some(id) = self.0.child_name(self.id(parent)?, name) else {
+            return Ok(None);
+        };
+        let child = self.node(id);
+        let (mut lo, mut hi) = (0, parent.children);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.child(parent, mid, cancel)?.reference.address < child.reference.address {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(Some((lo, child)))
+    }
     fn search_input(&self) -> Result<super::search::Input, String> {
         Ok(super::search::Input::Legacy(self.0.clone()))
     }
@@ -427,6 +471,20 @@ impl SparseProvider {
     }
 }
 impl Provider for SparseProvider {
+    fn query_field(
+        &mut self,
+        parent: TreeNode,
+        name: &str,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<(u64, TreeNode)>, String> {
+        if parent.kind != "object" {
+            return Ok(None);
+        }
+        self.index
+            .field_ordinal(self.native(parent)?, name, cancel)?
+            .map(|(ordinal, n)| self.node(n, cancel).map(|node| (ordinal, node)))
+            .transpose()
+    }
     fn search_input(&self) -> Result<super::search::Input, String> {
         Ok(super::search::Input::Sparse(Box::new(
             self.index.read_view()?,

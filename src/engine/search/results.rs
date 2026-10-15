@@ -57,6 +57,7 @@ impl Drop for Inner {
 #[derive(Clone)]
 pub struct ResultStore(Arc<Inner>);
 pub struct ResultWriter {
+    path: Vec<(crate::engine::session::NodeRef, u64, u64)>,
     store: ResultStore,
     buffers: [Vec<u8>; 2],
     written: [u64; 2],
@@ -198,8 +199,13 @@ impl ResultStore {
             h[24..].copy_from_slice(&sum.to_le_bytes());
             write_at(store.0.files[i].as_ref().unwrap(), 0, &h, &|| false)?;
         }
-        let lease = budget.reserve(Resource::Memory, 2 * 64 * 1024, "result append buffers")?;
+        let lease = budget.reserve(
+            Resource::Memory,
+            2 * 64 * 1024 + 8192,
+            "result append buffers and ancestry cursor",
+        )?;
         let writer = ResultWriter {
+            path: Vec::with_capacity(128),
             store: store.clone(),
             buffers: [Vec::with_capacity(64 * 1024), Vec::with_capacity(64 * 1024)],
             written: [HEADER, HEADER],
@@ -224,7 +230,7 @@ impl ResultStore {
         let mut s = self.0.state.lock().unwrap();
         if s.status == Status::Scanning {
             s.status = Status::Cancelled;
-            s.error = "Search cancelled; committed results are partial".into();
+            s.error = "Operation cancelled; committed results are partial".into();
         }
     }
     pub fn fail(&self, error: String) {
@@ -330,6 +336,41 @@ impl ResultStore {
     }
 }
 impl ResultWriter {
+    pub fn location(
+        &mut self,
+        location: &Location,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<u64, String> {
+        if location.node.reference.session != self.store.0.session || location.ancestors.len() > 127
+        {
+            return Err("Query result session/depth mismatch".into());
+        }
+        let mut link = NONE;
+        let mut ordinal = 0;
+        for (depth, edge) in location.ancestors.iter().enumerate() {
+            if edge.parent.reference.session != self.store.0.session {
+                return Err("Query ancestor session mismatch".into());
+            }
+            let saved = self
+                .path
+                .get(depth)
+                .copied()
+                .filter(|(reference, incoming, _)| {
+                    *reference == edge.parent.reference && *incoming == ordinal
+                });
+            link = if let Some((_, _, id)) = saved {
+                id
+            } else {
+                self.path.truncate(depth);
+                let id = self.ancestor(edge.parent, link, ordinal, cancel)?;
+                self.path.push((edge.parent.reference, ordinal, id));
+                id
+            };
+            ordinal = edge.ordinal;
+        }
+        self.path.truncate(location.ancestors.len());
+        self.hit(location.node, link, ordinal, cancel)
+    }
     pub fn count(&self) -> u64 {
         self.counts[0]
     }

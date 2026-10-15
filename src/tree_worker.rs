@@ -615,7 +615,7 @@ impl Task {
                                     None,
                                     None,
                                     format!(
-                                        "Exported {} search results to {}",
+                                        "Exported {} results to {}",
                                         if prefix.is_some() {
                                             "partial"
                                         } else {
@@ -675,6 +675,20 @@ impl Task {
         let mut b = self.shared.0.lock().unwrap();
         b.commands
             .retain(|(_, c)| matches!(c, Request::Output(..) | Request::SearchExport(..)));
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        b.commands
+            .push_back((epoch, Request::Navigation(Navigation::CancelPending)));
+        b.commands.push_back((epoch, Request::SearchWake));
+        drop(b);
+        self.shared.1.notify_all();
+        Ok(())
+    }
+    pub fn path_query(&self, text: String) -> Result<(), String> {
+        self.search.request_path(text)?;
+        let mut b = self.shared.0.lock().unwrap();
+        b.commands
+            .retain(|(_, c)| matches!(c, Request::Output(..) | Request::SearchExport(..)));
+        b.search_page = None;
         let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         b.commands
             .push_back((epoch, Request::Navigation(Navigation::CancelPending)));
@@ -871,6 +885,111 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     struct Input(PathBuf);
+    #[test]
+    fn jsonpath_reverse_duplicates_export_capture_and_search_replacement() {
+        let input = Input::new(r#"[{"n":0},{"n":1},{"n":2}]"#);
+        let task = Task::new(
+            input.0.clone(),
+            Backend::Sparse(OpenOptions::default()),
+            egui::Context::default(),
+        )
+        .unwrap();
+        drop(wait(&task, |f| f.exact));
+        task.path_query("$[::-1,::-1].n".into()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let snapshot = task.search.poll();
+            if let Some(state) = snapshot.state
+                && state.status == crate::engine::search::Status::Completed
+            {
+                assert_eq!(state.count, 6);
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", snapshot.error);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        task.search_select(5);
+        drop(wait(&task, |f| f.selection.path == r#"$[0]["n"]"#));
+        let destination = Input::new("old");
+        task.search_export(destination.0.clone(), false, false)
+            .unwrap();
+        task.search_query(crate::engine::search::Query::literal("absent"), false)
+            .unwrap();
+        loop {
+            task.search.poll();
+            let poll = task.poll();
+            if poll.notice.starts_with("Exported complete") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", poll.notice);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&destination.0).unwrap(),
+            "[2,1,0,2,1,0]"
+        );
+        let b = task.budget();
+        task.retire().join().unwrap();
+        assert_eq!(b.usage().memory, 0);
+        assert_eq!(b.usage().disk, 0);
+    }
+    #[test]
+    fn query_full_queue_cancellation_replacement_and_syntax_error_are_isolated() {
+        let input = Input::new(format!(
+            "[{}]",
+            std::iter::repeat_n("0", 10_000)
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        let task = Task::new(
+            input.0.clone(),
+            Backend::Sparse(OpenOptions::default()),
+            egui::Context::default(),
+        )
+        .unwrap();
+        drop(wait(&task, |f| f.exact));
+        task.path_query("$[*]".into()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while task.search.store().is_none_or(|s| s.state().count < 385) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        task.search_clear(true);
+        let partial = task.search.store().unwrap();
+        assert_eq!(
+            partial.state().status,
+            crate::engine::search::Status::Cancelled
+        );
+        task.path_query("$[?(@==99)]".into()).unwrap();
+        let generation = task.search.generation();
+        loop {
+            let snapshot = task.search.poll();
+            assert_eq!(snapshot.generation, generation);
+            if let Some(state) = snapshot.state
+                && state.status == crate::engine::search::Status::Completed
+            {
+                assert_eq!(state.count, 0);
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", snapshot.error);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        task.path_query("$[?length(@)>0]".into()).unwrap();
+        loop {
+            let snapshot = task.search.poll();
+            if !snapshot.error.is_empty() {
+                assert!(snapshot.state.is_none());
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(partial);
+        let b = task.budget();
+        task.retire().join().unwrap();
+        assert_eq!(b.usage().memory, 0);
+        assert_eq!(b.usage().disk, 0);
+    }
     impl Input {
         fn new(bytes: impl AsRef<[u8]>) -> Self {
             static ID: AtomicU64 = AtomicU64::new(0);

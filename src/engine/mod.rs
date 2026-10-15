@@ -13,3 +13,5 @@ pub use crate::document::Document as Session;
 pub mod sparse;
 
 pub mod search;
+
+pub mod query;

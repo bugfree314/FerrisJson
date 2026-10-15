@@ -7,6 +7,57 @@ struct Cursor {
     position: u64,
 }
 impl SparseIndex {
+    /// A validated continuation avoids restarting each forward page at a checkpoint.
+    pub(crate) fn query_array_page(
+        &mut self,
+        parent: Node,
+        ordinal: u64,
+        position: Option<u64>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(Page, u64), String> {
+        self.validate(parent, cancel)?;
+        if parent.kind != Kind::Array || ordinal >= parent.count {
+            return Err("Invalid query array cursor".into());
+        }
+        let (mut position, mut index) = if let Some(position) = position {
+            (position, ordinal)
+        } else {
+            let (p, i, _) = self.array_boundary(parent, ordinal, false, cancel)?;
+            (p, i)
+        };
+        let count = (parent.count - ordinal).min(64) as usize;
+        let lease = self.budget.reserve(
+            Resource::Memory,
+            count * std::mem::size_of::<Node>(),
+            "query array continuation page",
+        )?;
+        let mut nodes = Vec::with_capacity(count);
+        let mut scan = Scanner::new(
+            &self.snapshot,
+            &mut self.store,
+            &self.budget,
+            parent.session,
+            cancel,
+            false,
+        )?;
+        while index < ordinal + count as u64 {
+            let node = scan.indexed_node(position)?;
+            if index >= ordinal {
+                nodes.push(node);
+            }
+            position = scan.next_array_boundary(node, parent, index)?;
+            index += 1;
+        }
+        Ok((
+            Page {
+                nodes,
+                next: (index < parent.count).then_some(index),
+                total: parent.count,
+                _lease: lease,
+            },
+            position,
+        ))
+    }
     pub fn read_view(&self) -> Result<Self, String> {
         if !self.complete {
             return Err("Pending: search requires full validation".into());

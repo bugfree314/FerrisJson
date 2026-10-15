@@ -27,9 +27,13 @@ enum Target {
     Absolute(u64),
     FromEnd(u64),
 }
+enum Work {
+    Search(Query),
+    Path(String),
+}
 struct Inbox {
-    pending: Option<(u64, Query)>,
-    job: Option<(u64, Query, Input)>,
+    pending: Option<(u64, Work)>,
+    job: Option<(u64, Work, Input)>,
     active: Option<u64>,
     store: Option<ResultStore>,
     events: VecDeque<Event>,
@@ -106,7 +110,7 @@ impl SearchHub {
                         Cancellation::Generation(worker.0.epoch.clone(), generation),
                     ]),
                     || {
-                        input.run(query, generation, &cancel, &mut |event| {
+                        let mut notify = |event| {
                             if cancel() {
                                 return Err("Search event cancelled".into());
                             }
@@ -129,7 +133,19 @@ impl SearchHub {
                             (worker.0.wake)();
                             worker.0.ctx.request_repaint();
                             Ok(())
-                        })
+                        };
+                        match query {
+                            Work::Search(query) => {
+                                input.run(query, generation, &cancel, &mut notify)
+                            }
+                            Work::Path(text) => crate::engine::query::run(
+                                input,
+                                &text,
+                                generation,
+                                &cancel,
+                                &mut notify,
+                            ),
+                        }
                     },
                 );
                 {
@@ -155,7 +171,17 @@ impl SearchHub {
         Ok((hub, thread))
     }
     pub fn request(&self, query: Query, reverse: bool) -> Result<(), String> {
-        if query.term.len() > 64 * 1024 {
+        self.request_work(Work::Search(query), reverse)
+    }
+    pub fn request_path(&self, text: String) -> Result<(), String> {
+        self.request_work(Work::Path(text), false)
+    }
+    fn request_work(&self, query: Work, reverse: bool) -> Result<(), String> {
+        let length = match &query {
+            Work::Search(q) => q.term.len(),
+            Work::Path(text) => text.len(),
+        };
+        if length > 64 * 1024 {
             return Err("Search term exceeds 64 KiB".into());
         }
         let mut b = self.0.inbox.lock().unwrap();

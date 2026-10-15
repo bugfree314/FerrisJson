@@ -278,6 +278,16 @@ impl SparseIndex {
         key: &str,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Node, String> {
+        self.field_ordinal(parent, key, cancelled)?
+            .map(|(_, node)| node)
+            .ok_or_else(|| "Object key not found".into())
+    }
+    pub(crate) fn field_ordinal(
+        &mut self,
+        parent: Node,
+        key: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<(u64, Node)>, String> {
         self.validate(parent, cancelled)?;
         if parent.kind != Kind::Object {
             return Err("Field lookup requires an object".into());
@@ -301,11 +311,11 @@ impl SparseIndex {
                 && r[11] == hash
                 && key_matches(&self.snapshot, r[9], r[10], key, cancelled)?
             {
-                return self.field_node(r, cancelled);
+                return Ok(Some((r[6], self.field_node(r, cancelled)?)));
             }
             cursor = r[7];
         }
-        Err("Object key not found".into())
+        Ok(None)
     }
     pub fn child(
         &mut self,

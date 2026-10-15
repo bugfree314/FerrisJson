@@ -567,7 +567,7 @@ impl Document {
         }
         pointer
     }
-    fn child_name(&self, parent: usize, name: &str) -> Option<usize> {
+    pub(crate) fn child_name(&self, parent: usize, name: &str) -> Option<usize> {
         if !matches!(self.nodes[parent].kind, Kind::Object) {
             return None;
         }
@@ -580,31 +580,10 @@ impl Document {
             .ok()
             .map(|i| children[i] as usize)
     }
-    fn child_index(&self, parent: usize, index: usize) -> Option<usize> {
+    pub(crate) fn child_index(&self, parent: usize, index: usize) -> Option<usize> {
         let node = &self.nodes[parent];
         (matches!(node.kind, Kind::Array) && index < node.child_count as usize)
             .then(|| self.children[node.child_start as usize + index] as usize)
-    }
-    fn pointer_id(&self, pointer: &str) -> Option<usize> {
-        let mut id = 0;
-        for token in pointer.strip_prefix('/')?.split('/') {
-            let mut bytes = token.bytes();
-            while let Some(byte) = bytes.next() {
-                if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
-                    return None;
-                }
-            }
-            let token = token.replace("~1", "/").replace("~0", "~");
-            id = if matches!(self.nodes[id].kind, Kind::Array) {
-                if token.starts_with('+') || (token.len() > 1 && token.starts_with('0')) {
-                    return None;
-                }
-                self.child_index(id, token.parse().ok()?)?
-            } else {
-                self.child_name(id, &token)?
-            };
-        }
-        Some(id)
     }
     pub fn find_path(&self, path: &str) -> Result<usize, String> {
         let ids = self.query_path(path)?;
@@ -626,13 +605,26 @@ impl Document {
             return Err("Query cancelled".into());
         }
         let expression = expression.trim();
-        if expression.starts_with('/') {
-            let mut ids = NodeIds::new(&self.budget);
-            if let Some(id) = self.pointer_id(expression) {
-                ids.push(id as u32)?;
-            }
-            return Ok(ids);
+        let _plan_workspace = self.budget.reserve(
+            Resource::Memory,
+            2 * 1024 * 1024,
+            "compatibility query plan workspace",
+        )?;
+        match crate::engine::query::Plan::parse(expression) {
+            Ok(plan) => match crate::engine::query::collect(self, &plan, &cancelled) {
+                Ok(ids) => return Ok(ids),
+                Err(error) if matches!(self.storage, Storage::Indexed(_)) || !error.contains("Container comparisons are unsupported") => return Err(error),
+                Err(_) => {}
+            },
+            Err(error) if expression.starts_with('/') && error == "Invalid Pointer escape" => return Ok(NodeIds::new(&self.budget)),
+            Err(error) if matches!(self.storage, Storage::Indexed(_)) => return Err(error),
+            Err(_) if self.nodes.len() > 65_536 => return Err("Full-library compatibility query requires <=65536 document nodes; use a supported streaming expression".into()),
+            Err(_) => {}
         }
+        if self.nodes.len() > 65_536 {
+            return Err("Full-library compatibility query requires <=65536 document nodes".into());
+        }
+        crate::engine::query::Plan::compatibility_guard(expression, self.nodes.len())?;
         let normalized = if expression == "." {
             "$".into()
         } else if expression.starts_with('.') || expression.starts_with('[') {
@@ -641,14 +633,14 @@ impl Document {
             expression.to_owned()
         };
         let query = JsonPath::parse(&normalized).map_err(|e| format!("Invalid JSONPath: {e}"))?;
-        if matches!(self.storage, Storage::Indexed(_)) {
-            return indexed::query(self, &normalized, cancelled);
-        }
         let results = query.query_located(self.value().unwrap());
         if cancelled() {
             return Err("Query cancelled".into());
         }
         let mut ids = NodeIds::new(&self.budget);
+        if results.len() > 65_536 {
+            return Err("Compatibility query exceeds 65536 results".into());
+        }
         ids.reserve_exact(results.len())?;
         for (index, node) in results.iter().enumerate() {
             if index % 1024 == 0 && cancelled() {
