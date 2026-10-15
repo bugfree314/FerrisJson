@@ -35,11 +35,17 @@ mod worker;
 fn main() {
     let result = (|| {
         let mut args = std::env::args().skip(1);
-        let path = std::path::PathBuf::from(
-            args.next()
-                .ok_or("Usage: recursive_bench FILE [--indexed] [--search-cases]")?,
-        );
+        let path = std::path::PathBuf::from(args.next().ok_or(
+            "Usage: recursive_bench FILE [--indexed] [--search-cases] [--stream-search TERM]",
+        )?);
         let flags = args.collect::<Vec<_>>();
+        if let Some(at) = flags.iter().position(|s| s == "--stream-search") {
+            return app::benchmark_stream_search(
+                path,
+                flags.iter().any(|s| s == "--indexed"),
+                flags.get(at + 1).ok_or("Missing search term")?.clone(),
+            );
+        }
         app::benchmark_recursive(
             path,
             flags.iter().any(|s| s == "--indexed"),

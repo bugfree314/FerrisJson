@@ -20,8 +20,13 @@ const LIMIT: usize = 65_536;
 pub struct Hits {
     generation: u64,
     session: super::session::SessionId,
-    store: Arc<Mutex<Store>>,
-    first: u64,
+    data: Arc<Mutex<HitData>>,
+    count: u64,
+}
+struct HitData {
+    store: Store,
+    directory: u64,
+    next: u64,
     count: u64,
 }
 impl Hits {
@@ -31,48 +36,155 @@ impl Hits {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
-    fn get(&self, n: u64) -> Result<u64, String> {
-        if n >= self.count {
+    fn target(&self, n: u64) -> Result<(u64, u64), String> {
+        let d = self.data.lock().unwrap();
+        if n >= d.count {
             return Err("Match out of range".into());
         }
-        let r = self
-            .store
-            .lock()
-            .unwrap()
-            .get(self.first + n * super::sparse::store::RECORD, &|| false)?;
-        if r[0] != 8 {
-            return Err("Invalid match record".into());
-        }
-        Ok(r[1])
+        let at = d.store.directory_weight(d.directory, n, &|| false)?.0[2];
+        let record = d.store.get(at, &|| false)?;
+        Ok((record[1], record[2]))
+    }
+    #[cfg(test)]
+    fn get(&self, n: u64) -> Result<u64, String> {
+        self.target(n).map(|v| v.0)
     }
 }
 struct HitWriter {
-    generation: u64,
-    session: super::session::SessionId,
-    store: Store,
-    first: u64,
-    count: u64,
+    hits: Hits,
+    replacements: u64,
+    published: u64,
+    last: Instant,
+    started: Instant,
+    publish: bool,
 }
 impl HitWriter {
-    fn push(&mut self, id: u64, cancel: &dyn Fn() -> bool) -> Result<(), String> {
-        let at = self
-            .store
-            .append([8, id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], cancel)?;
-        if self.count == 0 {
-            self.first = at;
+    fn new(s: &Shared, cancel: &dyn Fn() -> bool, publish: bool) -> Result<Self, String> {
+        let mut store = Store::new(&s.budget, cancel)?;
+        store.enable_live_cache(&s.budget)?;
+        Ok(Self {
+            hits: Hits {
+                generation: s.search_epoch.load(Ordering::Relaxed),
+                session: s.session,
+                data: Arc::new(Mutex::new(HitData {
+                    store,
+                    directory: NONE,
+                    next: 0,
+                    count: 0,
+                })),
+                count: 0,
+            },
+            replacements: 0,
+            published: 0,
+            last: Instant::now(),
+            started: Instant::now(),
+            publish,
+        })
+    }
+    fn notify(&mut self, s: &Shared, complete: bool, force: bool) {
+        if !self.publish {
+            return;
         }
-        self.count += 1;
+        self.hits.count = self.hits.data.lock().unwrap().count;
+        if !force
+            && !(self.hits.count == 1 && self.published == 0)
+            && self.hits.count.saturating_sub(self.published) < 256
+            && self.last.elapsed() < Duration::from_millis(40)
+        {
+            return;
+        }
+        if self.hits.generation != s.search_epoch.load(Ordering::Acquire) {
+            return;
+        }
+        let mut c = s.control.lock().unwrap();
+        if self.hits.generation != s.search_epoch.load(Ordering::Acquire) {
+            return;
+        }
+        c.search_update = Some(SearchUpdate {
+            generation: self.hits.generation,
+            result: Ok(self.hits.clone()),
+            complete,
+            elapsed: self.started.elapsed(),
+        });
+        self.published = self.hits.count;
+        self.last = Instant::now();
+        drop(c);
+        s.ctx.request_repaint();
+    }
+    fn prune(&mut self, s: &Shared, cancel: &dyn Fn() -> bool) -> Result<(), String> {
+        let revision = s.index.lock().unwrap().replacements;
+        if revision == self.replacements {
+            return Ok(());
+        }
+        let next = self.hits.data.lock().unwrap().next;
+        for n in 0..next {
+            if cancel() {
+                return Err("Search cancelled".into());
+            }
+            let (edge, r) = {
+                let d = self.hits.data.lock().unwrap();
+                let edge = d
+                    .store
+                    .directory_find(d.directory, n, false, cancel)?
+                    .ok_or("Missing hit")?;
+                if edge[7] == 0 {
+                    continue;
+                }
+                (edge, d.store.get(edge[2], cancel)?)
+            };
+            let live = {
+                let i = s.index.lock().unwrap();
+                i.node(r[1])?[2] == r[2] && i.live_ancestor(r[1])? == r[1]
+            };
+            if !live {
+                let mut d = self.hits.data.lock().unwrap();
+                let root = d.directory;
+                d.directory = d.store.directory_put(root, [n, edge[2], 0, 0, 1], cancel)?;
+                d.count -= 1;
+            }
+        }
+        self.replacements = revision;
+        self.notify(s, false, true);
         Ok(())
     }
-    fn finish(self) -> Hits {
-        Hits {
-            generation: self.generation,
-            session: self.session,
-            store: Arc::new(Mutex::new(self.store)),
-            first: self.first,
-            count: self.count,
+    fn push(
+        &mut self,
+        s: &Shared,
+        id: u64,
+        start: u64,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        self.prune(s, cancel)?;
+        let i = s.index.lock().unwrap();
+        if i.node(id)?[2] != start || i.live_ancestor(id)? != id {
+            return Ok(());
         }
+        drop(i);
+        let mut d = self.hits.data.lock().unwrap();
+        let record = d
+            .store
+            .append([8, id, start, 1, 0, 0, 0, 0, 0, 0, 0, 0], cancel)?;
+        let root = d.directory;
+        let next = d.next;
+        d.directory = d
+            .store
+            .directory_put(root, [next, record, 1, 0, 1], cancel)?;
+        d.next += 1;
+        d.count += 1;
+        drop(d);
+        self.notify(s, false, false);
+        Ok(())
     }
+    fn finish(mut self) -> Hits {
+        self.hits.count = self.hits.data.lock().unwrap().count;
+        self.hits
+    }
+}
+pub struct SearchUpdate {
+    generation: u64,
+    pub result: Result<Hits, String>,
+    pub complete: bool,
+    pub elapsed: Duration,
 }
 // Node tags: 6 = discovered/range known, 9 = recursively indexed.
 // Node words: tag, kind, start, end, parent, key start/end, ordinal,
@@ -83,6 +195,7 @@ struct Index {
     root: u64,
     expand_all: bool,
     replaced: bool,
+    replacements: u64,
 }
 impl Index {
     fn node(&self, id: u64) -> Result<Record, String> {
@@ -259,6 +372,8 @@ pub struct Completion {
     pub elapsed: Duration,
 }
 struct Control {
+    search_operation: Option<(u64, super::search::Query)>,
+    search_update: Option<SearchUpdate>,
     export_operation: Option<(u64, Operation)>,
     export_completion: Option<(u64, Completion)>,
     start: u64,
@@ -369,6 +484,7 @@ impl Shared {
             let old = i.node(id)?;
             if start > old[2] {
                 i.replaced = true;
+                i.replacements = i.replacements.wrapping_add(1);
                 let r = [
                     6,
                     kind as u64,
@@ -497,8 +613,11 @@ impl Session {
                 root: NONE,
                 expand_all: false,
                 replaced: false,
+                replacements: 0,
             }),
             control: Mutex::new(Control {
+                search_operation: None,
+                search_update: None,
                 export_operation: None,
                 export_completion: None,
                 start: 0,
@@ -549,11 +668,13 @@ impl Session {
         let priority = std::thread::spawn(move || priority_worker(&fast));
         let op = s.clone();
         let operations = std::thread::spawn(move || operation_worker(&op, false));
+        let search = s.clone();
+        let searcher = std::thread::spawn(move || search_worker(&search));
         let output = s.clone();
         let exporter = std::thread::spawn(move || operation_worker(&output, true));
         Ok(Self {
             shared: s,
-            threads: vec![scanner, pager, priority, operations, exporter],
+            threads: vec![scanner, pager, priority, operations, exporter, searcher],
         })
     }
     pub fn budget(&self) -> BudgetManager {
@@ -597,8 +718,12 @@ impl Session {
         self.shared.changed.notify_all();
     }
     pub fn submit(&self, op: Operation) {
-        if matches!(op, Operation::Search(_)) {
+        if let Operation::Search(q) = op {
             self.clear_search();
+            let epoch = self.shared.search_epoch.load(Ordering::Acquire);
+            self.shared.control.lock().unwrap().search_operation = Some((epoch, q));
+            self.shared.changed.notify_all();
+            return;
         }
         if matches!(op, Operation::Export { .. }) {
             let n = self.shared.export_epoch.fetch_add(1, Ordering::Relaxed) + 1;
@@ -617,7 +742,16 @@ impl Session {
         self.shared.changed.notify_all();
     }
     pub fn clear_search(&self) {
-        self.shared.search_epoch.fetch_add(1, Ordering::Relaxed);
+        self.shared.search_epoch.fetch_add(1, Ordering::AcqRel);
+        let mut c = self.shared.control.lock().unwrap();
+        c.search_operation = None;
+        c.search_update = None;
+    }
+    pub fn search_update(&self) -> Option<SearchUpdate> {
+        let mut c = self.shared.control.lock().unwrap();
+        c.search_update
+            .take()
+            .filter(|u| u.generation == self.shared.search_epoch.load(Ordering::Acquire))
     }
     pub fn cancel_operation(&self) {
         self.shared.epoch.fetch_add(1, Ordering::Relaxed);
@@ -773,6 +907,7 @@ struct Parser<'a> {
     r: Reader<'a>,
     cancel: &'a dyn Fn() -> bool,
     local: Option<(u64, u64)>,
+    search: Option<(&'a super::search::Matcher, &'a mut HitWriter)>,
 }
 impl Parser<'_> {
     fn value(
@@ -798,6 +933,32 @@ impl Parser<'_> {
             NONE
         };
         let register = register && id != NONE;
+        let mut matched = false;
+        let mut consumed_string = false;
+        if let Some((matcher, output)) = self.search.as_mut() {
+            output.prune(self.s, self.cancel)?;
+            if register {
+                let mut reader = Reader::new(&self.s.snapshot)?.with_cancellation(self.cancel);
+                matched = matcher.keys()
+                    && key.0 != NONE
+                    && matcher.range(&mut reader, key.0, key.1, true, self.cancel)?;
+                if matched {
+                    output.push(self.s, id, start, self.cancel)?;
+                }
+                // Literals can be reported from a bounded decoded prefix of a huge string.
+                if !matched && matcher.values() && k == Kind::String && !matcher.is_regex() {
+                    matched = matcher.stream_string(
+                        &mut reader,
+                        start,
+                        self.s.source.bytes,
+                        self.cancel,
+                        &mut || output.push(self.s, id, start, self.cancel),
+                    )?;
+                    self.r.pos = reader.pos;
+                    consumed_string = true;
+                }
+            }
+        }
         if k.container() {
             self.r.next()?;
             space(&mut self.r)?;
@@ -839,13 +1000,32 @@ impl Parser<'_> {
             } else {
                 self.r.next()?;
             }
-        } else {
+        } else if !consumed_string {
             scalar(&mut self.r, k)?;
         }
         if register {
             self.s.finish(id, start, self.r.pos, self.local.is_none())?;
+            if let Some((matcher, output)) = self.search.as_mut() {
+                if !matched
+                    && matcher.values()
+                    && !k.container()
+                    && (k != Kind::String || matcher.is_regex())
+                {
+                    let mut reader = Reader::new(&self.s.snapshot)?.with_cancellation(self.cancel);
+                    if matcher.range(
+                        &mut reader,
+                        start,
+                        self.r.pos,
+                        k == Kind::String,
+                        self.cancel,
+                    )? {
+                        output.push(self.s, id, start, self.cancel)?;
+                    }
+                }
+                output.notify(self.s, false, false);
+            }
         }
-        if self.local.is_none() {
+        if self.local.is_none() && self.search.is_none() {
             self.s.scanned.fetch_max(self.r.pos, Ordering::Relaxed);
         }
         Ok(true)
@@ -864,6 +1044,7 @@ fn scan_all(s: &Shared) -> Result<(), String> {
         r,
         cancel: &cancel,
         local: None,
+        search: None,
     };
     p.value((NONE, NONE), (NONE, NONE, 0), 0, 0, true)?;
     space(&mut p.r)?;
@@ -911,6 +1092,7 @@ fn priority_worker(s: &Shared) {
                 r: reader,
                 cancel: &cancel,
                 local: Some((r[2], task.2)),
+                search: None,
             };
             let parent_start = if r[4] == NONE {
                 NONE
@@ -1042,6 +1224,11 @@ fn apply(s: &Shared, a: Action) -> Result<(), String> {
         let c = s.control.lock().unwrap();
         (c.selected, c.start)
     };
+    let hit = if let Action::Hit(h, n) = &a {
+        h.target(*n).ok()
+    } else {
+        None
+    };
     let mut i = s.index.lock().unwrap();
     if i.root == NONE {
         return Ok(());
@@ -1057,7 +1244,14 @@ fn apply(s: &Shared, a: Action) -> Result<(), String> {
             {
                 return Ok(());
             }
-            next = hits.get(n)?;
+            let _ = n;
+            let Some((id, source_start)) = hit else {
+                return Ok(());
+            };
+            if i.node(id)?[2] != source_start || i.live_ancestor(id)? != id {
+                return Ok(());
+            }
+            next = id;
             i.reveal(next)?;
             scroll = true;
         }
@@ -1321,6 +1515,90 @@ fn pager(s: &Shared) {
         std::thread::sleep(Duration::from_millis(16));
     }
 }
+fn search_worker(s: &Shared) {
+    loop {
+        let (epoch, q) = {
+            let mut c = s.control.lock().unwrap();
+            while c.search_operation.is_none() && !s.cancelled() {
+                c = s
+                    .changed
+                    .wait_timeout(c, Duration::from_millis(25))
+                    .unwrap()
+                    .0;
+            }
+            if s.cancelled() {
+                return;
+            }
+            c.search_operation.take().unwrap()
+        };
+        let cancel = || s.cancelled() || s.search_epoch.load(Ordering::Acquire) != epoch;
+        let started = Instant::now();
+        let result = (|| -> Result<(), String> {
+            let _lease = s.budget.reserve(
+                Resource::Memory,
+                2 * 1024 * 1024,
+                "streaming search workspace",
+            )?;
+            let matcher = super::search::Matcher::new(q, &s.budget)?;
+            let mut output = HitWriter::new(s, &cancel, true)?;
+            output.hits.generation = epoch;
+            output.notify(s, false, true);
+            let streaming = !s.ready.load(Ordering::Acquire);
+            if !streaming {
+                let root = s.index.lock().unwrap().root;
+                search_node(s, root, &matcher, &mut output, &cancel)?;
+            } else {
+                let mut r = Reader::new(&s.snapshot)?.with_cancellation(&cancel);
+                if r.peek()? == Some(0xef) {
+                    for b in [0xef, 0xbb, 0xbf] {
+                        r.expect(b)?;
+                    }
+                }
+                let mut parser = Parser {
+                    s,
+                    r,
+                    cancel: &cancel,
+                    local: None,
+                    search: Some((&matcher, &mut output)),
+                };
+                parser.value((NONE, NONE), (NONE, NONE, 0), 0, 0, true)?;
+                space(&mut parser.r)?;
+                if parser.r.peek()?.is_some() {
+                    return Err(parser.r.error("trailing characters"));
+                }
+            }
+            if cancel() {
+                return Err("Search cancelled".into());
+            }
+            output.prune(s, &cancel)?;
+            // Duplicates retain their first directory position and last value.
+            // Rebuild only this case in canonical directory order after the stream validates.
+            if streaming && s.index.lock().unwrap().replacements != 0 {
+                let mut final_output = HitWriter::new(s, &cancel, false)?;
+                final_output.hits.generation = epoch;
+                let root = s.index.lock().unwrap().root;
+                search_node(s, root, &matcher, &mut final_output, &cancel)?;
+                final_output.publish = true;
+                final_output.started = started;
+                final_output.notify(s, true, true);
+            } else {
+                output.notify(s, true, true);
+            }
+            Ok(())
+        })();
+        if !cancel()
+            && let Err(e) = result
+        {
+            s.control.lock().unwrap().search_update = Some(SearchUpdate {
+                generation: epoch,
+                result: Err(e),
+                complete: true,
+                elapsed: started.elapsed(),
+            });
+            s.ctx.request_repaint();
+        }
+    }
+}
 fn operation_worker(s: &Shared, export: bool) {
     loop {
         let (epoch, op) = {
@@ -1510,13 +1788,7 @@ fn operate(s: &Shared, op: Operation, cancel: &dyn Fn() -> bool) -> Result<Outpu
         Operation::Search(q) => {
             let matcher = super::search::Matcher::new(q, &s.budget)?;
             let root = s.index.lock().unwrap().root;
-            let mut ids = HitWriter {
-                generation: s.search_epoch.load(Ordering::Relaxed),
-                session: s.session,
-                store: Store::new(&s.budget, cancel)?,
-                first: NONE,
-                count: 0,
-            };
+            let mut ids = HitWriter::new(s, cancel, false)?;
             search_node(s, root, &matcher, &mut ids, cancel)?;
             Ok(Output::Search(ids.finish()))
         }
@@ -1572,7 +1844,7 @@ fn search_node(
                 && matcher.range(&mut reader, r[2], r[3], k == Kind::String, cancel)?);
     drop(reader);
     if hit {
-        output.push(id, cancel)?;
+        output.push(s, id, r[2], cancel)?;
     }
     for n in 0..r[9] {
         let child = s
@@ -1904,6 +2176,7 @@ mod tests {
             r: reader,
             cancel: &cancel,
             local: Some((r[2], 64)),
+            search: None,
         };
         let parent_start = s.shared.index.lock().unwrap().node(r[4]).unwrap()[2];
         p.value((r[4], parent_start), (r[5], r[6], hash), r[7], 0, true)
@@ -2101,6 +2374,7 @@ mod tests {
             r: reader,
             cancel: &no_cancel,
             local: Some((0, 64)),
+            search: None,
         };
         p.value((NONE, NONE), (NONE, NONE, 0), 0, 0, true).unwrap();
         drop(p);
@@ -2160,6 +2434,7 @@ mod tests {
             r: reader,
             cancel: &no_cancel,
             local: None,
+            search: None,
         };
         p.value((root, 0), (1, 4, hash), 0, 0, true).unwrap();
         drop(p);
@@ -2188,6 +2463,7 @@ mod tests {
             r: reader,
             cancel: &no_cancel,
             local: Some((0, 64)),
+            search: None,
         };
         p.value((NONE, NONE), (NONE, NONE, 0), 0, 0, true).unwrap();
         drop(p);
@@ -2211,6 +2487,222 @@ mod tests {
             value(&s, root),
             serde_json::from_slice::<serde_json::Value>(text).unwrap()
         );
+        retire(s);
+    }
+    fn search_only(input: &Input) -> Session {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut s = Session::start(
+            Source::open(&input.0).unwrap(),
+            cancel.clone(),
+            Default::default(),
+        )
+        .unwrap();
+        for t in std::mem::take(&mut s.threads) {
+            t.join().unwrap();
+        }
+        cancel.store(false, Ordering::Relaxed);
+        let shared = s.shared.clone();
+        s.threads
+            .push(std::thread::spawn(move || search_worker(&shared)));
+        s
+    }
+    fn search_done(s: &Session) -> Hits {
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(update) = s.search_update() {
+                let hits = update.result.unwrap();
+                if update.complete {
+                    return hits;
+                }
+            }
+            assert!(Instant::now() < until, "search timeout");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn search_publishes_and_reveals_before_value_end_without_global_indexer() {
+        let input = Input::new(
+            format!(
+                "{{\"a\":{{\"text\":\"needle{}\"}},\"tail\":0}}",
+                "x".repeat(16 * 1024 * 1024)
+            )
+            .as_bytes(),
+        );
+        let s = search_only(&input);
+        s.submit(Operation::Search(super::super::search::Query::literal(
+            "needle",
+        )));
+        let until = Instant::now() + Duration::from_secs(10);
+        let first = loop {
+            if let Some(update) = s.search_update() {
+                let hits = update.result.unwrap();
+                if !hits.is_empty() {
+                    assert!(!update.complete);
+                    break hits;
+                }
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(!s.statistics().ready);
+        let id = first.get(0).unwrap();
+        assert_eq!(s.shared.index.lock().unwrap().node(id).unwrap()[3], NONE);
+        apply(&s.shared, Action::Hit(first.clone(), 0)).unwrap();
+        assert_eq!(s.shared.control.lock().unwrap().selected, id);
+        assert_eq!(path(&s.shared, id, 1024, &|| false).unwrap(), "$.a.text");
+        // Regular operations have an independent cancellation generation.
+        s.submit(Operation::Path(id));
+        s.cancel_operation();
+        let hits = search_done(&s);
+        assert_eq!(hits.len(), 1);
+        assert!(!s.statistics().ready);
+        drop(first);
+        drop(hits);
+        retire(s);
+    }
+    #[test]
+    fn streaming_duplicate_hits_are_retracted_and_final_order_is_canonical() {
+        let input =
+            Input::new(br#"{"a":{"old":"hit"},"b":"hit","a":{"new":"hit"},"c":"hit","c":"gone"}"#);
+        let s = search_only(&input);
+        s.submit(Operation::Search(super::super::search::Query::literal(
+            "hit",
+        )));
+        let hits = search_done(&s);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            path(&s.shared, hits.get(0).unwrap(), 1024, &|| false).unwrap(),
+            "$.a.new"
+        );
+        assert_eq!(
+            path(&s.shared, hits.get(1).unwrap(), 1024, &|| false).unwrap(),
+            "$.b"
+        );
+        assert_eq!(s.shared.index.lock().unwrap().replacements, 2);
+        drop(hits);
+        retire(s);
+    }
+    #[test]
+    fn stale_hits_cannot_select_a_new_value_reusing_the_same_node_id() {
+        let input = Input::new(br#"{"a":"hit","a":"gone"}"#);
+        let s = search_only(&input);
+        let root = s
+            .shared
+            .register(Kind::Object, 0, (NONE, NONE), (NONE, NONE, 0), 0)
+            .unwrap();
+        let mut r = Reader::new(&s.shared.snapshot).unwrap();
+        r.pos = 1;
+        let hash = string(&mut r).unwrap();
+        drop(r);
+        let id = s
+            .shared
+            .register(Kind::String, 5, (root, 0), (1, 4, hash), 0)
+            .unwrap();
+        let mut writer = HitWriter::new(&s.shared, &|| false, false).unwrap();
+        writer.push(&s.shared, id, 5, &|| false).unwrap();
+        let mut active = HitWriter::new(&s.shared, &|| false, false).unwrap();
+        active.push(&s.shared, id, 5, &|| false).unwrap();
+        let hits = writer.finish();
+        s.shared
+            .register(Kind::String, 15, (root, 0), (11, 14, hash), 1)
+            .unwrap();
+        apply(&s.shared, Action::Hit(hits.clone(), 0)).unwrap();
+        assert_ne!(s.shared.control.lock().unwrap().selected, id);
+        active.prune(&s.shared, &|| false).unwrap();
+        let pruned = active.finish();
+        assert_eq!(pruned.len(), 0);
+        assert!(pruned.get(0).is_err());
+        drop(pruned);
+        drop(hits);
+        retire(s);
+    }
+    #[test]
+    fn streaming_search_cancellation_and_new_generation_discard_old_updates() {
+        let input = Input::new(
+            format!("[\"needle{}\",\"latest\"]", "x".repeat(4 * 1024 * 1024)).as_bytes(),
+        );
+        let s = search_only(&input);
+        s.submit(Operation::Search(super::super::search::Query::literal(
+            "needle",
+        )));
+        s.clear_search();
+        s.submit(Operation::Search(super::super::search::Query::literal(
+            "latest",
+        )));
+        let hits = search_done(&s);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            path(&s.shared, hits.get(0).unwrap(), 1024, &|| false).unwrap(),
+            "$[1]"
+        );
+        s.clear_search();
+        assert!(s.search_update().is_none());
+        drop(hits);
+        retire(s);
+    }
+    #[test]
+    fn streaming_search_rejects_invalid_tail_and_oversized_regex() {
+        for (text, regex, expected) in [
+            (br#"["hit",0] trailing"#.to_vec(), false, "trailing"),
+            (
+                format!("[\"hit{}\"]", "x".repeat(300 * 1024)).into_bytes(),
+                true,
+                "256 KiB",
+            ),
+        ] {
+            let input = Input::new(&text);
+            let s = search_only(&input);
+            let mut q = super::super::search::Query::literal("hit");
+            q.regex = regex;
+            s.submit(Operation::Search(q));
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(update) = s.search_update()
+                    && update.complete
+                {
+                    assert!(update.result.err().unwrap().contains(expected));
+                    break;
+                }
+                assert!(Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            retire(s);
+        }
+    }
+    #[test]
+    fn stream_and_ready_search_agree_for_decoded_and_chunk_boundary_literals() {
+        let text = format!(
+            r#"{{"na\u006de":"{}\uD83D\uDE00AbC","n":1E2,"a":[true,null,"ABC"]}}"#,
+            "x".repeat(65535)
+        );
+        let input = Input::new(text.as_bytes());
+        let s = search_only(&input);
+        for (term, expected) in [
+            ("😀abc", 1),
+            ("name", 1),
+            ("e+2", 1),
+            ("true", 1),
+            ("missing", 0),
+        ] {
+            let q = super::super::search::Query::literal(term);
+            s.submit(Operation::Search(q.clone()));
+            let hits = search_done(&s);
+            assert_eq!(hits.len(), expected, "{term}");
+            // The streaming parser has built complete ranges, but global Ready stays false.
+            s.shared.ready.store(true, Ordering::Release);
+            let Output::Search(reference) =
+                operate(&s.shared, Operation::Search(q), &|| false).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(hits.len(), reference.len(), "{term}");
+            for n in 0..hits.len() {
+                assert_eq!(hits.get(n).unwrap(), reference.get(n).unwrap());
+            }
+            s.shared.ready.store(false, Ordering::Release);
+            drop(hits);
+            drop(reference);
+        }
         retire(s);
     }
 }

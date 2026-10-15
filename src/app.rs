@@ -2147,6 +2147,15 @@ pub fn benchmark_recursive(
     recursive_ui::benchmark(path, indexed, search_cases)
 }
 
+#[allow(dead_code, reason = "Streaming search desktop benchmark entry")]
+pub fn benchmark_stream_search(
+    path: PathBuf,
+    indexed: bool,
+    term: String,
+) -> Result<serde_json::Value, String> {
+    recursive_ui::benchmark_stream_search(path, indexed, term)
+}
+
 #[allow(dead_code, reason = "Original-UI top-level discovery benchmark entry")]
 pub fn benchmark_top_level(path: PathBuf, indexed: bool) -> Result<serde_json::Value, String> {
     if cfg!(windows) {

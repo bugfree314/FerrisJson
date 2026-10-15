@@ -59,6 +59,9 @@ impl Matcher {
             _lease: lease,
         })
     }
+    pub(crate) fn is_regex(&self) -> bool {
+        self.query.regex
+    }
     pub fn keys(&self) -> bool {
         self.query.scope != SearchScope::Values
     }
@@ -75,6 +78,32 @@ impl Matcher {
         end: u64,
         string: bool,
         cancel: &dyn Fn() -> bool,
+    ) -> Result<bool, String> {
+        self.range_inner(reader, start, end, string, cancel, false, &mut || Ok(()))
+    }
+    pub(crate) fn stream_string(
+        &self,
+        reader: &mut Reader<'_>,
+        start: u64,
+        end: u64,
+        cancel: &dyn Fn() -> bool,
+        hit: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.range_inner(reader, start, end, true, cancel, true, hit)
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Shared bounded matcher with an optional early-hit callback"
+    )]
+    fn range_inner(
+        &self,
+        reader: &mut Reader<'_>,
+        start: u64,
+        end: u64,
+        string: bool,
+        cancel: &dyn Fn() -> bool,
+        consume: bool,
+        hit: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<bool, String> {
         if self.query.term.is_empty() {
             return Ok(false);
@@ -94,6 +123,7 @@ impl Matcher {
         }) as usize;
         let mut window = String::with_capacity(capacity);
         let mut added = 0;
+        let mut found = false;
         loop {
             let c = if string {
                 reader.character()?
@@ -105,6 +135,9 @@ impl Matcher {
             let Some(c) = c else {
                 break;
             };
+            if found && consume {
+                continue;
+            }
             // serde_json arbitrary_precision preserves digits but canonicalizes
             // exponent markers and supplies a missing positive exponent sign.
             if numeric && matches!(c, 'e' | 'E') {
@@ -123,7 +156,13 @@ impl Matcher {
                 }
                 if !self.query.regex {
                     if self.text(&window) {
-                        return Ok(true);
+                        if !consume {
+                            return Ok(true);
+                        }
+                        hit()?;
+                        found = true;
+                        window.clear();
+                        continue;
                     }
                     let mut boundary = window.len().saturating_sub(self.overlap);
                     while !window.is_char_boundary(boundary) {
@@ -137,7 +176,13 @@ impl Matcher {
         if cancel() {
             return Err("Search cancelled".into());
         }
-        Ok(self.text(&window))
+        if !found && self.text(&window) {
+            if consume {
+                hit()?;
+            }
+            found = true;
+        }
+        Ok(found)
     }
 }
 pub enum Input {

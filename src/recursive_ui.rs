@@ -13,16 +13,23 @@ pub(super) struct View {
     results: Option<(String, Vec<u64>, String)>,
     querying: bool,
     work_label: &'static str,
+    searching: bool,
+    search_revealed: bool,
     busy: bool,
     exporting: bool,
 }
 impl View {
     pub(super) fn match_label(&self) -> String {
         let n = self.matches.as_ref().map_or(0, |h| h.len());
-        format!("{} / {}", if n == 0 { 0 } else { self.match_index + 1 }, n)
+        format!(
+            "{} / {}{}",
+            if n == 0 { 0 } else { self.match_index + 1 },
+            n,
+            if self.searching { " (searching)" } else { "" }
+        )
     }
     pub(super) fn search_busy(&self) -> bool {
-        self.busy && self.work_label == "Search"
+        self.searching
     }
     pub(super) fn query_busy(&self) -> bool {
         self.busy && self.work_label == "Path"
@@ -143,6 +150,35 @@ impl Viewer {
         };
         if s.statistics().ready && self.open_duration.is_none() {
             self.open_duration = self.load_started.take().map(|t| t.elapsed());
+        }
+        if let Some(update) = s.search_update() {
+            self.progressive.searching = !update.complete;
+            if update.complete {
+                self.query_duration = Some(("Search", update.elapsed));
+            }
+            match update.result {
+                Ok(hits) => {
+                    self.progressive.match_index = self
+                        .progressive
+                        .match_index
+                        .min(hits.len().saturating_sub(1));
+                    if !self.progressive.search_revealed && !hits.is_empty() {
+                        self.progressive.search_revealed = true;
+                        self.progressive.match_index = if self.search_reverse {
+                            hits.len() - 1
+                        } else {
+                            0
+                        };
+                        s.action(FileAction::Hit(hits.clone(), self.progressive.match_index));
+                    }
+                    self.progressive.matches = Some(hits);
+                    self.search_error = None;
+                }
+                Err(e) => {
+                    self.progressive.matches = None;
+                    self.search_error = Some(e);
+                }
+            }
         }
         if let Some(completed) = s.completion() {
             if completed.export {
@@ -372,13 +408,14 @@ impl Viewer {
     }
     pub(super) fn progressive_search(&mut self) {
         self.search_due = None;
-        self.progressive.querying = false;
-        self.progressive.work_label = "Search";
         self.progressive.matches = None;
+        self.progressive.match_index = 0;
+        self.progressive.search_revealed = false;
+        self.progressive.searching = false;
         self.search_error = None;
         if self.term.is_empty() {
             if let Some(s) = &self.progressive.session {
-                s.cancel_operation();
+                s.clear_search();
             }
             return;
         }
@@ -389,7 +426,7 @@ impl Viewer {
                 regex: self.regex,
                 scope: self.scope,
             }));
-            self.progressive.busy = true;
+            self.progressive.searching = true;
         }
     }
     pub(super) fn progressive_cancel_export(&mut self) {
@@ -411,6 +448,7 @@ impl Viewer {
             s.clear_search();
         }
         self.progressive.busy = false;
+        self.progressive.searching = false;
     }
     pub(super) fn progressive_query(&mut self) {
         self.progressive.results = None;
@@ -436,11 +474,17 @@ impl Viewer {
         if len == 0 {
             return;
         }
-        let n = count as u64 % len;
-        self.progressive.match_index = if backwards {
-            (self.progressive.match_index + len - n) % len
+        let n = count as u64;
+        self.progressive.match_index = if self.progressive.searching {
+            if backwards {
+                self.progressive.match_index.saturating_sub(n)
+            } else {
+                self.progressive.match_index.saturating_add(n).min(len - 1)
+            }
+        } else if backwards {
+            (self.progressive.match_index + len - n % len) % len
         } else {
-            (self.progressive.match_index + n) % len
+            (self.progressive.match_index + n % len) % len
         };
         if let Some(s) = &self.progressive.session {
             s.action(FileAction::Hit(hits.clone(), self.progressive.match_index));
@@ -653,7 +697,7 @@ pub(super) fn benchmark(
             app.scope = SearchScope::Values;
             app.progressive_search();
             let begin = Instant::now();
-            while app.progressive.busy {
+            while app.progressive.search_busy() {
                 app.poll_progressive();
                 if let Some(e) = &app.search_error {
                     return Err(e.clone());
@@ -736,6 +780,151 @@ pub(super) fn benchmark(
     }
     Ok(
         serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"scope":"B default original UI headless egui submission; full recursive validation; no native presentation","indexed_setting":indexed,"searches":searches,"navigation":navigation,"headless_frame_p95_us":p95,"headless_frame_max_us":maximum,"first_frame_us":first,"first_expand_us":expanded,"complete_us":complete_us,"statistics":statistics,"no_legacy_document":no_legacy,"resources_after_retire":usage,"cleanup_us":cancel.elapsed().as_micros()as u64}),
+    )
+}
+
+pub(super) fn benchmark_stream_search(
+    path: PathBuf,
+    indexed: bool,
+    term: String,
+) -> Result<serde_json::Value, String> {
+    let ctx = egui::Context::default();
+    let mut app = Viewer::empty();
+    app.colors.indexed_files = indexed;
+    let opened = Instant::now();
+    app.load_file(path, &ctx);
+    let mut submitted: Option<Instant> = None;
+    let mut first_result = None;
+    let mut first_reveal = None;
+    let mut first_ready = None;
+    let mut search_complete = None;
+    let mut index_complete = None;
+    let mut ready_at_submit = false;
+    let mut frames = std::collections::VecDeque::with_capacity(4096);
+    let budget = loop {
+        let frame = Instant::now();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1120.0, 760.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        if frames.len() == 4096 {
+            frames.pop_front();
+        }
+        frames.push_back(frame.elapsed().as_micros() as u64);
+        if let Some(error) = app.error.as_ref().or(app.search_error.as_ref()) {
+            return Err(error.clone());
+        }
+        if let Some(page) = &app.progressive.page {
+            if let Some(submit_time) = submitted {
+                let elapsed = submit_time.elapsed().as_micros() as u64;
+                if app
+                    .progressive
+                    .matches
+                    .as_ref()
+                    .is_some_and(|h| !h.is_empty())
+                {
+                    if first_result.is_none() {
+                        first_result = Some(elapsed);
+                        first_ready =
+                            Some(app.progressive.session.as_ref().unwrap().statistics().ready);
+                    }
+                    if (page.selection.path != "$" || !page.selection.kind.container())
+                        && first_reveal.is_none()
+                    {
+                        first_reveal = Some(elapsed);
+                    }
+                }
+                if !app.progressive.search_busy() && search_complete.is_none() {
+                    search_complete = Some(elapsed);
+                }
+                if page.ready && index_complete.is_none() {
+                    index_complete = Some(opened.elapsed().as_micros() as u64);
+                }
+                if search_complete.is_some()
+                    && index_complete.is_some()
+                    && (app
+                        .progressive
+                        .matches
+                        .as_ref()
+                        .is_none_or(|h| h.is_empty())
+                        || first_reveal.is_some())
+                {
+                    break app.progressive.session.as_ref().unwrap().budget();
+                }
+            } else {
+                ready_at_submit = app.progressive.session.as_ref().unwrap().statistics().ready;
+                app.term = term.clone();
+                app.scope = SearchScope::Values;
+                submitted = Some(Instant::now());
+                app.progressive_search();
+            }
+        }
+        if opened.elapsed() > Duration::from_secs(600) {
+            return Err("Streaming search benchmark timeout".into());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let hits = app
+        .progressive
+        .matches
+        .as_ref()
+        .ok_or("Missing completed search")?
+        .clone();
+    let count = hits.len();
+    let mut navigation = Vec::new();
+    if count > 0 {
+        for rank in [0, count / 2, count - 1] {
+            app.progressive
+                .session
+                .as_ref()
+                .unwrap()
+                .action(FileAction::Hit(hits.clone(), rank));
+            let previous = app.progressive.page.as_ref().unwrap().clone();
+            let begin = Instant::now();
+            loop {
+                app.poll_progressive();
+                if let Some(error) = &app.error {
+                    return Err(error.clone());
+                }
+                if let Some(page) = &app.progressive.page
+                    && !Arc::ptr_eq(page, &previous)
+                {
+                    navigation.push(serde_json::json!({"match_rank":rank,"path":page.selection.path,"latency_us":begin.elapsed().as_micros() as u64}));
+                    break;
+                }
+                if begin.elapsed() > Duration::from_secs(30) {
+                    return Err("Search navigation timeout".into());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    drop(hits);
+    let usage_before = budget.usage();
+    let mut frames = frames.into_iter().collect::<Vec<_>>();
+    frames.sort_unstable();
+    let p95 = frames[frames.len().saturating_sub(1) * 95 / 100];
+    let maximum = frames.last().copied().unwrap_or(0);
+    let no_legacy = app.doc.is_none() && app.rows.is_empty() && app.expanded.is_empty();
+    app.clear_progressive();
+    drop(app);
+    crate::shutdown::finish();
+    let usage = budget.usage();
+    if usage.memory != 0 || usage.disk != 0 || !no_legacy {
+        return Err(format!("Retained resources or legacy document: {usage:?}"));
+    }
+    Ok(
+        serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"scope":"C original UI headless egui submission; search starts at first page; no native presentation",
+        "indexed_setting":indexed,"term":term,"count":count,"ready_at_submit":ready_at_submit,"ready_at_first_result":first_ready,
+        "first_result_us":first_result,"first_reveal_us":first_reveal,"search_complete_us":search_complete,"index_complete_from_open_us":index_complete,
+        "navigation":navigation,"recent_frame_p95_us":p95,"recent_frame_max_us":maximum,"managed_usage_before_retire":usage_before,"resources_after_retire":usage,"no_legacy_document":no_legacy}),
     )
 }
 
@@ -826,5 +1015,76 @@ mod tests {
         crate::shutdown::finish();
         assert_eq!(budget.usage().memory, 0);
         assert_eq!(budget.usage().disk, 0);
+    }
+    #[test]
+    fn streaming_ui_keeps_selection_and_clamps_navigation_until_completion() {
+        let path = std::env::temp_dir().join(format!("FerrisJson-c-ui-{}.tmp", std::process::id()));
+        std::fs::write(
+            &path,
+            format!(
+                "[\"needle\",\"{}\",\"needle\"]",
+                "x".repeat(16 * 1024 * 1024)
+            ),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Viewer::empty();
+        app.load_file(path.clone(), &ctx);
+        let until = Instant::now() + Duration::from_secs(20);
+        while app.progressive.page.is_none() {
+            app.poll_progressive();
+            assert!(app.error.is_none());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        app.term = "needle".into();
+        app.progressive_search();
+        while app
+            .progressive
+            .matches
+            .as_ref()
+            .is_none_or(|h| h.is_empty())
+        {
+            app.poll_progressive();
+            assert!(app.search_error.is_none());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.progressive.search_busy());
+        assert!(app.progressive.match_label().contains("searching"));
+        app.progressive_match(false, 100);
+        assert_eq!(app.progressive.match_index, 0);
+        // A user navigation after the initial reveal must survive later batches.
+        app.progressive
+            .session
+            .as_ref()
+            .unwrap()
+            .action(FileAction::Rank(0));
+        while app.progressive.search_busy()
+            || app
+                .progressive
+                .page
+                .as_ref()
+                .is_none_or(|p| p.selection.path != "$")
+        {
+            app.poll_progressive();
+            assert!(app.search_error.is_none());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.progressive.matches.as_ref().unwrap().len(), 2);
+        assert_eq!(app.progressive.page.as_ref().unwrap().selection.path, "$");
+        assert!(!app.progressive.match_label().contains("searching"));
+        app.progressive.match_index = 1;
+        app.progressive_match(false, 1);
+        assert_eq!(app.progressive.match_index, 0);
+        app.term.clear();
+        app.progressive_search();
+        assert!(!app.progressive.search_busy());
+        assert!(app.progressive.matches.is_none());
+        app.clear_progressive();
+        drop(app);
+        crate::shutdown::finish();
+        let _ = std::fs::remove_file(path);
     }
 }
