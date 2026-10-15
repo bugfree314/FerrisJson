@@ -177,6 +177,18 @@ impl FileSource {
     pub(crate) fn close(&mut self) {
         self.file.take();
     }
+    pub(crate) fn try_clone(&self) -> io::Result<File> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Source closed"))?
+            .try_clone()
+    }
+    pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Source closed"))?
+            .metadata()
+    }
     pub(crate) fn read_exact_at(&self, offset: u64, bytes: &mut [u8]) -> io::Result<()> {
         self.read_exact_at_cancellable(offset, bytes, &|| false)
     }

@@ -37,6 +37,13 @@ struct CopyRequest {
 }
 
 pub struct Viewer {
+    discovery: Option<crate::engine::top_level::Discovery>,
+    discovery_start: Option<Receiver<crate::engine::top_level::Discovery>>,
+    top_page: Option<Arc<crate::engine::top_level::Page>>,
+    top_selected: u64,
+    top_start: u64,
+    top_expanded: bool,
+    top_source: String,
     doc: Option<Arc<Document>>,
     preview_worker: Option<PreviewWorker>,
     requested_rows: Vec<usize>,
@@ -98,6 +105,136 @@ pub struct Viewer {
 }
 
 impl Viewer {
+    fn discovering(&self) -> bool {
+        self.pending.is_some() && self.discovery.is_some() && self.top_page.is_some()
+    }
+    fn clear_top(&mut self) {
+        self.top_page = None;
+        if let Some(discovery) = self.discovery.take() {
+            crate::shutdown::defer(discovery.retire());
+        }
+        if let Some(rx) = self.discovery_start.take()
+            && let Ok(discovery) = rx.try_recv()
+        {
+            crate::shutdown::defer(discovery.retire());
+        }
+        self.top_selected = 0;
+        self.top_start = 0;
+        self.top_expanded = true;
+    }
+    fn poll_top(&mut self) {
+        if let Some(rx) = &self.discovery_start {
+            match rx.try_recv() {
+                Ok(discovery) => {
+                    self.discovery = Some(discovery);
+                    self.discovery_start = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.discovery_start = None,
+                Err(mpsc::TryRecvError::Empty) => (),
+            }
+        }
+        if let Some(page) = self.discovery.as_ref().and_then(|d| d.poll())
+            && page.start == self.top_start
+            && page.selected == self.top_selected
+        {
+            if self.top_page.is_none() {
+                self.cancel_operations();
+                self.large_copy = None;
+            }
+            self.top_page = Some(page);
+        }
+    }
+    fn top_tree(&mut self, ui: &mut egui::Ui) {
+        let page = self.top_page.as_ref().unwrap().clone();
+        let count = if self.top_expanded {
+            self.discovery.as_ref().unwrap().statistics().rows
+        } else {
+            1
+        };
+        ui.label(RichText::new(&self.top_source).strong());
+        ui.separator();
+        let mut wanted = self.top_start;
+        let mut area = egui::ScrollArea::both()
+            .id_salt("tree")
+            .auto_shrink([false, false]);
+        if self.scroll_to {
+            area = area.vertical_scroll_offset(
+                (self.top_selected as f32 * (25.0 + ui.spacing().item_spacing.y)
+                    - ui.available_height() / 2.0)
+                    .max(0.0),
+            );
+            self.scroll_to = false;
+        }
+        area.show_rows(ui, 25.0, count as usize, |ui, range| {
+            wanted = range.start as u64;
+            for index in range {
+                let Some(row) = page.rows.iter().find(|row| row.index == index as u64) else {
+                    ui.label("Loading...");
+                    continue;
+                };
+                let palette = self.colors.active();
+                let fill = if row.index == self.top_selected {
+                    color(palette.selection)
+                } else if index % 2 == 0 {
+                    color(palette.stripe)
+                } else {
+                    Color32::TRANSPARENT
+                };
+                egui::Frame::new().fill(fill).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.set_height(25.0);
+                        ui.add_space(if row.index == 0 { 0.0 } else { 18.0 });
+                        if row.kind.container() {
+                            if ui
+                                .add_enabled(
+                                    row.index == 0,
+                                    egui::Button::new(if row.index == 0 && self.top_expanded {
+                                        "▾"
+                                    } else {
+                                        "▸"
+                                    })
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                self.top_expanded = !self.top_expanded;
+                                if !self.top_expanded {
+                                    self.top_selected = 0;
+                                    wanted = 0;
+                                }
+                            }
+                        } else {
+                            ui.add_space(26.0);
+                        }
+                        let c = kind_color(row.kind.name(), palette);
+                        if ui
+                            .add(
+                                egui::Label::new(RichText::new(&row.label).monospace().color(c))
+                                    .sense(egui::Sense::click()),
+                            )
+                            .clicked()
+                        {
+                            self.top_selected = row.index;
+                        }
+                        if ui
+                            .add(
+                                egui::Label::new(RichText::new(&row.preview).monospace().color(c))
+                                    .sense(egui::Sense::click()),
+                            )
+                            .clicked()
+                        {
+                            self.top_selected = row.index;
+                        }
+                    });
+                });
+            }
+        });
+        self.top_start = wanted;
+        if let Some(discovery) = &self.discovery {
+            discovery.request(wanted, self.top_selected);
+        }
+    }
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         file: Option<PathBuf>,
@@ -138,6 +275,13 @@ impl Viewer {
     }
     fn empty() -> Self {
         Self {
+            discovery: None,
+            discovery_start: None,
+            top_page: None,
+            top_selected: 0,
+            top_start: 0,
+            top_expanded: true,
+            top_source: String::new(),
             doc: None,
             preview_worker: None,
             requested_rows: Vec::new(),
@@ -199,6 +343,12 @@ impl Viewer {
         }
     }
     fn cursor_location(&self) -> Option<(String, String)> {
+        if self.discovering() {
+            return self
+                .top_page
+                .as_ref()
+                .map(|p| (String::new(), p.selection.path.clone()));
+        }
         self.doc.as_ref()?;
         // Visible IDs stay sorted; avoid scanning the whole document on every frame.
         let row = self.rows.binary_search(&(self.selected as u32)).ok()? + 1;
@@ -227,6 +377,10 @@ impl Viewer {
         if self.pending.is_some() {
             return;
         }
+        self.clear_top();
+        self.top_source = path.display().to_string();
+        let (top_tx, top_rx) = mpsc::sync_channel(1);
+        self.discovery_start = Some(top_rx);
         self.load_started = Some(Instant::now());
         let old = self.prepare_load();
         let waiting = Arc::clone(&self.waiting_for_old);
@@ -248,16 +402,55 @@ impl Viewer {
                 Priority::Background,
                 Cancellation::Flag(Arc::clone(&cancelled)),
                 || {
-                    if indexed {
-                        Document::open_indexed(
-                            &path,
-                            || cancelled.load(Ordering::Relaxed),
-                            &progress,
-                        )
+                    let stable = if cfg!(windows) {
+                        Some(crate::engine::top_level::Source::open(&path)?)
                     } else {
-                        std::fs::read_to_string(&path)
-                            .map_err(|e| format!("Cannot open {}: {e}", path.display()))
-                            .and_then(Document::parse_owned)
+                        None
+                    };
+                    if let Some(source) = &stable
+                        && let Ok(discovery) = crate::engine::top_level::Discovery::start(
+                            source.clone(),
+                            cancelled.clone(),
+                            ctx.clone(),
+                        )
+                    {
+                        discovery.wait_first(Duration::from_millis(20));
+                        let _ = top_tx.send(discovery);
+                        ctx.request_repaint();
+                    }
+                    let result = if indexed {
+                        if let Some(source) = &stable {
+                            Document::open_indexed_file(
+                                source.duplicate_file()?,
+                                || cancelled.load(Ordering::Relaxed),
+                                &progress,
+                            )
+                        } else {
+                            Document::open_indexed(
+                                &path,
+                                || cancelled.load(Ordering::Relaxed),
+                                &progress,
+                            )
+                        }
+                    } else {
+                        let text = if let Some(source) = &stable {
+                            source.read_text(&|| cancelled.load(Ordering::Relaxed))
+                        } else {
+                            read_file_cancellable(&path, &cancelled)
+                        };
+                        text.and_then(|text| {
+                            if cancelled.load(Ordering::Relaxed) {
+                                Err("Loading cancelled".into())
+                            } else {
+                                Document::parse_owned(text)
+                            }
+                        })
+                    };
+                    drop(stable);
+                    if cancelled.load(Ordering::Relaxed) {
+                        Err("Loading cancelled".into())
+                    } else {
+                        result
                     }
                 },
             )
@@ -342,12 +535,18 @@ impl Viewer {
         old
     }
     fn poll(&mut self) {
+        self.poll_top();
         let Some(rx) = &self.pending else {
             return;
         };
         match rx.try_recv() {
             Ok(result) => {
+                let top_pointer = self
+                    .top_page
+                    .as_ref()
+                    .and_then(|p| p.selection.pointer.clone());
                 self.pending = None;
+                self.clear_top();
                 match result {
                     Ok((_doc, _, _))
                         if self.indexing && self.loading_cancelled.load(Ordering::Relaxed) =>
@@ -401,7 +600,10 @@ impl Viewer {
                         self.history_index = 0;
                         self.vim.cancel();
                         self.notice = "Document loaded".into();
-                        self.select(0);
+                        let selected = top_pointer
+                            .and_then(|p| self.doc.as_ref().unwrap().find_path(&p).ok())
+                            .unwrap_or(0);
+                        self.select(selected);
                         self.rebuild_rows();
                     }
                     Err(error) => {
@@ -430,6 +632,7 @@ impl Viewer {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.pending = None;
+                self.clear_top();
                 if self.loading_cancelled.load(Ordering::Relaxed) {
                     self.error = None;
                     self.notice = "Opening cancelled; reopen the previous file if needed".into();
@@ -670,6 +873,10 @@ impl Viewer {
         }
     }
     fn search(&mut self) {
+        if self.discovering() {
+            self.search_due = None;
+            return;
+        }
         self.search_due = None;
         self.matches = NodeIds::default();
         self.search_error = None;
@@ -727,6 +934,9 @@ impl Viewer {
         self.query_duration = Some(("Search", elapsed + started.elapsed()));
     }
     fn go_to_path(&mut self) {
+        if self.discovering() {
+            return;
+        }
         if let Some(worker) = &mut self.path_worker {
             worker.cancel();
         }
@@ -868,6 +1078,15 @@ impl Viewer {
         self.reveal(self.matches[self.match_index] as usize);
     }
     fn copy(&mut self, ctx: &egui::Context, path: bool) {
+        if self.discovering() {
+            if path
+                && let Some(page) = &self.top_page
+                && page.selection.pointer.is_some()
+            {
+                ctx.copy_text(page.selection.path.clone());
+            }
+            return;
+        }
         if path {
             if let Some(doc) = &self.doc {
                 ctx.copy_text(doc.path(self.selected));
@@ -890,6 +1109,9 @@ impl Viewer {
         }
     }
     fn export(&mut self) {
+        if self.discovering() {
+            return;
+        }
         if let Some(doc) = &self.doc {
             self.export_selection(Arc::clone(doc), Selection::Node(self.selected));
         }
@@ -1011,6 +1233,45 @@ impl Viewer {
         {
             self.load_file(file, ctx);
         }
+        if self.discovering() && !ctx.wants_keyboard_input() {
+            let count = if self.top_expanded {
+                self.discovery.as_ref().unwrap().statistics().rows
+            } else {
+                1
+            };
+            let before = self.top_selected;
+            if ctx.input(|i| i.key_pressed(Key::ArrowDown) || i.key_pressed(Key::J)) {
+                self.top_selected = self
+                    .top_selected
+                    .saturating_add(1)
+                    .min(count.saturating_sub(1));
+            }
+            if ctx.input(|i| i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::K)) {
+                self.top_selected = self.top_selected.saturating_sub(1);
+            }
+            if ctx.input(|i| i.key_pressed(Key::Home)) {
+                self.top_selected = 0;
+            }
+            if ctx.input(|i| i.key_pressed(Key::End)) {
+                self.top_selected = count.saturating_sub(1);
+            }
+            if ctx.input(|i| i.key_pressed(Key::PageDown)) {
+                self.top_selected = self
+                    .top_selected
+                    .saturating_add(self.page_rows as u64)
+                    .min(count.saturating_sub(1));
+            }
+            if ctx.input(|i| i.key_pressed(Key::PageUp)) {
+                self.top_selected = self.top_selected.saturating_sub(self.page_rows as u64);
+            }
+            if self.top_selected != before {
+                self.scroll_to = true;
+            }
+            if let Some(discovery) = &self.discovery {
+                discovery.request(self.top_start, self.top_selected);
+            }
+            return;
+        }
         if ctx.wants_keyboard_input() {
             self.vim.cancel();
             return;
@@ -1113,6 +1374,45 @@ impl eframe::App for Viewer {
 }
 impl Viewer {
     fn selection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.discovering() {
+            let page = self.top_page.as_ref().unwrap().clone();
+            let mut wrap_changed = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("Value preview");
+                ui.colored_label(
+                    kind_color(page.selection.kind.name(), self.colors.active()),
+                    page.selection.kind.name(),
+                );
+                wrap_changed = ui.checkbox(&mut self.colors.wrap_values, "Wrap").changed();
+            });
+            if wrap_changed {
+                self.save_colors();
+            }
+            let path = &page.selection.path;
+            ui.add(egui::Label::new(RichText::new(path).monospace()).truncate());
+            ui.horizontal_wrapped(|ui| {
+                ui.add_enabled(false, egui::Button::new("Copy JSON"));
+                if ui
+                    .add_enabled(
+                        page.selection.pointer.is_some(),
+                        egui::Button::new("Copy path"),
+                    )
+                    .clicked()
+                {
+                    self.copy(ctx, true);
+                }
+                ui.add_enabled(false, egui::Button::new("Export"));
+            });
+            ui.separator();
+            json_preview(
+                ui,
+                &page.detail,
+                self.colors.active(),
+                "value_preview",
+                self.colors.wrap_values,
+            );
+            return;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.heading("Value preview");
             let node = self.doc.as_ref().unwrap().node_info(self.selected);
@@ -1149,6 +1449,10 @@ impl Viewer {
         );
     }
     fn results_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.discovering() {
+            ui.heading("JSONPath results");
+            return;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.heading("JSONPath results");
             if ui
@@ -1423,11 +1727,11 @@ impl Viewer {
                     }
                     self.query_duration = None;
                 }
-                if ui.button("Expand all").clicked() {
+                if ui.add_enabled(!self.discovering(), egui::Button::new("Expand all")).clicked() {
                     self.expanded.fill(true);
                     self.rebuild_rows();
                 }
-                if ui.button("Collapse all").clicked() {
+                if ui.add_enabled(!self.discovering(), egui::Button::new("Collapse all")).clicked() {
                     self.expanded.fill(false);
                     self.select(0);
                     self.rebuild_rows();
@@ -1441,7 +1745,7 @@ impl Viewer {
                     if let Some((label, duration)) = self.query_duration {
                         ui.label(format!("{label}: {}", format_duration(duration))).on_hover_text("Includes query, node reveal and selection preview; excludes painting.");
                     }
-                    if self.pending.is_some() {
+                    if self.pending.is_some() && !self.discovering() {
                         if self.indexing { ui.label(self.indexed_progress.status()); }
                         ui.label(if self.waiting_for_old.load(Ordering::Relaxed) {
                             "Waiting for previous document..."
@@ -1453,7 +1757,7 @@ impl Viewer {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.label(RichText::new(if ctx.wants_keyboard_input() { "INPUT" } else { "NORMAL" }).monospace().strong());
                         ui.label(RichText::new(self.vim.display()).monospace().color(Color32::from_rgb(100, 180, 235)));
-                        if let Some(doc) = &self.doc {
+                        if let Some(doc) = &self.doc && !self.discovering() {
                             ui.label(doc.backend_name());
                             ui.label(format!("{} nodes", doc.node_count())).on_hover_text(format!("{:.1} KB", doc.bytes as f64 / 1024.0));
                         }
@@ -1467,7 +1771,7 @@ impl Viewer {
                 });
             });
         });
-        if self.doc.is_some() {
+        if self.doc.is_some() || self.discovering() {
             egui::SidePanel::right("inspector")
                 .default_width(360.0)
                 .width_range(220.0..=700.0)
@@ -1545,6 +1849,10 @@ impl Viewer {
                     }
                 });
                 ui.separator();
+            }
+            if self.discovering() {
+                self.top_tree(ui);
+                return;
             }
             if self.doc.is_none() {
                 ui.vertical_centered(|ui| {
@@ -1756,6 +2064,7 @@ impl Viewer {
 }
 impl Drop for Viewer {
     fn drop(&mut self) {
+        self.clear_top();
         self.loading_cancelled.store(true, Ordering::Relaxed);
         self.export_cancelled.store(true, Ordering::Relaxed);
         self.cancel_operations();
@@ -1765,6 +2074,112 @@ impl Drop for Viewer {
             crate::shutdown::defer(thread);
         }
     }
+}
+
+#[allow(dead_code, reason = "Original-UI top-level discovery benchmark entry")]
+pub fn benchmark_top_level(path: PathBuf, indexed: bool) -> Result<serde_json::Value, String> {
+    let ctx = egui::Context::default();
+    let mut app = Viewer::empty();
+    app.colors.indexed_files = indexed;
+    let started = Instant::now();
+    app.load_file(path, &ctx);
+    let until = Instant::now() + Duration::from_secs(180);
+    let (stage, statistics, budget, labels) = loop {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1120.0, 760.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        if app.discovering()
+            && app
+                .top_page
+                .as_ref()
+                .is_some_and(|p| p.rows.iter().any(|r| r.index > 0))
+        {
+            let discovery = app.discovery.as_ref().unwrap();
+            break (
+                "top-level",
+                Some(discovery.statistics()),
+                Some(discovery.budget()),
+                app.top_page
+                    .as_ref()
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .take(4)
+                    .map(|r| r.label.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if app.pending.is_none() {
+            if let Some(error) = &app.error {
+                return Err(error.clone());
+            }
+            if app.doc.is_some() {
+                break ("complete-document", None, None, Vec::new());
+            }
+        }
+        if Instant::now() >= until {
+            return Err("Top-level display timeout".into());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let first_frame_us = started.elapsed().as_micros() as u64;
+    let cancel_started = Instant::now();
+    app.loading_cancelled.store(true, Ordering::Relaxed);
+    app.clear_top();
+    while app.pending.is_some() {
+        app.poll();
+        if Instant::now() >= until {
+            return Err("Full loader cancellation timeout".into());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop(app);
+    crate::shutdown::finish();
+    let usage = budget.map(|b| b.usage());
+    if usage.is_some_and(|u| u.memory != 0 || u.disk != 0) {
+        return Err(format!("Discovery resources retained: {usage:?}"));
+    }
+    let legacy_usage = crate::engine::budget::BudgetManager::default().usage();
+    if legacy_usage.memory != 0 || legacy_usage.disk != 0 {
+        return Err(format!(
+            "Legacy loader resources retained: {legacy_usage:?}"
+        ));
+    }
+    Ok(
+        serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"scope":"headless original UI submission; includes normal full loader contention, not native presentation", "indexed":indexed,"stage":stage,"first_frame_us":first_frame_us,"discovery":statistics,"labels":labels,"cleanup_us":cancel_started.elapsed().as_micros() as u64,"discovery_resources_after_retire":usage,"legacy_resources_after_retire":legacy_usage}),
+    )
+}
+fn read_file_cancellable(path: &std::path::Path, cancelled: &AtomicBool) -> Result<String, String> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("Loading cancelled".into());
+    }
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+    let len = usize::try_from(file.metadata().map_err(|e| e.to_string())?.len())
+        .map_err(|_| "Input size overflow")?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|e| e.to_string())?;
+    let mut block = [0u8; 64 * 1024];
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("Loading cancelled".into());
+        }
+        let n = file.read(&mut block).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&block[..n]);
+    }
+    String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 fn wait_for_old_document(
     old: Option<Arc<Document>>,
@@ -1791,6 +2206,160 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    struct TopInput(PathBuf);
+    #[cfg(windows)]
+    impl TopInput {
+        fn new(text: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "FerrisJson-top-ui-{}-{}.tmp",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::write(&path, text).unwrap();
+            Self(path)
+        }
+    }
+    #[cfg(windows)]
+    impl Drop for TopInput {
+        fn drop(&mut self) {
+            let until = Instant::now() + Duration::from_secs(2);
+            loop {
+                if std::fs::remove_file(&self.0).is_ok() {
+                    break;
+                }
+                if Instant::now() >= until {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    #[cfg(windows)]
+    fn attach_top(
+        app: &mut Viewer,
+        input: &TopInput,
+        ctx: &egui::Context,
+    ) -> mpsc::Sender<LoadResult> {
+        let (tx, rx) = mpsc::channel();
+        app.pending = Some(rx);
+        app.top_source = input.0.display().to_string();
+        app.discovery = Some(
+            crate::engine::top_level::Discovery::start(
+                crate::engine::top_level::Source::open(&input.0).unwrap(),
+                Arc::new(AtomicBool::new(false)),
+                ctx.clone(),
+            )
+            .unwrap(),
+        );
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.poll_top();
+            if app.top_page.as_ref().is_some_and(|p| p.rows.len() > 1) {
+                break;
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        tx
+    }
+    #[cfg(windows)]
+    #[test]
+    fn top_fields_use_original_panels_and_selection_transfers_to_final_document() {
+        let text = r#"{"a/b":{"nested":1},"last":2}"#;
+        let input = TopInput::new(text);
+        let ctx = egui::Context::default();
+        let mut app = Viewer::empty();
+        let tx = attach_top(&mut app, &input, &ctx);
+        app.top_selected = 1;
+        app.discovery.as_ref().unwrap().request(0, 1);
+        let until = Instant::now() + Duration::from_secs(5);
+        while app.top_page.as_ref().unwrap().selected != 1 {
+            app.poll_top();
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let output = with_io_context(
+            Priority::Interactive,
+            Cancellation::Flag(Arc::new(AtomicBool::new(true))),
+            || {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1120.0, 760.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw(ctx),
+                )
+            },
+        );
+        fn texts(shape: &egui::Shape, found: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => found.push(t.galley.text().into()),
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        texts(s, found);
+                    }
+                }
+                _ => (),
+            }
+        }
+        let mut found = Vec::new();
+        for shape in output.shapes {
+            texts(&shape.shape, &mut found);
+        }
+        for label in ["Value preview", "JSONPath results", "a/b"] {
+            assert!(
+                found.iter().any(|s| s == label),
+                "Missing {label}: {found:?}"
+            );
+        }
+        assert!(!found.iter().any(|s| s.contains("Opening settings")
+            || s.contains("scanned")
+            || s.contains("FerrisJson · Tree")));
+        assert_eq!(app.inspector_ratio, 0.5);
+        assert!(app.doc.is_none());
+        app.copy(&ctx, false);
+        app.export();
+        assert!(app.large_copy.is_none() && app.pending_export.is_none());
+        tx.send(Ok((
+            Document::parse(text).unwrap(),
+            input.0.display().to_string(),
+            Some(input.0.clone()),
+        )))
+        .unwrap();
+        app.poll();
+        assert!(!app.discovering() && app.discovery.is_none());
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(app.selected, doc.find_path("/a~1b").unwrap());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn full_validation_failure_retracts_provisional_fields_and_restores_old_document() {
+        let input = TopInput::new(r#"{"new":1} trailing"#);
+        let ctx = egui::Context::default();
+        let mut app = loaded();
+        let old = app.doc.as_ref().unwrap().clone();
+        let tx = attach_top(&mut app, &input, &ctx);
+        assert!(app.discovering());
+        tx.send(Err("Invalid JSON: trailing characters".into()))
+            .unwrap();
+        app.poll();
+        assert!(app.discovery.is_none() && app.top_page.is_none());
+        assert!(Arc::ptr_eq(app.doc.as_ref().unwrap(), &old));
+        assert!(app.error.as_ref().unwrap().contains("trailing"));
+    }
+    #[test]
+    fn cancelled_file_read_does_not_begin_loading() {
+        let flag = AtomicBool::new(true);
+        assert_eq!(
+            read_file_cancellable(std::path::Path::new("not-opened.json"), &flag).unwrap_err(),
+            "Loading cancelled"
+        );
+    }
     #[test]
     fn paste_moves_the_buffer_and_restores_it_on_syntax_error() {
         let ctx = egui::Context::default();

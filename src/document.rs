@@ -292,6 +292,14 @@ impl Document {
     ) -> Result<Self, String> {
         indexed::open_with_budget(path, cancelled, progress, budget)
     }
+    /// Read from an already-open source identity instead of reopening a path.
+    pub fn open_indexed_file(
+        file: std::fs::File,
+        cancelled: impl Fn() -> bool,
+        progress: &LoadProgress,
+    ) -> Result<Self, String> {
+        indexed::open_file_with_budget(file, cancelled, progress, BudgetManager::default())
+    }
     pub fn budget(&self) -> &BudgetManager {
         &self.budget
     }
@@ -901,7 +909,7 @@ pub enum SearchScope {
     Keys,
     Values,
 }
-fn is_identifier(key: &str) -> bool {
+pub(crate) fn is_identifier(key: &str) -> bool {
     let mut chars = key.chars();
     chars
         .next()

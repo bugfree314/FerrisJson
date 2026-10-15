@@ -1008,3 +1008,104 @@ python scripts/verify-s6.py --sizes 2 --rounds 3 --report-name smoke-report.json
 
 
 0.7.2 版本更新后，重新通过 141 项全目标测试（82 库、52 主程序、4 适配器、3 生成器）、严格 Clippy、格式和差异检查；Windows Release 主程序构建与捕获输出的 11 项 CLI 检查通过，版本输出为 FerrisJson 0.7.2。Cargo 两文件版本一致；基准脚本语法及读取包版本检查通过（脚本需 Python 3.11+）。没有重跑或改写 0.7.1 的性能测量。提交前再次检查暂存列表，排除全部样本/测试和基准 JSON。
+
+## 27. A — 默认原界面的顶层结构优先显示（2026-10-15）
+
+### 27.1 实现与验证范围
+
+基于 main / 0.7.2 / `a8f2980` 的未提交工作区，包版本仍为 0.7.2。按照用户批准的新方案只实施 A；原工具栏、树和右侧预览布局保留，无新后台进度面板。Windows 默认文件打开先顺序扫描顶层键/数组序号，将值类型与未完成范围登记到临时磁盘目录，经后台分页交给原树显示。完整解析仍并行进行，完成后交接原文档；B 的持续递归索引与 C 的首条检索尚未实现。详见 [方案与限制](top-level-first-plan.md)。
+
+以上为实施与测量时的工作区版本；用户随后确认人工验收通过，并要求将 A 提交为 0.8.0，版本提交验证见 27.5。27.2–27.4 保留原始测量的真实版本、哈希和口径。
+
+发现阶段不构建完整 AST，最多缓存 64 行和有限选中预览；发现受管理内存配额 8 MiB、目录磁盘配额 1 GiB。超出键长/深度/配额限制则停止可选发现，由完整加载器继续。首个字段可以在巨大首值尚未扫描完时出现；后续顶层字段仍需跨过前一个值才能发现。发现和最终加载沿用同一受保护源句柄，避免路径重新打开造成源不一致。
+
+最终代码通过 149 项全目标测试（87 库、55 主程序、4 适配器、3 生成器）、严格 Clippy、格式/差异检查、Windows Release 主程序与 top_level_bench 构建、11 项 CLI 回归。自动测试覆盖巨大首值提前发布、嵌套/转义/重复键、宽数组分页、取消与资源释放、写入/重命名保护、原路径替换后仍读同一源、原 UI 有限预览及完整校验失败撤回。尚无原生人工或其他平台验收。
+
+### 27.2 测量口径
+
+最终 `top_level_bench.exe` SHA-256：`94053eb99c68b04b64fdae8a62ea550aa951847e476b747bd7cc8a4ee37e45f0`。样本精确为十进制 100,000,000 / 300,000,000 / 500,000,000 字节。三个结构分别为普通对象（meta 在前、巨大 data 字符串在后）、巨大 first 字符串作为首值的对象、以空白填充到每元素约 1000 字节的顶层标量数组。
+
+同一最终构建运行 30 个独立进程：默认内存加载路径三结构×三大小×三轮，共 27 次；Indexed 路径三结构各 100 MB 单轮，共 3 次。计时从调用默认 load_file 前开始，到首个非根字段通过原 UI 的 egui 布局与 tessellate 提交为止，包含原完整加载器的并行争用。全部在 top-level 阶段命中预期首键/序号，不是等最终文档就绪。样本刚生成或计算过哈希，不能视为系统冷缓存。
+
+首批显示后即取消并等待退休；这不是完整大文件校验、持续滚动或检索基准。不含进程启动、系统字体初始化与原生窗口/GPU 呈现，不能据此承诺任意文件 1 秒首屏。没有历史对照，不宣称加速倍数。B/C 未实施，因此本节没有低/高命中测量；后续搜索专项仍按 100/300/500 MB 低/高命中执行，S0 保持暂停。
+
+### 27.3 最终测量结果
+
+单位 ms；默认路径为三轮中位数 [最小, 最大]。
+
+| 结构 | 100 MB | 300 MB | 500 MB |
+| --- | ---: | ---: | ---: |
+| 普通对象 | 20.099 [19.692, 20.153] | 20.404 [20.278, 20.517] | 20.117 [19.915, 20.467] |
+| 巨大首值对象 | 20.118 [18.973, 21.175] | 20.570 [19.832, 21.139] | 20.041 [19.751, 20.513] |
+| 顶层数组 | 25.566 [24.472, 25.777] | 24.897 [23.671, 24.940] | 25.638 [3.544, 28.043] |
+
+Indexed 路径 100 MB 单轮：普通对象 20.074 ms、巨大首值对象 19.479 ms、顶层数组 24.774 ms。数组 500 MB 的 3.544 ms 保留实际结果，不作剔除；该轮首个分页请求恰已包含子元素，其他轮次需要后续页。
+
+全部首字段发现时已读扫描数据均为 65,536 字节；显示时后台可能已继续读取，不能把它当作整个打开流程的总 I/O。发现预算账本峰值最大 1.3125 MiB，仅含发现模块管理的预留，不含并行完整加载文本/DOM、GUI 或进程 RSS。30 次取消退休后，发现与旧引擎内存/磁盘账本均为零。最终完整加载时间、峰值 RSS、完整 500 MB 校验与交接停顿未在该矩阵测量。
+
+本地报告 `target/top-a-local/report.json`，测试/构建日志同目录。源一致性修正前的报告另存 `pre-handle-fix-report.json`，不把旧测量改写成最终构建测量。样本与 JSON 报告不纳入版本。
+
+| 本地输入 | SHA-256 |
+| --- | --- |
+| ordinary-100MB.json | `615913b6c72087b0d8a7d0ac8a051e86ca6c3781b95d6324626e706e5f1afdb4` |
+| ordinary-300MB.json | `23e840628ea93c94f9cea8ac9fda270422fa296d9ed5f9de638cdbc8579a4c63` |
+| ordinary-500MB.json | `431804887996a92246279d807a5956c30783b1436a5140e348c3a0994a357258` |
+| object-100MB.json（巨大首值） | `a30568a8edde9f0ef67cf1d665184bfdd25716acd6db2659b2d6847b46a5042e` |
+| object-300MB.json（巨大首值） | `962b03878af80dbf296c5a0823c7abefdd292962825dad09b340c147afb279c6` |
+| object-500MB.json（巨大首值） | `e1c8b8234b88e48b1012cae66e2494e36ea853e0673376dbd6bf80af86313a25` |
+| scalar-100MB.json（顶层数组） | `0f9133740fa7243407026310911f16a2ead6d08f7bd5a4e70d7f2e4afdd0962d` |
+| scalar-300MB.json（顶层数组） | `a72fa429fba3bfd3258e4b014acab1a1a97f7da6d9c3ab0b9bfacb3bee0a5bc8` |
+| scalar-500MB.json（顶层数组） | `5fb472c62f772c78f7c21e251fb18e8704d43b06a6b15b3a94da5442d651c9e3` |
+
+### 27.4 复现入口
+
+构建及单次执行：
+
+```powershell
+cargo build --offline --locked --release --bin FerrisJson --example top_level_bench
+target/release/examples/top_level_bench.exe target/top-a-local/ordinary-100MB.json
+target/release/examples/top_level_bench.exe target/top-a-local/ordinary-100MB.json --indexed
+```
+
+以下 Python 代码生成相同字节布局，输出仅在本地 target。对每个默认样本独立运行三次；100 MB 每类另加一次 `--indexed`。捕获 JSON stdout 可保存到本地报告，并核对 stage、首字段标签、扫描字节数及两套退休账本；不将其添加到 Git。
+
+```python
+from pathlib import Path
+root = Path('target/top-a-local')
+root.mkdir(parents=True, exist_ok=True)
+for mb in (100, 300, 500):
+    size = mb * 1_000_000
+    for shape in ('ordinary', 'object', 'scalar'):
+        path = root / f'{shape}-{mb}MB.json'
+        if path.exists():
+            raise FileExistsError(path)
+        with path.open('xb') as f:
+            if shape != 'scalar':
+                prefix = b'{"meta":{"version":1},"data":"' if shape == 'ordinary' else b'{"first":"'
+                suffix = b'","tail":true}' if shape == 'ordinary' else b'","last":1}'
+                f.write(prefix)
+                left = size - len(prefix) - len(suffix)
+                while left:
+                    n = min(left, 65536)
+                    f.write(b'x' * n)
+                    left -= n
+                f.write(suffix)
+            else:
+                f.write(b'[')
+                count = size // 1000
+                for i in range(count):
+                    record = b'1' if i in (0, count // 2, count - 1) else b'0'
+                    n = 999 if i == count - 1 else 1000
+                    f.write(record + b' ' * (n - len(record) - 1)
+                            + (b']' if i == count - 1 else b','))
+        assert path.stat().st_size == size
+```
+
+
+### 27.5 0.8.0 版本提交与人工验收（2026-10-15）
+
+用户确认 A 人工验收通过，按要求将默认原界面顶层优先显示收录为 0.8.0（本次版本提交）。Cargo.toml/Cargo.lock 中 FerrisJson 版本、README 当前版本与适用限制、TODO 版本索引/里程碑/验证及阶段方案同步更新。此处仅新增版本与验收记录，没有额外性能算法变更或新的大文件性能测量；27.2–27.4 的 30 次测量仍为 0.7.2 工作区，不改写成 0.8.0 成绩。
+
+0.8.0 重新通过 149 项全目标测试（87 库、55 主程序、4 适配器、3 生成器）、严格 Clippy、格式/差异检查；Windows Release 主程序和 top_level_bench 构建、11 项 CLI 回归通过，版本输出为 FerrisJson 0.8.0。首次使用系统临时目录时三项替换/重命名测试因环境拒绝访问失败；改用项目内 target/top-a-local/tmp 后全目标通过，没有改动代码或降低断言。日志保存在本地 target/top-a-local/*-080*。
+
+完整加载与最终交接仍有时间/内存开销，B/C 尚未实施；原生 GPU 呈现延迟定量测量、其他平台专项仍未完成。S0 保持暂停，后续大文件专项仍为十进制 100/300/500 MB，检索包含低/高命中。提交前核对暂存列表，排除样本、测试 JSON 和基准 JSON 报告。本次仅提交，不创建 tag、不推送、不打包发布。

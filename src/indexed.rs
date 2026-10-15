@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
     fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -109,9 +109,17 @@ impl Snapshot {
             use std::os::windows::fs::OpenOptionsExt;
             input_options.share_mode(1);
         }
-        let mut input = input_options
+        let input = input_options
             .open(path)
             .map_err(|e| format!("Cannot open {}: {e}", path.display()))?;
+        Self::copy_file(input, cancelled, progress, budget)
+    }
+    pub(crate) fn copy_file(
+        input: fs::File,
+        cancelled: &impl Fn() -> bool,
+        progress: &LoadProgress,
+        budget: &BudgetManager,
+    ) -> Result<Self, String> {
         let before = input.metadata().map_err(|e| e.to_string())?;
         usize::try_from(before.len()).map_err(|_| "File size exceeds platform address range")?;
         progress.total.store(before.len(), Ordering::Relaxed);
@@ -169,13 +177,18 @@ impl Snapshot {
             }
         }
         let mut snapshot = result.ok_or("Cannot create snapshot")?;
+        let input = FileSource::new(input);
         let mut buffer = vec![0; BLOCK];
         loop {
             if cancelled() {
                 return Err("Loading cancelled".into());
             }
-            let count =
-                with_io_slot(cancelled, || input.read(&mut buffer)).map_err(|e| e.to_string())?;
+            let count = (before.len() - snapshot.len).min(BLOCK as u64) as usize;
+            if count > 0 {
+                input
+                    .read_exact_at_cancellable(snapshot.len, &mut buffer[..count], cancelled)
+                    .map_err(|e| e.to_string())?;
+            }
             if count == 0 {
                 break;
             }
@@ -939,6 +952,23 @@ pub(super) fn open_with_budget(
     budget: BudgetManager,
 ) -> Result<Document, String> {
     let source = Snapshot::copy(path, &cancelled, progress, &budget)?;
+    from_snapshot(source, cancelled, progress, budget)
+}
+pub(super) fn open_file_with_budget(
+    file: fs::File,
+    cancelled: impl Fn() -> bool,
+    progress: &LoadProgress,
+    budget: BudgetManager,
+) -> Result<Document, String> {
+    let source = Snapshot::copy_file(file, &cancelled, progress, &budget)?;
+    from_snapshot(source, cancelled, progress, budget)
+}
+fn from_snapshot(
+    source: Snapshot,
+    cancelled: impl Fn() -> bool,
+    progress: &LoadProgress,
+    budget: BudgetManager,
+) -> Result<Document, String> {
     let bytes =
         usize::try_from(source.len).map_err(|_| "File size exceeds platform address range")?;
     progress.phase.store(1, Ordering::Relaxed);
