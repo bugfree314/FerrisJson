@@ -1,5 +1,7 @@
 use crate::engine::budget::{Reservation, Resource};
 use crate::engine::file_source::{Cancellation, Priority, with_io_context};
+#[path = "recursive_ui.rs"]
+mod recursive_ui;
 use crate::preview_worker::{Output as PreviewOutput, PreviewWorker, ROW_BATCH};
 use crate::{
     document::{Document, LoadProgress, NodeIds, SearchScope},
@@ -37,6 +39,7 @@ struct CopyRequest {
 }
 
 pub struct Viewer {
+    progressive: recursive_ui::View,
     discovery: Option<crate::engine::top_level::Discovery>,
     discovery_start: Option<Receiver<crate::engine::top_level::Discovery>>,
     top_page: Option<Arc<crate::engine::top_level::Page>>,
@@ -275,6 +278,7 @@ impl Viewer {
     }
     fn empty() -> Self {
         Self {
+            progressive: Default::default(),
             discovery: None,
             discovery_start: None,
             top_page: None,
@@ -343,6 +347,9 @@ impl Viewer {
         }
     }
     fn cursor_location(&self) -> Option<(String, String)> {
+        if let Some(page) = &self.progressive.page {
+            return Some((String::new(), page.selection.path.clone()));
+        }
         if self.discovering() {
             return self
                 .top_page
@@ -374,6 +381,10 @@ impl Viewer {
         }
     }
     fn load_file(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if cfg!(windows) {
+            self.load_progressive(path, ctx);
+            return;
+        }
         if self.pending.is_some() {
             return;
         }
@@ -460,6 +471,7 @@ impl Viewer {
         });
     }
     fn load_text(&mut self, text: String, source: String, ctx: &egui::Context) {
+        self.clear_progressive();
         if self.pending.is_some() {
             return;
         }
@@ -535,6 +547,7 @@ impl Viewer {
         old
     }
     fn poll(&mut self) {
+        self.poll_progressive();
         self.poll_top();
         let Some(rx) = &self.pending else {
             return;
@@ -859,6 +872,8 @@ impl Viewer {
         }
     }
     fn schedule_search(&mut self, ctx: &egui::Context) {
+        self.progressive_cancel_operation();
+        self.progressive.matches = None;
         if let Some(worker) = &mut self.search_worker {
             worker.cancel();
         }
@@ -873,6 +888,10 @@ impl Viewer {
         }
     }
     fn search(&mut self) {
+        if self.progressive.session.is_some() {
+            self.progressive_search();
+            return;
+        }
         if self.discovering() {
             self.search_due = None;
             return;
@@ -934,6 +953,10 @@ impl Viewer {
         self.query_duration = Some(("Search", elapsed + started.elapsed()));
     }
     fn go_to_path(&mut self) {
+        if self.progressive.session.is_some() {
+            self.progressive_query();
+            return;
+        }
         if self.discovering() {
             return;
         }
@@ -1066,6 +1089,10 @@ impl Viewer {
         self.match_step(backwards, 1);
     }
     fn match_step(&mut self, backwards: bool, count: usize) {
+        if self.progressive.session.is_some() {
+            self.progressive_match(backwards, count);
+            return;
+        }
         if self.matches.is_empty() {
             return;
         }
@@ -1078,6 +1105,10 @@ impl Viewer {
         self.reveal(self.matches[self.match_index] as usize);
     }
     fn copy(&mut self, ctx: &egui::Context, path: bool) {
+        if self.progressive.session.is_some() {
+            self.progressive_copy(ctx, path);
+            return;
+        }
         if self.discovering() {
             if path
                 && let Some(page) = &self.top_page
@@ -1109,6 +1140,10 @@ impl Viewer {
         }
     }
     fn export(&mut self) {
+        if self.progressive.session.is_some() {
+            self.progressive_export(false);
+            return;
+        }
         if self.discovering() {
             return;
         }
@@ -1232,6 +1267,10 @@ impl Viewer {
             && let Some(file) = self.file.clone()
         {
             self.load_file(file, ctx);
+        }
+        if self.progressive.session.is_some() {
+            self.progressive_keyboard(ctx);
+            return;
         }
         if self.discovering() && !ctx.wants_keyboard_input() {
             let count = if self.top_expanded {
@@ -1374,6 +1413,10 @@ impl eframe::App for Viewer {
 }
 impl Viewer {
     fn selection_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.progressive.page.is_some() {
+            self.progressive_selection(ui, ctx);
+            return;
+        }
         if self.discovering() {
             let page = self.top_page.as_ref().unwrap().clone();
             let mut wrap_changed = false;
@@ -1449,6 +1492,10 @@ impl Viewer {
         );
     }
     fn results_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.progressive.session.is_some() {
+            self.progressive_results(ui, ctx);
+            return;
+        }
         if self.discovering() {
             ui.heading("JSONPath results");
             return;
@@ -1530,6 +1577,9 @@ impl Viewer {
         self.path_worker
             .get_or_insert_with(|| Worker::new(ctx.clone()));
         self.poll();
+        if let Some(text) = self.progressive.clipboard.take() {
+            ctx.copy_text(text);
+        }
         self.poll_export(ctx);
         self.poll_operations(ctx);
         self.keyboard(ctx);
@@ -1562,22 +1612,23 @@ impl Viewer {
                         self.save_colors();
                     }
                     if ui.checkbox(&mut self.colors.indexed_files, "Indexed files")
-                        .on_hover_text("Validated disk snapshot and byte-range index; no whole Value. Filters/functions and oversized regex values require reopening in in-memory mode. Paste/stdin keep their existing backend.").changed() { self.save_colors(); }
+                        .on_hover_text("Windows files use the progressive disk index. This setting applies to legacy file paths on other platforms; paste/stdin keep their memory backend.").changed() { self.save_colors(); }
                 });
                 if ui.button("Help").clicked() {
                     self.help = true;
                 }
-                if self.pending.is_some() {
+                if self.pending.is_some() || (self.progressive.opening() && self.progressive.page.is_none()) {
                     ui.spinner();
-                    if self.indexing && ui.button("Cancel open").clicked() {
+                    if (self.indexing || self.progressive.opening()) && ui.button("Cancel open").clicked() {
                         self.loading_cancelled.store(true, Ordering::Relaxed);
                         self.notice = "Cancelling indexed opening...".into();
                     }
                 }
-                if self.pending_export.is_some() {
+                if self.pending_export.is_some() || self.progressive.export_busy() {
                     ui.spinner();
                     if ui.button("Cancel export").clicked() {
                         self.export_cancelled.store(true, Ordering::Relaxed);
+                        self.progressive_cancel_export();
                         self.notice = "Cancelling export...".into();
                     }
                 }
@@ -1668,11 +1719,13 @@ impl Viewer {
                 if changed {
                     self.schedule_search(ctx);
                 }
-                if self.search_due.is_some() || self.search_worker.as_ref().is_some_and(|w| w.busy)
+                if self.search_due.is_some() || self.search_worker.as_ref().is_some_and(|w| w.busy) || self.progressive.search_busy()
                 {
                     ui.spinner();
                 }
-                ui.label(if self.matches.is_empty() {
+                ui.label(if self.progressive.session.is_some() {
+                    self.progressive.match_label()
+                } else if self.matches.is_empty() {
                     "0 / 0".into()
                 } else {
                     format!("{} / {}", self.match_index + 1, self.matches.len())
@@ -1693,7 +1746,7 @@ impl Viewer {
             }
             ui.horizontal(|ui| {
                 ui.label("JSONPath");
-                if self.path_worker.as_ref().is_some_and(|w| w.busy) {
+                if self.path_worker.as_ref().is_some_and(|w| w.busy) || self.progressive.query_busy() {
                     ui.spinner();
                 }
                 let response = ui.add(
@@ -1705,6 +1758,7 @@ impl Viewer {
                 );
                 if response.changed() && self.query.trim().is_empty() {
                     self.path_results = None;
+                    self.progressive_clear_query();
                     if let Some(worker) = &mut self.path_worker {
                         worker.cancel();
                     }
@@ -1722,16 +1776,19 @@ impl Viewer {
                 {
                     self.query.clear();
                     self.path_results = None;
+                    self.progressive_clear_query();
                     if let Some(worker) = &mut self.path_worker {
                         worker.cancel();
                     }
                     self.query_duration = None;
                 }
                 if ui.add_enabled(!self.discovering(), egui::Button::new("Expand all")).clicked() {
+                    if let Some(s) = &self.progressive.session { s.action(crate::engine::recursive::Action::All(true)); }
                     self.expanded.fill(true);
                     self.rebuild_rows();
                 }
                 if ui.add_enabled(!self.discovering(), egui::Button::new("Collapse all")).clicked() {
+                    if let Some(s) = &self.progressive.session { s.action(crate::engine::recursive::Action::All(false)); }
                     self.expanded.fill(false);
                     self.select(0);
                     self.rebuild_rows();
@@ -1771,7 +1828,7 @@ impl Viewer {
                 });
             });
         });
-        if self.doc.is_some() || self.discovering() {
+        if self.doc.is_some() || self.discovering() || self.progressive.page.is_some() {
             egui::SidePanel::right("inspector")
                 .default_width(360.0)
                 .width_range(220.0..=700.0)
@@ -1849,6 +1906,10 @@ impl Viewer {
                     }
                 });
                 ui.separator();
+            }
+            if self.progressive.page.is_some() {
+                self.progressive_tree(ui);
+                return;
             }
             if self.discovering() {
                 self.top_tree(ui);
@@ -2064,6 +2125,7 @@ impl Viewer {
 }
 impl Drop for Viewer {
     fn drop(&mut self) {
+        self.clear_progressive();
         self.clear_top();
         self.loading_cancelled.store(true, Ordering::Relaxed);
         self.export_cancelled.store(true, Ordering::Relaxed);
@@ -2076,8 +2138,20 @@ impl Drop for Viewer {
     }
 }
 
+#[allow(dead_code, reason = "Progressive desktop benchmark entry")]
+pub fn benchmark_recursive(
+    path: PathBuf,
+    indexed: bool,
+    search_cases: bool,
+) -> Result<serde_json::Value, String> {
+    recursive_ui::benchmark(path, indexed, search_cases)
+}
+
 #[allow(dead_code, reason = "Original-UI top-level discovery benchmark entry")]
 pub fn benchmark_top_level(path: PathBuf, indexed: bool) -> Result<serde_json::Value, String> {
+    if cfg!(windows) {
+        return recursive_ui::benchmark(path, indexed, false);
+    }
     let ctx = egui::Context::default();
     let mut app = Viewer::empty();
     app.colors.indexed_files = indexed;
@@ -2397,7 +2471,16 @@ mod tests {
     }
     fn wait_load(app: &mut Viewer) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while app.pending.is_some() {
+        while app.pending.is_some()
+            || app.progressive.opening()
+            || app
+                .progressive
+                .session
+                .as_ref()
+                .is_some_and(|s| !s.statistics().ready)
+            || (app.progressive.session.is_some()
+                && app.progressive.page.as_ref().is_none_or(|p| !p.ready))
+        {
             app.poll();
             assert!(Instant::now() < deadline, "Loading did not finish");
             std::thread::sleep(Duration::from_millis(1));
@@ -2411,8 +2494,18 @@ mod tests {
         app.load_file(PathBuf::from("examples/sample.json"), &ctx);
         wait_load(&mut app);
         assert!(app.error.is_none());
-        assert!(app.doc.as_ref().unwrap().value().is_none());
-        assert!(!app.detail.is_empty());
+        if cfg!(windows) {
+            assert!(app.doc.is_none());
+            assert_eq!(app.expanded.capacity(), 0);
+            assert_eq!(app.history.capacity(), 0);
+            assert!(app.progressive.page.as_ref().unwrap().ready);
+            assert!(!app.progressive.page.as_ref().unwrap().detail.is_empty());
+            app.clear_progressive();
+            app = loaded();
+        } else {
+            assert!(app.doc.as_ref().unwrap().value().is_none());
+            assert!(!app.detail.is_empty());
+        }
         let old = Arc::clone(app.doc.as_ref().unwrap());
         let (tx, rx) = mpsc::channel();
         app.pending = Some(rx);

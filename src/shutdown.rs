@@ -3,10 +3,10 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 static CLEANUP: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 pub fn defer(thread: JoinHandle<()>) {
-    CLEANUP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(thread);
+    let mut pending = CLEANUP.lock().unwrap_or_else(|e| e.into_inner());
+    // Repeated file opens must not retain completed OS thread handles until exit.
+    pending.retain(|thread| !thread.is_finished());
+    pending.push(thread);
 }
 pub fn finish() {
     let threads = std::mem::take(&mut *CLEANUP.lock().unwrap_or_else(|e| e.into_inner()));

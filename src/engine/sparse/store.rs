@@ -6,7 +6,7 @@ use crate::engine::{
 };
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -16,17 +16,23 @@ use std::{
 
 pub(crate) const HEADER: u64 = 80;
 const BUCKETS: u64 = 65_536;
-const RECORD: u64 = 104;
+pub(crate) const RECORD: u64 = 104;
 const BASE: u64 = HEADER + BUCKETS * 16;
 pub(crate) type Record = [u64; 12];
 
 pub(crate) struct Store {
+    write_cache: Option<Mutex<RecordCache>>,
     file: Option<File>,
     owner: Arc<Owner>,
     len: u64,
     readonly: bool,
     _directory_stack: Reservation,
     undo: Option<Undo>,
+}
+struct RecordCache {
+    records: std::collections::HashMap<u64, (Record, bool)>,
+    order: std::collections::VecDeque<u64>,
+    _lease: Reservation,
 }
 struct Undo {
     initial_len: u64,
@@ -51,7 +57,11 @@ impl Drop for Store {
 }
 impl Store {
     pub(crate) fn read_view(&self, budget: &BudgetManager) -> Result<Self, String> {
+        if self.write_cache.is_some() {
+            return Err("Live cached indexes cannot create external file views".into());
+        }
         Ok(Self {
+            write_cache: None,
             file: Some(
                 self.file
                     .as_ref()
@@ -78,6 +88,9 @@ impl Store {
         budget: &BudgetManager,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
+        if self.write_cache.is_some() {
+            return Err("Live cached indexes cannot be persisted".into());
+        }
         let _lease = budget.reserve(Resource::Memory, 64 * 1024, "index checkpoint buffer")?;
         let mut options = OpenOptions::new();
         #[cfg(unix)]
@@ -191,7 +204,9 @@ impl Store {
             }
         }
         let (file, path) = result.ok_or("Cannot create sparse index")?;
+        #[allow(unused_mut)] // Unix unlinks the owner path after opening.
         let mut store = Self {
+            write_cache: None,
             file: Some(file),
             owner: Arc::new(Owner {
                 path: Some(path),
@@ -266,22 +281,37 @@ impl Store {
         }
         Ok(())
     }
-    fn write_at(
-        &mut self,
-        pos: u64,
-        bytes: &[u8],
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<(), String> {
+    fn write_at(&self, pos: u64, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<(), String> {
         if self.readonly {
             return Err("Read-only index view".into());
         }
 
-        with_io_slot(cancelled, || {
-            let file = self.file.as_mut().unwrap();
-            file.seek(SeekFrom::Start(pos))?;
-            file.write_all(bytes)
-        })
-        .map_err(|e| e.to_string())
+        let file = self.file.as_ref().unwrap();
+        let mut done = 0;
+        while done < bytes.len() {
+            let n = with_io_slot(cancelled, || {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::FileExt;
+                    file.seek_write(&bytes[done..], pos + done as u64)
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    file.write_at(&bytes[done..], pos + done as u64)
+                }
+                #[cfg(not(any(windows, unix)))]
+                {
+                    Err(std::io::Error::other("Positioned index writes unavailable"))
+                }
+            })
+            .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("Index write made no progress".into());
+            }
+            done += n;
+        }
+        Ok(())
     }
     pub(crate) fn bytes(&self) -> u64 {
         self.len
@@ -333,14 +363,22 @@ impl Store {
         if !self.valid_offset(offset) {
             return Err("Invalid sparse record offset".into());
         }
+        if let Some(cache) = &self.write_cache
+            && let Some((r, _)) = cache.lock().unwrap().records.get(&offset)
+        {
+            super::check(cancelled)?;
+            return Ok(*r);
+        }
         let mut bytes = [0; RECORD as usize];
         self.read_at(offset, &mut bytes, cancelled)?;
         if hash_bytes(&bytes[..96]) != u64::from_le_bytes(bytes[96..].try_into().unwrap()) {
             return Err("Sparse record checksum mismatch".into());
         }
-        Ok(std::array::from_fn(|n| {
+        let record = std::array::from_fn(|n| {
             u64::from_le_bytes(bytes[n * 8..n * 8 + 8].try_into().unwrap())
-        }))
+        });
+        self.cache_record(offset, record, false, cancelled)?;
+        Ok(record)
     }
     pub(crate) fn put(
         &mut self,
@@ -364,6 +402,17 @@ impl Store {
             crate::engine::budget::reserve_vec(&mut log.records, 1, &mut log.lease)?;
             log.records.push((offset, previous));
         }
+        if self.write_cache.is_some() {
+            return self.cache_record(offset, record, true, cancelled);
+        }
+        self.write_record(offset, record, cancelled)
+    }
+    fn write_record(
+        &self,
+        offset: u64,
+        record: Record,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
         let mut bytes = [0; RECORD as usize];
         for (n, value) in record.iter().enumerate() {
             bytes[n * 8..n * 8 + 8].copy_from_slice(&value.to_le_bytes());
@@ -372,10 +421,57 @@ impl Store {
         bytes[96..].copy_from_slice(&sum.to_le_bytes());
         self.write_at(offset, &bytes, cancelled)
     }
+    /// Only for a single live ephemeral owner. No external file views or
+    /// persistence are used by this owner; dirty entries may die with it.
+    pub(crate) fn enable_live_cache(&mut self, budget: &BudgetManager) -> Result<(), String> {
+        let lease = budget.reserve(
+            Resource::Memory,
+            4 * 1024 * 1024,
+            "bounded live index record cache",
+        )?;
+        self.write_cache = Some(Mutex::new(RecordCache {
+            records: std::collections::HashMap::with_capacity(8192),
+            order: std::collections::VecDeque::with_capacity(8192),
+            _lease: lease,
+        }));
+        Ok(())
+    }
+    fn cache_record(
+        &self,
+        offset: u64,
+        record: Record,
+        dirty: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), String> {
+        let Some(cache) = &self.write_cache else {
+            return Ok(());
+        };
+        super::check(cancelled)?;
+        let mut c = cache.lock().unwrap();
+        if let Some(old) = c.records.get_mut(&offset) {
+            *old = (record, old.1 || dirty);
+            return Ok(());
+        }
+        if c.records.len() == 8192 {
+            let victim = *c.order.front().unwrap();
+            let (r, modified) = c.records[&victim];
+            if modified {
+                self.write_record(victim, r, cancelled)?;
+            }
+            c.order.pop_front();
+            c.records.remove(&victim);
+        }
+        c.order.push_back(offset);
+        c.records.insert(offset, (record, dirty));
+        Ok(())
+    }
     pub(crate) fn in_transaction(&self) -> bool {
         self.undo.is_some()
     }
     pub(crate) fn transaction(&mut self, budget: &BudgetManager) -> Result<(), String> {
+        if self.write_cache.is_some() {
+            return Err("Live cached indexes do not use rollback transactions".into());
+        }
         if self.undo.is_some() {
             return Err("Nested tree transaction".into());
         }
@@ -419,6 +515,9 @@ impl Store {
         budget: &BudgetManager,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, String> {
+        if self.write_cache.is_some() {
+            return Err("Live cached indexes cannot create external file copies".into());
+        }
         let mut copy = Self::new(budget, cancelled)?;
         copy.owner.disk.lock().unwrap().resize(self.len as usize)?;
         copy.len = self.len;

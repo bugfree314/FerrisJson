@@ -67,6 +67,18 @@ impl Drop for Snapshot {
     }
 }
 impl Snapshot {
+    /// The caller already owns a protected, immutable-for-this-session handle.
+    /// This reader neither copies nor removes the source file.
+    pub(crate) fn protected(file: fs::File, budget: &BudgetManager) -> Result<Self, String> {
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        Ok(Self {
+            file: FileSource::new(file),
+            path: None,
+            len,
+            _disk: budget.reserve(Resource::Disk, 0, "protected source reader")?,
+            budget: budget.clone(),
+        })
+    }
     pub(crate) fn cached_with_disk(
         path: &Path,
         budget: &BudgetManager,
@@ -1124,7 +1136,7 @@ fn from_snapshot(
 }
 
 #[derive(Clone)]
-enum Selector {
+pub(crate) enum Selector {
     Name(String),
     Index(i64),
     Wildcard,
@@ -1232,11 +1244,10 @@ fn selectors(text: &str) -> Result<Vec<Selector>, String> {
         })
         .collect()
 }
-pub(super) fn query(
-    doc: &Document,
-    expression: &str,
-    cancelled: impl Fn() -> bool,
-) -> Result<NodeIds, String> {
+pub(crate) fn path_segments(expression: &str) -> Result<Vec<(bool, Vec<Selector>)>, String> {
+    if !expression.starts_with('$') {
+        return Err(unsupported());
+    }
     let mut segments = Vec::new();
     let bytes = expression.as_bytes();
     let mut position = 1;
@@ -1300,6 +1311,14 @@ pub(super) fn query(
         segments.push((recursive, selectors(&expression[start..position])?));
         position += 1;
     }
+    Ok(segments)
+}
+pub(super) fn query(
+    doc: &Document,
+    expression: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<NodeIds, String> {
+    let segments = path_segments(expression)?;
     let mut current = NodeIds::new(&doc.budget);
     current.push(0)?;
     for (recursive, selectors) in segments {
