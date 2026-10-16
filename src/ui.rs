@@ -201,7 +201,7 @@ pub fn cheatsheet(ctx: &egui::Context, open: &mut bool, palette: Palette) {
         .default_width(720.0).max_width((ctx.content_rect().width() - 40.0).max(300.0))
         .max_height((ctx.content_rect().height() - 60.0).max(200.0)).show(ctx, |ui| {
             ui.label(RichText::new("Navigate JSON at the speed of thought").size(22.0).strong());
-            ui.label("Vim keys work in the tree. Text fields keep normal typing. Esc closes this page.");
+            ui.label("Vim keys work in the tree. Current row shows its absolute visible row number; other rows show distance from the cursor. Text fields keep normal typing. Esc closes this page.");
             ui.add_space(10.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let groups: &[(&str, &[(&str, &str)])] = &[
@@ -221,7 +221,7 @@ pub fn cheatsheet(ctx: &egui::Context, open: &mut bool, palette: Palette) {
                 ui.label(RichText::new("JSONPath").strong());
                 ui.label("Press . outside text fields to focus JSONPath. The shortcut does not insert a dot.");
                 ui.monospace("$.users[*].name   $..email   $.users[?(@.active == true)]");
-                ui.label("Go / Enter runs JSONPath. The lower inspector keeps results; the upper always previews your selection. Drag the divider to resize.");
+                ui.label("Enter runs JSONPath in the default viewer; Run query / Enter in the paged tree. F4 / Shift+F4 jumps to the next / previous result and wraps around. The lower inspector keeps results; the upper always previews your selection. Drag the divider to resize.");
                 ui.horizontal_wrapped(|ui| { for kind in ["string", "number", "boolean", "null", "object", "array"] {
                     ui.colored_label(kind_color(kind, palette), kind);
                 }});

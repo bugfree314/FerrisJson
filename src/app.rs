@@ -878,6 +878,11 @@ impl Viewer {
             }
         }
     }
+    fn next_query_match(&mut self, backwards: bool) {
+        if let Some(worker) = &mut self.path_worker {
+            worker.next(backwards);
+        }
+    }
     fn next_match(&mut self, backwards: bool) {
         self.match_step(backwards, 1);
     }
@@ -1073,6 +1078,9 @@ impl Viewer {
         }
         if ctx.input(|i| i.key_pressed(Key::F3)) {
             self.next_match(ctx.input(|i| i.modifiers.shift));
+        }
+        if ctx.input(|i| i.key_pressed(Key::F4)) {
+            self.next_query_match(ctx.input(|i| i.modifiers.shift));
         }
         if ctx.input(|i| i.key_pressed(Key::F5))
             && let Some(file) = self.file.clone()
@@ -1524,12 +1532,17 @@ impl Viewer {
                     ui.spinner();
                 }
                 let row_height = ui.spacing().interact_size.y;
+                let position = self.path_worker.as_ref().and_then(QueryWorker::position);
+                let counter = position.map_or_else(|| "0/0".into(), |(index, count)| format!("{}/{count}", index + 1));
+                let counter_width = ui.painter().layout_no_wrap(
+                    counter.clone(), egui::TextStyle::Body.resolve(ui.style()), ui.visuals().text_color(),
+                ).size().x;
                 let controls_width: f32 = ["Expand all", "Collapse all"].iter().map(|label| {
                     (ui.painter().layout_no_wrap(
                         (*label).into(), egui::TextStyle::Button.resolve(ui.style()), ui.visuals().text_color(),
                     ).size().x + 2.0 * ui.spacing().button_padding.x).max(ui.spacing().interact_size.x)
                 }).sum();
-                let field_width = (ui.available_width() - controls_width - 2.0 * ui.spacing().item_spacing.x).max(100.0);
+                let field_width = (ui.available_width() - controls_width - counter_width - 2.0 * row_height - 5.0 * ui.spacing().item_spacing.x).max(100.0);
                 let mut clear = false;
                 let response = ui.allocate_ui_with_layout(
                     egui::vec2(field_width, row_height + 4.0),
@@ -1568,6 +1581,11 @@ impl Viewer {
                 } else if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     self.go_to_path();
                 }
+                ui.label(counter);
+                if ui.add_enabled(position.is_some(), egui::Button::new("<").min_size(egui::vec2(row_height, row_height)))
+                    .on_hover_text("Previous JSONPath match (Shift+F4)").clicked() { self.next_query_match(true); }
+                if ui.add_enabled(position.is_some(), egui::Button::new(">").min_size(egui::vec2(row_height, row_height)))
+                    .on_hover_text("Next JSONPath match (F4)").clicked() { self.next_query_match(false); }
                 if ui.button("Expand all").clicked() {
                     self.expanded.fill(true);
                     self.rebuild_rows();
@@ -1731,6 +1749,9 @@ impl Viewer {
             }
             let mut select = None;
             let mut toggle = None;
+            let selected_row = self.rows.binary_search(&(self.selected as u32)).unwrap_or(0);
+            let number_digits = self.rows.len().max(1).to_string().len();
+            let number_width = number_digits as f32 * 9.0 + 12.0;
             area.show_rows(ui, row_height, self.rows.len(), |ui, range| {
                 self.viewport_first = range.start;
                 if let Some(worker) = &mut self.search_worker {
@@ -1762,6 +1783,12 @@ impl Viewer {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.set_height(row_height);
+                            let number = if row == selected_row { row + 1 } else { row.abs_diff(selected_row) };
+                            let response = ui.add_sized([number_width, row_height], egui::Label::new(
+                                RichText::new(format!("{number:>width$}", width = number_digits))
+                                    .monospace().color(if row == selected_row { ui.visuals().text_color() } else { ui.visuals().weak_text_color() }),
+                            ).sense(egui::Sense::click()));
+                            if response.clicked() { select = Some(id); }
                             ui.add_space(node.depth as f32 * 18.0);
                             if node.container() {
                                 if ui

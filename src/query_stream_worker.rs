@@ -67,12 +67,12 @@ pub struct Snapshot {
 pub struct QueryWorker {
     producer: TaskWorker<Job>, reader: TaskWorker<Read>, shared: Arc<Mutex<Published>>, ctx: egui::Context,
     doc: Option<Arc<Document>>, expression: String, generation: u64, start: u64, rendered: Option<(u64, u64)>,
-    reveal: bool, started: Option<Instant>, elapsed: Option<Duration>, error: Option<String>, pub busy: bool,
+    selected: u64, reveal: bool, started: Option<Instant>, elapsed: Option<Duration>, error: Option<String>, pub busy: bool,
 }
 impl QueryWorker {
     pub fn new(ctx: egui::Context) -> Self {
         Self { producer: TaskWorker::new(ctx.clone()), reader: TaskWorker::new(ctx.clone()), shared: Arc::new(Mutex::new(Published::default())), ctx,
-            doc: None, expression: String::new(), generation: 0, start: 0, rendered: None, reveal: true,
+            doc: None, expression: String::new(), generation: 0, start: 0, rendered: None, selected: 0, reveal: true,
             started: None, elapsed: None, error: None, busy: false }
     }
     pub fn cancel(&mut self) {
@@ -82,7 +82,7 @@ impl QueryWorker {
     }
     pub fn submit(&mut self, doc: Arc<Document>, request: QueryRequest) -> Result<(), String> {
         self.cancel(); self.generation = self.generation.wrapping_add(1);
-        self.expression = request.expression.clone(); self.start = 0; self.reveal = true;
+        self.expression = request.expression.clone(); self.start = 0; self.selected = 0; self.reveal = true;
         self.producer.submit(doc.clone(), Job { request, source: doc.clone(), shared: self.shared.clone(), generation: self.generation, ctx: self.ctx.clone() })?;
         self.doc = Some(doc); self.started = Some(Instant::now()); self.busy = true; Ok(())
     }
@@ -92,7 +92,20 @@ impl QueryWorker {
         else { self.error = Some("Query cancelled before results were published".into()); }
     }
     pub fn page(&mut self, start: u64) {
-        self.reader.cancel(); self.start = start; self.rendered = None; self.reveal = true; self.error = None; self.busy = true;
+        self.reader.cancel(); self.start = start; self.selected = start; self.rendered = None; self.reveal = true; self.error = None; self.busy = true;
+    }
+    pub fn position(&self) -> Option<(u64, u64)> {
+        self.doc.as_ref()?;
+        let count = self.shared.lock().unwrap().store.as_ref()?.state().count;
+        (count > 0).then_some((self.selected, count))
+    }
+    pub fn next(&mut self, backwards: bool) {
+        let Some((current, count)) = self.position() else { return; };
+        let index = if backwards {
+            if current == 0 { count - 1 } else { current - 1 }
+        } else if current + 1 >= count { 0 } else { current + 1 };
+        self.page(index / PAGE * PAGE);
+        self.selected = index;
     }
     pub fn copy(&mut self, selection: Selection, limit: Option<usize>) -> Result<(), String> {
         let doc = self.doc.as_ref().ok_or("No query document")?;
@@ -115,7 +128,7 @@ impl QueryWorker {
                 Ok(ReadOutput::Page { page: mut output, start, count }) if start == self.start => {
                     output.expression = self.expression.clone();
                     self.rendered = Some((start, count));
-                    if self.reveal { first = output.ids.first().map(|id| *id as usize); self.reveal = false; }
+                    if self.reveal { first = output.ids.get(self.selected.saturating_sub(start) as usize).map(|id| *id as usize); self.reveal = false; }
                     page = Some(output);
                 }
                 Ok(ReadOutput::Clipboard(result)) => clipboard = Some(result),

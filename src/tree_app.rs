@@ -321,6 +321,29 @@ impl Viewer {
             self.query_snapshot = Some(task.query.poll());
         }
     }
+    fn next_query_match(&mut self, backwards: bool) {
+        let count = self.query_snapshot.as_ref().and_then(|s| s.state.as_ref()).map_or(0, |s| s.count);
+        if count == 0 { return; }
+        let index = match self.query_selected {
+            None => if backwards { count - 1 } else { 0 },
+            Some(0) if backwards => count - 1,
+            Some(current) if backwards => current - 1,
+            Some(current) => if current + 1 >= count { 0 } else { current + 1 },
+        };
+        if let Some(task) = &self.task {
+            match task.query_select(index) {
+                Ok(()) => {
+                    self.query_selected = Some(index);
+                    let start = index / 16 * 16;
+                    if self.query_start != start {
+                        self.query_start = start; self.query_page = None;
+                        self.query_page_error = None; self.query_page_request = None;
+                    }
+                }
+                Err(error) => self.notice = error,
+            }
+        }
+    }
     fn query_results(&mut self, ui: &mut egui::Ui) {
         use crate::engine::results::Status;
         let Some(snapshot) = &self.query_snapshot else { return; };
@@ -370,7 +393,7 @@ impl Viewer {
                 match task.query_select(index) { Ok(()) => self.query_selected = Some(index), Err(error) => self.notice = error }
             }
             if cancel { task.query_clear(false); self.query_page_request = None; }
-            if clear { task.query_clear(true); self.jsonpath.clear(); self.query_snapshot = None; self.query_page = None; self.query_page_error = None; self.query_page_request = None; }
+            if clear { self.query_selected = None; task.query_clear(true); self.jsonpath.clear(); self.query_snapshot = None; self.query_page = None; self.query_page_error = None; self.query_page_request = None; }
             if let Some((export, partial)) = output {
                 let path = if export { rfd::FileDialog::new().add_filter("JSON", &["json"]).set_file_name(if partial { "query-partial.json" } else { "query-results.json" }).save_file() } else { None };
                 if (!export || path.is_some()) && let Err(error) = task.query_output(path, partial.then_some(count)) { self.notice = error; }
@@ -392,6 +415,10 @@ impl Viewer {
             });
         }
         if self.help {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(Key::F4)) {
+            self.next_query_match(ctx.input(|i| i.modifiers.shift));
             return;
         }
         if ctx.input(|i| i.key_pressed(Key::F5)) {
@@ -573,6 +600,12 @@ impl Viewer {
                 && generation == task.query.generation() && start == self.query_start
             { self.query_page_error = Some(error); }
             if let Some(snapshot) = &self.query_snapshot && let Some(state) = &snapshot.state {
+                if state.count > 0 && self.query_selected.is_none() {
+                    match task.query_select(0) {
+                        Ok(()) => self.query_selected = Some(0),
+                        Err(error) => self.notice = error,
+                    }
+                }
                 let key = (snapshot.generation, self.query_start, state.count.min(self.query_start.saturating_add(16)));
                 if state.count > self.query_start && self.query_page_request != Some(key) {
                     match task.query_page(self.query_start) {
@@ -764,6 +797,12 @@ impl Viewer {
                 if ui.button("Clear query").clicked() {
                     self.jsonpath.clear(); self.start_query();
                 }
+                let count = self.query_snapshot.as_ref().and_then(|s| s.state.as_ref()).map_or(0, |s| s.count);
+                ui.label(format!("{}/{count}", self.query_selected.map_or(0, |index| index + 1)));
+                if ui.add_enabled(count > 0, egui::Button::new("<"))
+                    .on_hover_text("Previous JSONPath match (Shift+F4)").clicked() { self.next_query_match(true); }
+                if ui.add_enabled(count > 0, egui::Button::new(">"))
+                    .on_hover_text("Next JSONPath match (F4)").clicked() { self.next_query_match(false); }
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label(if self.search_reverse {
@@ -1014,10 +1053,16 @@ impl Viewer {
             let mut select: Option<Location> = None;
             let mut toggle: Option<Location> = None;
             if let Some(frame) = &self.frame {
+                let number_digits = frame.total.max(1).to_string().len();
+                let number_width = number_digits as f32 * 9.0 + 12.0;
                 for row in frame.rows.iter().take(rows as usize) {
                     ui.horizontal(|ui| {
+                        let number = if row.rank == frame.selected_rank { row.rank + 1 } else { row.rank.abs_diff(frame.selected_rank) };
+                        ui.add_sized([number_width, 24.0], egui::Label::new(
+                            RichText::new(format!("{number:>width$}", width = number_digits)).monospace()
+                                .color(if row.rank == frame.selected_rank { ui.visuals().text_color() } else { ui.visuals().weak_text_color() }),
+                        ));
                         ui.add_space((row.location.ancestors.len().min(32) * 12) as f32);
-                        ui.monospace(format!("{}", row.rank + 1));
                         if row.location.node.container() {
                             if ui
                                 .small_button(if row.expanded { "▾" } else { "▸" })
@@ -1106,7 +1151,8 @@ impl Viewer {
                     "[ / ]: history; yy / Ctrl+C: copy JSON; yp / Ctrl+P: copy path",
                     ".: focus Path (JSON Pointer, e.g. /items/0)",
                     "F5: reload; F1: help; Esc: cancel pending jump and key sequence",
-                    "Search: / ? or Ctrl+F; n / N with counts. JSONPath: Run query / Enter; results have independent paging, cancel and output.",
+                    "Search: / ? or Ctrl+F; n / N with counts. JSONPath: Run query / Enter; F4 / Shift+F4: next / previous result (wraps).",
+                    "Line numbers: current visible row is absolute; other rows show distance from the cursor. Results have independent paging, cancel and output.",
                     "During validation, only committed content is browsable; complete output waits for Ready.",
                 ] { ui.label(line); }
             });
