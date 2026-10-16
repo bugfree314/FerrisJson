@@ -1,20 +1,11 @@
-//! Independent JSONPath lane. Query evaluation remains a legacy adapter in B.
+//! Independent JSONPath task lane; semantics and requests live in engine::query.
 use crate::{
     document::{Document, NodeIds},
     task_worker::{TaskWorker, Work},
 };
 
-pub struct QueryRequest {
-    pub expression: String,
-}
-
-impl QueryRequest {
-    pub fn new(expression: impl Into<String>) -> Self {
-        Self {
-            expression: expression.into(),
-        }
-    }
-}
+pub use crate::engine::query::QueryRequest;
+use crate::engine::query::QueryEngine;
 
 pub struct QueryOutput {
     pub expression: String,
@@ -32,8 +23,7 @@ impl Work for QueryRequest {
     }
 
     fn execute(self, doc: &Document, cancelled: &dyn Fn() -> bool) -> Result<QueryOutput, String> {
-        // The memory library still evaluates a whole query without a cancellation hook.
-        let ids = doc.query_path_cancellable(&self.expression, cancelled)?;
+        let ids = QueryEngine::execute(doc, &self, cancelled)?;
         if cancelled() {
             return Err("Query cancelled".into());
         }

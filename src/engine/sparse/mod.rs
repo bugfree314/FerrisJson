@@ -210,7 +210,7 @@ impl SparseIndex {
     pub fn source_bytes(&self) -> u64 {
         self.snapshot.len
     }
-    fn validate(&self, node: Node, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+    pub(crate) fn validate(&self, node: Node, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
         if node.session != self.root.session {
             return Err("Node belongs to a different sparse session".into());
         }
@@ -380,55 +380,9 @@ impl SparseIndex {
             _lease: lease,
         })
     }
-    /// CLI-only JSON Pointer subset. Full JSONPath belongs to S7.
+    /// Compatibility entry for the existing single-node Pointer subset.
     pub fn pointer(&mut self, pointer: &str, cancelled: &dyn Fn() -> bool) -> Result<Node, String> {
-        if pointer.len() > 16 * 1024 {
-            return Err("Sparse pointer exceeds 16 KiB command budget".into());
-        }
-        let _lease = self
-            .budget
-            .reserve(Resource::Memory, 32 * 1024, "sparse pointer decode")?;
-        let mut node = self.root;
-        if pointer.is_empty() {
-            self.validate(node, cancelled)?;
-            return Ok(node);
-        }
-        if !pointer.starts_with('/') {
-            return Err("Expected JSON Pointer starting with /".into());
-        }
-        for segment in pointer[1..].split('/') {
-            let mut decoded = String::with_capacity(segment.len());
-            let mut chars = segment.chars();
-            while let Some(c) = chars.next() {
-                if c == '~' {
-                    decoded.push(match chars.next() {
-                        Some('0') => '~',
-                        Some('1') => '/',
-                        _ => return Err("Invalid JSON Pointer escape".into()),
-                    });
-                } else {
-                    decoded.push(c);
-                }
-            }
-            node = match node.kind {
-                Kind::Object => self.field(node, &decoded, cancelled)?,
-                Kind::Array => {
-                    if decoded.is_empty()
-                        || (decoded.len() > 1 && decoded.starts_with('0'))
-                        || !decoded.bytes().all(|b| b.is_ascii_digit())
-                    {
-                        return Err("Invalid array index in JSON Pointer".into());
-                    }
-                    self.child(
-                        node,
-                        decoded.parse().map_err(|_| "Array index overflow")?,
-                        cancelled,
-                    )?
-                }
-                _ => return Err("Pointer descends into scalar".into()),
-            };
-        }
-        Ok(node)
+        crate::engine::query::QueryEngine::sparse_pointer(self, pointer, cancelled)
     }
     /// Streams original validated bytes, including duplicate keys in container ranges.
     /// It is not the legacy canonical/pretty export API.

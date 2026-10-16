@@ -16,3 +16,6 @@ pub mod search;
 
 /// Ordered result storage shared by search and JSONPath.
 pub mod results;
+
+/// Structural query compilation and backend adapters; independent of text search.
+pub mod query;

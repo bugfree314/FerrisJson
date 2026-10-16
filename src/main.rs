@@ -161,11 +161,14 @@ fn run() -> Result<(), String> {
         let stdout = io::stdout();
         let mut output = io::BufWriter::new(stdout.lock());
         if let Some(path) = get {
-            doc.write_node(&mut output, doc.find_path(&path)?)
+            let id = engine::query::QueryEngine::find(&doc, &path, &|| false)?;
+            doc.write_node(&mut output, id)
                 .map_err(|e| e.to_string())?;
             writeln!(output).map_err(|e| e.to_string())?;
         } else if let Some(expression) = query {
-            doc.write_results(&mut output, &doc.query_path(&expression)?)
+            let request = engine::query::QueryRequest::new(expression);
+            let ids = engine::query::QueryEngine::execute(&doc, &request, &|| false)?;
+            doc.write_results(&mut output, &ids)
                 .map_err(|e| e.to_string())?;
             writeln!(output).map_err(|e| e.to_string())?;
         } else if let Some(term) = search {

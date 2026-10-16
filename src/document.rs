@@ -1,5 +1,4 @@
 use serde_json::Value;
-use serde_json_path::{JsonPath, PathElement};
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -567,7 +566,7 @@ impl Document {
         }
         pointer
     }
-    fn child_name(&self, parent: usize, name: &str) -> Option<usize> {
+    pub(crate) fn child_name(&self, parent: usize, name: &str) -> Option<usize> {
         if !matches!(self.nodes[parent].kind, Kind::Object) {
             return None;
         }
@@ -580,39 +579,14 @@ impl Document {
             .ok()
             .map(|i| children[i] as usize)
     }
-    fn child_index(&self, parent: usize, index: usize) -> Option<usize> {
+    pub(crate) fn child_index(&self, parent: usize, index: usize) -> Option<usize> {
         let node = &self.nodes[parent];
         (matches!(node.kind, Kind::Array) && index < node.child_count as usize)
             .then(|| self.children[node.child_start as usize + index] as usize)
     }
-    fn pointer_id(&self, pointer: &str) -> Option<usize> {
-        let mut id = 0;
-        for token in pointer.strip_prefix('/')?.split('/') {
-            let mut bytes = token.bytes();
-            while let Some(byte) = bytes.next() {
-                if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
-                    return None;
-                }
-            }
-            let token = token.replace("~1", "/").replace("~0", "~");
-            id = if matches!(self.nodes[id].kind, Kind::Array) {
-                if token.starts_with('+') || (token.len() > 1 && token.starts_with('0')) {
-                    return None;
-                }
-                self.child_index(id, token.parse().ok()?)?
-            } else {
-                self.child_name(id, &token)?
-            };
-        }
-        Some(id)
-    }
+    /// Compatibility entry; query semantics belong to engine::query.
     pub fn find_path(&self, path: &str) -> Result<usize, String> {
-        let ids = self.query_path(path)?;
-        match ids.as_slice() {
-            [id] => Ok(*id as usize),
-            [] => Err(format!("Path not found: {path}")),
-            _ => Err("Path selected multiple nodes; use --query to retrieve all results".into()),
-        }
+        crate::engine::query::QueryEngine::find(self, path, &|| false)
     }
     pub fn query_path(&self, expression: &str) -> Result<NodeIds, String> {
         self.query_path_cancellable(expression, || false)
@@ -622,49 +596,7 @@ impl Document {
         expression: &str,
         cancelled: impl Fn() -> bool,
     ) -> Result<NodeIds, String> {
-        if cancelled() {
-            return Err("Query cancelled".into());
-        }
-        let expression = expression.trim();
-        if expression.starts_with('/') {
-            let mut ids = NodeIds::new(&self.budget);
-            if let Some(id) = self.pointer_id(expression) {
-                ids.push(id as u32)?;
-            }
-            return Ok(ids);
-        }
-        let normalized = if expression == "." {
-            "$".into()
-        } else if expression.starts_with('.') || expression.starts_with('[') {
-            format!("${expression}")
-        } else {
-            expression.to_owned()
-        };
-        let query = JsonPath::parse(&normalized).map_err(|e| format!("Invalid JSONPath: {e}"))?;
-        if matches!(self.storage, Storage::Indexed(_)) {
-            return indexed::query(self, &normalized, cancelled);
-        }
-        let results = query.query_located(self.value().unwrap());
-        if cancelled() {
-            return Err("Query cancelled".into());
-        }
-        let mut ids = NodeIds::new(&self.budget);
-        ids.reserve_exact(results.len())?;
-        for (index, node) in results.iter().enumerate() {
-            if index % 1024 == 0 && cancelled() {
-                return Err("Query cancelled".into());
-            }
-            let mut id = 0;
-            for element in node.location().iter() {
-                id = match element {
-                    PathElement::Name(name) => self.child_name(id, name),
-                    PathElement::Index(index) => self.child_index(id, *index),
-                }
-                .ok_or_else(|| "Query result not found in tree".to_string())?;
-            }
-            ids.push(id as u32)?;
-        }
-        Ok(ids)
+        crate::engine::query::QueryEngine::document(self, expression, &cancelled)
     }
 
     pub fn row_preview(&self, id: usize) -> String {
@@ -860,7 +792,7 @@ impl Document {
         }
         Ok(())
     }
-    fn direct_children(&self, id: usize) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn direct_children(&self, id: usize) -> impl Iterator<Item = usize> + '_ {
         let mut next = id + 1;
         let end = self.nodes[id].end();
         std::iter::from_fn(move || {

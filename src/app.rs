@@ -1,3 +1,4 @@
+use crate::engine::query::QueryEngine;
 use crate::engine::budget::{Reservation, Resource};
 use crate::engine::file_source::{Cancellation, Priority, with_io_context};
 use crate::preview_worker::{Output as PreviewOutput, PreviewWorker, ROW_BATCH};
@@ -755,7 +756,7 @@ impl Viewer {
             }
         } else {
             let started = Instant::now();
-            let result = doc.query_path(&self.query).map(|ids| {
+            let result = QueryEngine::document(doc, &self.query, &|| false).map(|ids| {
                 let preview = doc.results_preview(&ids);
                 (ids, preview)
             });
