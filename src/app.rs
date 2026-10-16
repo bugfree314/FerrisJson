@@ -1523,36 +1523,50 @@ impl Viewer {
                 if self.path_worker.as_ref().is_some_and(|w| w.busy) {
                     ui.spinner();
                 }
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .id(egui::Id::new("query_field"))
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("$.users[*].name or $.users[?(@.active)]")
-                        .desired_width((ui.available_width() - 270.0).max(100.0)),
-                );
-                if response.changed() && self.query.trim().is_empty() {
+                let row_height = ui.spacing().interact_size.y;
+                let controls_width: f32 = ["Expand all", "Collapse all"].iter().map(|label| {
+                    (ui.painter().layout_no_wrap(
+                        (*label).into(), egui::TextStyle::Button.resolve(ui.style()), ui.visuals().text_color(),
+                    ).size().x + 2.0 * ui.spacing().button_padding.x).max(ui.spacing().interact_size.x)
+                }).sum();
+                let field_width = (ui.available_width() - controls_width - 2.0 * ui.spacing().item_spacing.x).max(100.0);
+                let mut clear = false;
+                let response = ui.allocate_ui_with_layout(
+                    egui::vec2(field_width, row_height + 4.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| egui::Frame::new()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .stroke(ui.visuals().widgets.inactive.bg_stroke)
+                        .corner_radius(ui.visuals().widgets.inactive.corner_radius)
+                        .inner_margin(egui::Margin::symmetric(4, 2))
+                        .show(ui, |ui| ui.horizontal(|ui| {
+                            let text_width = (field_width - 8.0 - row_height - ui.spacing().item_spacing.x).max(24.0);
+                            let response = ui.add_sized(
+                                [text_width, row_height],
+                                egui::TextEdit::singleline(&mut self.query)
+                                    .id(egui::Id::new("query_field"))
+                                    .font(egui::TextStyle::Monospace)
+                                    .frame(false)
+                                    .margin(egui::Margin::ZERO)
+                                    .hint_text("$.users[*].name or $.users[?(@.active)]"),
+                            );
+                            clear = ui.add_enabled(
+                                !self.query.is_empty() || self.path_results.is_some()
+                                    || self.path_worker.as_ref().is_some_and(|w| w.busy),
+                                egui::Button::new("×").frame(false).min_size(egui::vec2(row_height, row_height)),
+                            ).on_hover_text("Clear JSONPath and results").clicked();
+                            response
+                        }).inner).inner,
+                ).inner;
+                if clear || (response.changed() && self.query.trim().is_empty()) {
+                    if clear { self.query.clear(); }
                     self.path_results = None;
                     if let Some(worker) = &mut self.path_worker {
                         worker.cancel();
                     }
                     self.path_duration = None;
-                }
-                if ui.button("Go").clicked()
-                    || (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
-                {
+                } else if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     self.go_to_path();
-                }
-                if ui
-                    .button("Reset")
-                    .on_hover_text("Clear JSONPath results and show selected value")
-                    .clicked()
-                {
-                    self.query.clear();
-                    self.path_results = None;
-                    if let Some(worker) = &mut self.path_worker {
-                        worker.cancel();
-                    }
-                    self.path_duration = None;
                 }
                 if ui.button("Expand all").clicked() {
                     self.expanded.fill(true);
