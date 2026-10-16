@@ -258,7 +258,19 @@ impl Snapshot {
         Ok(())
     }
 }
+const SEARCH_CACHE_BLOCKS: usize = 16;
+struct CachedReadBlock {
+    start: u64,
+    bytes: Vec<u8>,
+    _lease: Reservation,
+}
+struct ReadCache {
+    blocks: [Option<CachedReadBlock>; SEARCH_CACHE_BLOCKS],
+    next: usize,
+    _lease: Reservation,
+}
 pub(crate) struct Reader<'a> {
+    cache: Option<Box<ReadCache>>,
     cancelled: Option<&'a dyn Fn() -> bool>,
     source: &'a Snapshot,
     buffer: Vec<u8>,
@@ -275,6 +287,7 @@ impl<'a> Reader<'a> {
             .budget
             .reserve(Resource::Memory, BLOCK, "reader buffer")?;
         Ok(Self {
+            cache: None,
             cancelled: None,
             source,
             _buffer_reservation: lease,
@@ -285,6 +298,87 @@ impl<'a> Reader<'a> {
             line: 1,
             column: 0,
         })
+    }
+    /// Optional per-search-worker cache, tied to this immutable Snapshot. No
+    /// whole-file allocation; cache pages and metadata share the source budget.
+    pub(crate) fn enable_search_cache(&mut self) {
+        if self.cache.is_some() {
+            return;
+        }
+        let Ok(lease) = self.source.budget.reserve(
+            Resource::Memory,
+            std::mem::size_of::<ReadCache>(),
+            "search block cache metadata",
+        ) else {
+            return;
+        };
+        self.cache = Some(Box::new(ReadCache {
+            blocks: std::array::from_fn(|_| None),
+            next: 0,
+            _lease: lease,
+        }));
+    }
+    pub(crate) fn clear_search_cache(&mut self) -> bool {
+        self.cache.take().is_some()
+    }
+    pub(crate) fn trim_search_cache(&mut self, required: usize) {
+        let used = self.source.budget.usage().memory;
+        if used.saturating_add(required) > self.source.budget.limits().memory {
+            self.clear_search_cache();
+        }
+    }
+    fn remember_block(&mut self) {
+        // Optional caching must never turn a successful read into a budget error.
+        let Some(cache) = self.cache.as_mut() else {
+            return;
+        };
+        let slot = cache.next;
+        // Recycle the evicted allocation; steady sequential reads do not allocate
+        // another 64 KiB on every block boundary.
+        if let Some(mut block) = cache.blocks[slot].take() {
+            block.start = self.start;
+            block.bytes.clear();
+            block.bytes.extend_from_slice(&self.buffer[..self.count]);
+            cache.blocks[slot] = Some(block);
+            cache.next = (slot + 1) % SEARCH_CACHE_BLOCKS;
+            return;
+        }
+        let budget = &self.source.budget;
+        if budget.usage().memory.saturating_add(BLOCK * 4) > budget.limits().memory {
+            return;
+        }
+        let Ok(mut lease) = budget.reserve(Resource::Memory, BLOCK, "search cached file block")
+        else {
+            return;
+        };
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(BLOCK).is_err() {
+            return;
+        }
+        if lease.resize(bytes.capacity()).is_err() {
+            return;
+        }
+        bytes.extend_from_slice(&self.buffer[..self.count]);
+        cache.blocks[slot] = Some(CachedReadBlock {
+            start: self.start,
+            bytes,
+            _lease: lease,
+        });
+        cache.next = (slot + 1) % SEARCH_CACHE_BLOCKS;
+    }
+    pub(crate) fn checkpoint(&self) -> (u64, u64, u64) {
+        (self.pos, self.line, self.column)
+    }
+    pub(crate) fn restore(&mut self, saved: (u64, u64, u64)) {
+        (self.pos, self.line, self.column) = saved;
+    }
+    /// Borrow a fully buffered range without decoding or allocating. Missing
+    /// ranges fall back to the regular bounded character reader.
+    pub(crate) fn buffered_range(&self, start: u64, end: u64) -> Option<&[u8]> {
+        if start < self.start || end < start || end > self.start + self.count as u64 {
+            return None;
+        }
+        Some(&self.buffer[(start - self.start) as usize..(end - self.start) as usize])
     }
     pub(crate) fn with_cancellation(mut self, cancelled: &'a dyn Fn() -> bool) -> Self {
         self.cancelled = Some(cancelled);
@@ -304,15 +398,30 @@ impl<'a> Reader<'a> {
         }
         if self.pos < self.start || self.pos >= self.start + self.count as u64 {
             self.start = self.pos / BLOCK as u64 * BLOCK as u64;
-            self.count = (self.source.len - self.start).min(BLOCK as u64) as usize;
+            let count = (self.source.len - self.start).min(BLOCK as u64) as usize;
+            // A failed/partial read must not leave a reusable buffer marked valid.
+            self.count = 0;
+            if let Some(cache) = &self.cache
+                && let Some(block) = cache
+                    .blocks
+                    .iter()
+                    .flatten()
+                    .find(|b| b.start == self.start)
+            {
+                self.buffer[..count].copy_from_slice(&block.bytes[..count]);
+                self.count = count;
+                return Ok(Some(self.buffer[(self.pos - self.start) as usize]));
+            }
             self.source
                 .file
                 .read_exact_at_cancellable(
                     self.start,
-                    &mut self.buffer[..self.count],
+                    &mut self.buffer[..count],
                     self.cancelled.unwrap_or(&|| false),
                 )
                 .map_err(|e| e.to_string())?;
+            self.count = count;
+            self.remember_block();
         }
         Ok(Some(self.buffer[(self.pos - self.start) as usize]))
     }

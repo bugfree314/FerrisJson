@@ -28,6 +28,7 @@ pub struct Matcher {
     query: Query,
     regex: regex::Regex,
     overlap: usize,
+    window: std::cell::RefCell<String>,
     _lease: Reservation,
 }
 impl Matcher {
@@ -56,6 +57,7 @@ impl Matcher {
             query,
             regex,
             overlap,
+            window: std::cell::RefCell::new(String::new()),
             _lease: lease,
         })
     }
@@ -69,7 +71,15 @@ impl Matcher {
         self.query.scope != SearchScope::Keys
     }
     pub fn text(&self, text: &str) -> bool {
-        !self.query.term.is_empty() && self.regex.is_match(text)
+        if self.query.term.is_empty() {
+            return false;
+        }
+        if !self.query.regex && self.query.case {
+            text.contains(&self.query.term)
+        } else {
+            // Keep regex Unicode case folding for case-insensitive literals.
+            self.regex.is_match(text)
+        }
     }
     pub(crate) fn range(
         &self,
@@ -105,6 +115,9 @@ impl Matcher {
         consume: bool,
         hit: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<bool, String> {
+        if cancel() {
+            return Err("Search cancelled".into());
+        }
         if self.query.term.is_empty() {
             return Ok(false);
         }
@@ -113,6 +126,25 @@ impl Matcher {
         }
         reader.pos = start;
         let numeric = !string && matches!(reader.peek()?, Some(b'-' | b'0'..=b'9'));
+        if !consume && string {
+            // The peek above/this peek loads the current block. Unescaped UTF-8
+            // strings can be matched directly; escaped or split ranges decode below.
+            reader.peek()?;
+            if let Some(raw) = reader.buffered_range(start, end)
+                && raw.len() >= 2
+                && raw[0] == b'"'
+                && raw[raw.len() - 1] == b'"'
+            {
+                let bytes = &raw[1..raw.len() - 1];
+                if !bytes.iter().any(|b| *b == b'\\' || *b == b'"' || *b < 32)
+                    && let Ok(text) = std::str::from_utf8(bytes)
+                {
+                    let found = self.text(text);
+                    reader.pos = end;
+                    return Ok(found);
+                }
+            }
+        }
         if string {
             reader.expect(b'"')?;
         }
@@ -121,7 +153,13 @@ impl Matcher {
         } else {
             (64 * 1024 + self.overlap + 4) as u64
         }) as usize;
-        let mut window = String::with_capacity(capacity);
+        let mut window = self.window.borrow_mut();
+        window.clear();
+        if window.capacity() < capacity {
+            window
+                .try_reserve_exact(capacity)
+                .map_err(|e| format!("Search decode allocation failed: {e}"))?;
+        }
         let mut added = 0;
         let mut found = false;
         loop {

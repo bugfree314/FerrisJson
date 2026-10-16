@@ -1,7 +1,7 @@
 //! Progressive file session with resident tree metadata and search results.
 //! Source JSON is read on demand; exports stream to their destination file.
 use super::{
-    budget::{BudgetManager, Limits, Reservation, Resource},
+    budget::{BudgetManager, Limits, Reservation, Resource, reserve_vec},
     sparse::store::{Record, Store},
     top_level::{Kind, Source},
 };
@@ -24,11 +24,52 @@ pub struct Hits {
     data: Arc<Mutex<HitData>>,
     count: u64,
 }
+const HIT_CHUNK: usize = 4096;
+struct HitChunk {
+    records: Vec<(u64, u64)>,
+    _lease: Reservation,
+}
 struct HitData {
-    store: Store,
-    directory: u64,
-    next: u64,
-    count: u64,
+    chunks: Vec<HitChunk>,
+    count: usize,
+    budget: BudgetManager,
+    directory: Reservation,
+}
+impl HitData {
+    fn get(&self, n: usize) -> Result<(u64, u64), String> {
+        if n >= self.count {
+            return Err("Match out of range".into());
+        }
+        Ok(self.chunks[n / HIT_CHUNK].records[n % HIT_CHUNK])
+    }
+    fn push(&mut self, record: (u64, u64)) -> Result<(), String> {
+        let next = self.count.checked_add(1).ok_or("Match count overflow")?;
+        if self.count.is_multiple_of(HIT_CHUNK) {
+            if self.chunks.len() == self.chunks.capacity() {
+                let additional = self.chunks.len().max(4);
+                reserve_vec(&mut self.chunks, additional, &mut self.directory)?;
+            }
+            let mut records = Vec::new();
+            let mut lease = self
+                .budget
+                .reserve(Resource::Memory, 0, "resident match block")?;
+            reserve_vec(&mut records, HIT_CHUNK, &mut lease)?;
+            self.chunks.push(HitChunk {
+                records,
+                _lease: lease,
+            });
+        }
+        self.chunks[self.count / HIT_CHUNK].records.push(record);
+        self.count = next;
+        Ok(())
+    }
+    fn truncate(&mut self, count: usize) {
+        self.chunks.truncate(count.div_ceil(HIT_CHUNK));
+        if let Some(last) = self.chunks.last_mut() {
+            last.records.truncate((count - 1) % HIT_CHUNK + 1);
+        }
+        self.count = count;
+    }
 }
 impl Hits {
     pub fn len(&self) -> u64 {
@@ -39,12 +80,10 @@ impl Hits {
     }
     fn target(&self, n: u64) -> Result<(u64, u64), String> {
         let d = self.data.lock().unwrap();
-        if n >= d.count {
+        if n >= d.count as u64 {
             return Err("Match out of range".into());
         }
-        let at = d.store.directory_weight(d.directory, n, &|| false)?.0[2];
-        let record = d.store.get(at, &|| false)?;
-        Ok((record[1], record[2]))
+        d.get(usize::try_from(n).map_err(|_| "Match index overflow")?)
     }
     #[cfg(test)]
     fn get(&self, n: u64) -> Result<u64, String> {
@@ -58,19 +97,24 @@ struct HitWriter {
     last: Instant,
     started: Instant,
     publish: bool,
+    trusted_ready: bool,
 }
 impl HitWriter {
     fn new(s: &Shared, cancel: &dyn Fn() -> bool, publish: bool) -> Result<Self, String> {
-        let store = Store::memory(&s.budget, cancel)?;
+        if cancel() {
+            return Err("Search cancelled".into());
+        }
         Ok(Self {
             hits: Hits {
                 generation: s.search_epoch.load(Ordering::Relaxed),
                 session: s.session,
                 data: Arc::new(Mutex::new(HitData {
-                    store,
-                    directory: NONE,
-                    next: 0,
+                    chunks: Vec::new(),
                     count: 0,
+                    budget: s.budget.clone(),
+                    directory: s
+                        .budget
+                        .reserve(Resource::Memory, 0, "resident match directory")?,
                 })),
                 count: 0,
             },
@@ -79,13 +123,14 @@ impl HitWriter {
             last: Instant::now(),
             started: Instant::now(),
             publish,
+            trusted_ready: false,
         })
     }
     fn notify(&mut self, s: &Shared, complete: bool, force: bool) {
         if !self.publish {
             return;
         }
-        self.hits.count = self.hits.data.lock().unwrap().count;
+        self.hits.count = self.hits.data.lock().unwrap().count as u64;
         if !force
             && !(self.hits.count == 1 && self.published == 0)
             && self.hits.count.saturating_sub(self.published) < 256
@@ -112,37 +157,32 @@ impl HitWriter {
         s.ctx.request_repaint();
     }
     fn prune(&mut self, s: &Shared, cancel: &dyn Fn() -> bool) -> Result<(), String> {
+        if self.trusted_ready {
+            return Ok(());
+        }
         let revision = s.index.lock().unwrap().replacements;
         if revision == self.replacements {
             return Ok(());
         }
-        let next = self.hits.data.lock().unwrap().next;
-        for n in 0..next {
+        // Stable compaction keeps canonical relative order without a per-hit AVL tree.
+        let mut d = self.hits.data.lock().unwrap();
+        let mut kept = 0;
+        for n in 0..d.count {
             if cancel() {
                 return Err("Search cancelled".into());
             }
-            let (edge, r) = {
-                let d = self.hits.data.lock().unwrap();
-                let edge = d
-                    .store
-                    .directory_find(d.directory, n, false, cancel)?
-                    .ok_or("Missing hit")?;
-                if edge[7] == 0 {
-                    continue;
-                }
-                (edge, d.store.get(edge[2], cancel)?)
-            };
+            let (id, start) = d.get(n)?;
             let live = {
                 let i = s.index.lock().unwrap();
-                i.node(r[1])?[2] == r[2] && i.live_ancestor(r[1])? == r[1]
+                i.node(id)?[2] == start && i.live_ancestor(id)? == id
             };
-            if !live {
-                let mut d = self.hits.data.lock().unwrap();
-                let root = d.directory;
-                d.directory = d.store.directory_put(root, [n, edge[2], 0, 0, 1], cancel)?;
-                d.count -= 1;
+            if live {
+                d.chunks[kept / HIT_CHUNK].records[kept % HIT_CHUNK] = (id, start);
+                kept += 1;
             }
         }
+        d.truncate(kept);
+        drop(d);
         self.replacements = revision;
         self.notify(s, false, true);
         Ok(())
@@ -155,28 +195,20 @@ impl HitWriter {
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), String> {
         self.prune(s, cancel)?;
-        let i = s.index.lock().unwrap();
-        if i.node(id)?[2] != start || i.live_ancestor(id)? != id {
-            return Ok(());
+        // Ready traversal already follows only live directory entries. During streaming,
+        // replacements may invalidate nodes, so preserve the ancestor/start checks.
+        if !self.trusted_ready {
+            let i = s.index.lock().unwrap();
+            if i.node(id)?[2] != start || i.live_ancestor(id)? != id {
+                return Ok(());
+            }
         }
-        drop(i);
-        let mut d = self.hits.data.lock().unwrap();
-        let record = d
-            .store
-            .append([8, id, start, 1, 0, 0, 0, 0, 0, 0, 0, 0], cancel)?;
-        let root = d.directory;
-        let next = d.next;
-        d.directory = d
-            .store
-            .directory_put(root, [next, record, 1, 0, 1], cancel)?;
-        d.next += 1;
-        d.count += 1;
-        drop(d);
+        self.hits.data.lock().unwrap().push((id, start))?;
         self.notify(s, false, false);
         Ok(())
     }
     fn finish(mut self) -> Hits {
-        self.hits.count = self.hits.data.lock().unwrap().count;
+        self.hits.count = self.hits.data.lock().unwrap().count as u64;
         self.hits
     }
 }
@@ -959,23 +991,23 @@ impl Parser<'_> {
         if let Some((matcher, output)) = self.search.as_mut() {
             output.prune(self.s, self.cancel)?;
             if register {
-                let mut reader = Reader::new(&self.s.snapshot)?.with_cancellation(self.cancel);
+                let saved = self.r.checkpoint();
                 matched = matcher.keys()
                     && key.0 != NONE
-                    && matcher.range(&mut reader, key.0, key.1, true, self.cancel)?;
+                    && matcher.range(&mut self.r, key.0, key.1, true, self.cancel)?;
+                self.r.restore(saved);
                 if matched {
                     output.push(self.s, id, start, self.cancel)?;
                 }
                 // Literals can be reported from a bounded decoded prefix of a huge string.
                 if !matched && matcher.values() && k == Kind::String && !matcher.is_regex() {
                     matched = matcher.stream_string(
-                        &mut reader,
+                        &mut self.r,
                         start,
                         self.s.source.bytes,
                         self.cancel,
                         &mut || output.push(self.s, id, start, self.cancel),
                     )?;
-                    self.r.pos = reader.pos;
                     consumed_string = true;
                 }
             }
@@ -1032,14 +1064,12 @@ impl Parser<'_> {
                     && !k.container()
                     && (k != Kind::String || matcher.is_regex())
                 {
-                    let mut reader = Reader::new(&self.s.snapshot)?.with_cancellation(self.cancel);
-                    if matcher.range(
-                        &mut reader,
-                        start,
-                        self.r.pos,
-                        k == Kind::String,
-                        self.cancel,
-                    )? {
+                    let saved = self.r.checkpoint();
+                    let end = self.r.pos;
+                    let hit =
+                        matcher.range(&mut self.r, start, end, k == Kind::String, self.cancel)?;
+                    self.r.restore(saved);
+                    if hit {
                         output.push(self.s, id, start, self.cancel)?;
                     }
                 }
@@ -1537,6 +1567,8 @@ fn pager(s: &Shared) {
     }
 }
 fn search_worker(s: &Shared) {
+    let stopped = || s.cancelled();
+    let mut ready_reader: Option<Reader<'_>> = None;
     loop {
         let (epoch, q) = {
             let mut c = s.control.lock().unwrap();
@@ -1554,6 +1586,9 @@ fn search_worker(s: &Shared) {
         };
         let cancel = || s.cancelled() || s.search_epoch.load(Ordering::Acquire) != epoch;
         let started = Instant::now();
+        if let Some(reader) = ready_reader.as_mut() {
+            reader.trim_search_cache(16 * 1024 * 1024);
+        }
         let result = (|| -> Result<(), String> {
             let _lease = s.budget.reserve(
                 Resource::Memory,
@@ -1567,7 +1602,18 @@ fn search_worker(s: &Shared) {
             let streaming = !s.ready.load(Ordering::Acquire);
             if !streaming {
                 let root = s.index.lock().unwrap().root;
-                search_node(s, root, &matcher, &mut output, &cancel)?;
+                if ready_reader.is_none() {
+                    ready_reader = Some(Reader::new(&s.snapshot)?.with_cancellation(&stopped));
+                }
+                ready_reader.as_mut().unwrap().enable_search_cache();
+                search_node_with_reader(
+                    s,
+                    root,
+                    &matcher,
+                    &mut output,
+                    &cancel,
+                    ready_reader.as_mut().unwrap(),
+                )?;
             } else {
                 let mut r = Reader::new(&s.snapshot)?.with_cancellation(&cancel);
                 if r.peek()? == Some(0xef) {
@@ -1852,18 +1898,108 @@ fn search_node(
     output: &mut HitWriter,
     cancel: &dyn Fn() -> bool,
 ) -> Result<(), String> {
+    let mut reader = Reader::new(&s.snapshot)?.with_cancellation(cancel);
+    search_node_with_reader(s, id, matcher, output, cancel, &mut reader)
+}
+fn search_node_with_reader(
+    s: &Shared,
+    id: u64,
+    matcher: &super::search::Matcher,
+    output: &mut HitWriter,
+    cancel: &dyn Fn() -> bool,
+    reader: &mut Reader<'_>,
+) -> Result<(), String> {
+    if !s.ready.load(Ordering::Acquire) {
+        output.trusted_ready = false;
+        return search_pending_node(s, id, matcher, output, cancel, reader);
+    }
+    struct Frame {
+        path: [u64; 128],
+        depth: usize,
+        next: u64,
+    }
+    // One bounded cursor per nesting level, never a full copy of the index.
+    let mut frames = Vec::<Frame>::new();
+    let mut lease = s
+        .budget
+        .reserve(Resource::Memory, 0, "sequential search cursors")?;
+    reserve_vec(&mut frames, 129, &mut lease)?;
+    let mut current = Some((id, s.index.lock().unwrap().node(id)?));
+    output.trusted_ready = s.ready.load(Ordering::Acquire);
+    loop {
+        if cancel() {
+            return Err("Search cancelled".into());
+        }
+        if let Some((id, r)) = current.take() {
+            let k = kind_from(r[1])?;
+            let hit = (matcher.keys()
+                && r[5] != NONE
+                && matcher.range(reader, r[5], r[6], true, cancel)?)
+                || (matcher.values()
+                    && !k.container()
+                    && matcher.range(reader, r[2], r[3], k == Kind::String, cancel)?);
+            if hit {
+                reader.trim_search_cache(128 * 1024);
+                if let Err(error) = output.push(s, id, r[2], cancel) {
+                    if cancel() || !reader.clear_search_cache() {
+                        return Err(error);
+                    }
+                    output.push(s, id, r[2], cancel)?;
+                }
+            }
+            if r[8] != NONE {
+                if frames.len() == 129 {
+                    return Err("Search depth limit".into());
+                }
+                frames.push(Frame {
+                    path: [NONE; 128],
+                    depth: 0,
+                    next: r[8],
+                });
+            }
+        }
+        while let Some(frame) = frames.last_mut() {
+            // Fetch the next child and its record under one short lock; matching
+            // and file I/O run outside the index lock.
+            let i = s.index.lock().unwrap();
+            if let Some(edge) = i.store.directory_next(
+                &mut frame.path,
+                &mut frame.depth,
+                &mut frame.next,
+                cancel,
+            )? {
+                current = Some((edge[2], i.node(edge[2])?));
+                break;
+            }
+            drop(i);
+            frames.pop();
+        }
+        if current.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+// Concurrent indexing can rotate/change directories; retain ordinal lookup here.
+fn search_pending_node(
+    s: &Shared,
+    id: u64,
+    matcher: &super::search::Matcher,
+    output: &mut HitWriter,
+    cancel: &dyn Fn() -> bool,
+    reader: &mut Reader<'_>,
+) -> Result<(), String> {
     if cancel() {
         return Err("Search cancelled".into());
     }
     let r = s.index.lock().unwrap().node(id)?;
     let k = kind_from(r[1])?;
-    let mut reader = Reader::new(&s.snapshot)?.with_cancellation(cancel);
     let hit =
-        (matcher.keys() && r[5] != NONE && matcher.range(&mut reader, r[5], r[6], true, cancel)?)
+        (matcher.keys() && r[5] != NONE && matcher.range(reader, r[5], r[6], true, cancel)?)
             || (matcher.values()
                 && !k.container()
-                && matcher.range(&mut reader, r[2], r[3], k == Kind::String, cancel)?);
-    drop(reader);
+                && matcher.range(reader, r[2], r[3], k == Kind::String, cancel)?);
     if hit {
         output.push(s, id, r[2], cancel)?;
     }
@@ -1874,10 +2010,11 @@ fn search_node(
             .unwrap()
             .child(r, n)?
             .ok_or("Missing child")?;
-        search_node(s, child, matcher, output, cancel)?;
+        search_pending_node(s, child, matcher, output, cancel, reader)?;
     }
     Ok(())
 }
+
 fn append(out: &mut Vec<u64>, id: u64) -> Result<(), String> {
     if out.len() == LIMIT {
         return Err("Compatibility query is limited to 65536 results".into());

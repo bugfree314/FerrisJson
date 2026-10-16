@@ -44,6 +44,31 @@ impl Store {
         self.refresh(child, b, cancel)?;
         Ok(child)
     }
+    /// In-order cursor: each directory edge is visited once instead of a rank
+    /// lookup from the root for every child. Only use with a stable directory.
+    pub(crate) fn directory_next(
+        &self,
+        path: &mut [u64; 128],
+        depth: &mut usize,
+        next: &mut u64,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<Record>, String> {
+        while *next != NONE {
+            if *depth == path.len() {
+                return Err("Directory depth limit".into());
+            }
+            path[*depth] = *next;
+            *depth += 1;
+            *next = self.branch(*next, cancel)?[3];
+        }
+        if *depth == 0 {
+            return Ok(None);
+        }
+        *depth -= 1;
+        let r = self.branch(path[*depth], cancel)?;
+        *next = r[4];
+        Ok(Some(r))
+    }
     pub(crate) fn directory_put(
         &mut self,
         root: u64,
