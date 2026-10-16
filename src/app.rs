@@ -1181,6 +1181,20 @@ impl Viewer {
             if ui.button("Export").clicked() {
                 self.export();
             }
+            ui.menu_button("Export matches", |ui| {
+                if ui.add_enabled(self.matches.completed(), egui::Button::new("All values")).clicked() {
+                    ui.close(); self.export_matches(false, false);
+                }
+                if ui.add_enabled(self.matches.completed(), egui::Button::new("All paths")).clicked() {
+                    ui.close(); self.export_matches(true, false);
+                }
+                if ui.add_enabled(!self.matches.is_empty(), egui::Button::new("Partial values (committed prefix)")).clicked() {
+                    ui.close(); self.export_matches(false, true);
+                }
+                if ui.add_enabled(!self.matches.is_empty(), egui::Button::new("Partial paths (committed prefix)")).clicked() {
+                    ui.close(); self.export_matches(true, true);
+                }
+            });
         });
         ui.separator();
         json_preview(
@@ -1384,15 +1398,60 @@ impl Viewer {
                             changed |= ui.selectable_value(&mut self.scope, scope, label).changed();
                         }
                     });
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.term)
-                        .hint_text(if self.search_reverse {
-                            "? Search backward..."
-                        } else {
-                            "/ Search forward..."
-                        })
-                        .desired_width((ui.available_width() - 185.0).max(140.0)),
+                let total = self.matches.len();
+                let position = self.match_index.map_or_else(
+                    || if total == 0 { "0".into() } else { "—".into() },
+                    |i| (i + 1).to_string(),
                 );
+                let counter = if self.matches.completed() {
+                    format!("{position} / {total}")
+                } else if self.matches.store.is_some() {
+                    format!("{position} / at least {total}")
+                } else { "0 / 0".into() };
+                let running = self.search_due.is_some()
+                    || self.matches.store.as_ref().is_some_and(|s| s.state().status == crate::engine::results::Status::Scanning)
+                    || (self.matches.store.is_none() && self.search_worker.as_ref().is_some_and(|w| w.busy));
+                let row_height = ui.spacing().interact_size.y;
+                let counter_width = ui.painter().layout_no_wrap(
+                    counter.clone(), egui::TextStyle::Body.resolve(ui.style()), ui.visuals().text_color(),
+                ).size().x;
+                let field_width = (ui.available_width() - counter_width - 2.0 * row_height - 4.0 * ui.spacing().item_spacing.x).max(80.0);
+                let mut clear = false;
+                let mut cancel = false;
+                let response = ui.allocate_ui_with_layout(
+                    egui::vec2(field_width, row_height + 4.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .stroke(ui.visuals().widgets.inactive.bg_stroke)
+                    .corner_radius(ui.visuals().widgets.inactive.corner_radius)
+                    .inner_margin(egui::Margin::symmetric(4, 2))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let slots = if running { 2.0 } else { 1.0 };
+                            let text_width = (field_width - 8.0 - slots * row_height - slots * ui.spacing().item_spacing.x).max(24.0);
+                            let response = ui.add_sized(
+                                [text_width, row_height],
+                                egui::TextEdit::singleline(&mut self.term)
+                                    .id(egui::Id::new("search_field"))
+                                    .frame(false)
+                                    .margin(egui::Margin::ZERO)
+                                    .hint_text(if self.search_reverse { "? Search backward..." } else { "/ Search forward..." }),
+                            );
+                            clear = ui.add_enabled(
+                                !self.term.is_empty(), egui::Button::new("×").frame(false).min_size(egui::vec2(row_height, row_height)),
+                            ).on_hover_text("Clear search").clicked();
+                            if running {
+                                let spinner = ui.add_sized([row_height, row_height], egui::Spinner::new().size(16.0));
+                                cancel = ui.interact(spinner.rect, ui.id().with("cancel_search"), egui::Sense::click())
+                                    .on_hover_text("Cancel search; keep committed matches")
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked();
+                            }
+                            response
+                        }).inner
+                    }).inner,
+                ).inner;
                 if self.focus_search {
                     response.request_focus();
                     self.focus_search = false;
@@ -1401,65 +1460,31 @@ impl Viewer {
                 if response.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
                     response.surrender_focus();
                 }
-                if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                if clear {
+                    self.term.clear();
+                    self.search();
+                    changed = false;
+                } else if cancel {
+                    self.search_due = None;
+                    if let Some(worker) = &mut self.search_worker { worker.cancel_scan(); }
+                    changed = false;
+                } else if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     response.surrender_focus();
                     self.search();
                     changed = false;
                 }
-                if changed {
-                    self.schedule_search(ctx);
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                if self.search_due.is_some() || self.search_worker.as_ref().is_some_and(|w| w.busy)
-                {
-                    ui.spinner();
-                }
-                let total = self.matches.len();
-                let position = self.match_index.map_or("—".into(), |i| (i + 1).to_string());
-                ui.label(if self.matches.completed() {
-                    format!("{position} / {total}")
-                } else if self.matches.store.is_some() {
-                    format!("{position} / at least {total}")
-                } else { "0 / 0".into() });
+                if changed { self.schedule_search(ctx); }
+                let count_response = ui.label(counter);
                 if let Some(store) = &self.matches.store {
-                    use crate::engine::results::Status;
-                    ui.label(match store.state().status {
-                        Status::Scanning => "Scanning",
-                        Status::Completed => "Complete",
-                        Status::Cancelled => "Cancelled (partial)",
-                        Status::Failed => "Failed (partial)",
+                    count_response.on_hover_text(match store.state().status {
+                        crate::engine::results::Status::Scanning => "Searching; count is a lower bound",
+                        crate::engine::results::Status::Completed => "Complete search results",
+                        crate::engine::results::Status::Cancelled => "Cancelled; partial results",
+                        crate::engine::results::Status::Failed => "Failed; partial results",
                     });
                 }
-                if ui.button("<").clicked() {
-                    self.next_match(true);
-                }
-                if ui.button(">").clicked() {
-                    self.next_match(false);
-                }
-                if ui.button("Clear").clicked() {
-                    self.term.clear();
-                    self.search();
-                }
-                if ui.button("Cancel search").clicked()
-                    && let Some(worker) = &mut self.search_worker
-                {
-                    worker.cancel_scan();
-                }
-                ui.menu_button("Export matches", |ui| {
-                    if ui.add_enabled(self.matches.completed(), egui::Button::new("All values")).clicked() {
-                        ui.close(); self.export_matches(false, false);
-                    }
-                    if ui.add_enabled(self.matches.completed(), egui::Button::new("All paths")).clicked() {
-                        ui.close(); self.export_matches(true, false);
-                    }
-                    if ui.add_enabled(!self.matches.is_empty(), egui::Button::new("Partial values (committed prefix)")).clicked() {
-                        ui.close(); self.export_matches(false, true);
-                    }
-                    if ui.add_enabled(!self.matches.is_empty(), egui::Button::new("Partial paths (committed prefix)")).clicked() {
-                        ui.close(); self.export_matches(true, true);
-                    }
-                });
+                if ui.add_sized([row_height, row_height], egui::Button::new("<")).clicked() { self.next_match(true); }
+                if ui.add_sized([row_height, row_height], egui::Button::new(">")).clicked() { self.next_match(false); }
             });
             if let Some(error) = &self.search_error {
                 ui.colored_label(Color32::LIGHT_RED, error);
