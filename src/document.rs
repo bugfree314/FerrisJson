@@ -808,7 +808,9 @@ impl Document {
         let mut matches = NodeIds::new(&self.budget);
         self.search_visit(&matcher, &cancelled, &mut |id, matched| {
             if matched {
-                if matches.len() >= 65_536 { return Err("Compatibility search is limited to 65536 matches; use --paged-tree or --sparse for streaming search".into()); }
+                if matches.len() == matches.capacity() {
+                    matches.reserve_exact(matches.capacity().max(1024))?;
+                }
                 matches.push(id as u32)?;
             }
             Ok(())

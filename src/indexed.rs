@@ -1101,12 +1101,8 @@ enum Selector {
     Slice(Option<i64>, Option<i64>, i64),
 }
 fn result_id(result: &mut NodeIds, id: usize) -> Result<(), String> {
-    const LIMIT: usize = 256 * 1024 * 1024 / 4;
-    if result.len() >= LIMIT {
-        return Err("Indexed query exceeds 256 MiB result-ID budget; narrow the expression".into());
-    }
     if result.len() == result.capacity() {
-        result.reserve_exact(result.capacity().max(1024).min(LIMIT - result.len()))?;
+        result.reserve_exact(result.capacity().max(1024))?;
     }
     result.push(id as u32)?;
     Ok(())

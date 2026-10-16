@@ -332,7 +332,7 @@ fn cursor_export_complete_partial_failed_and_cancelled_is_atomic() {
 }
 
 #[test]
-fn compatibility_collector_rejects_over_limit_without_all_hit_allocation() {
+fn compatibility_collector_accepts_more_than_65536_hits_within_budget() {
     let text = format!(
         "[{}]",
         std::iter::repeat_n("0", 65_537)
@@ -343,12 +343,10 @@ fn compatibility_collector_rejects_over_limit_without_all_hit_allocation() {
     let doc = Document::parse_owned_recover_with_budget(text, b.clone())
         .map_err(|(e, _)| e)
         .unwrap();
-    assert!(
-        doc.search("0", true, false, SearchScope::Values)
-            .err()
-            .unwrap()
-            .contains("65536")
-    );
+    let hits = doc.search("0", true, false, SearchScope::Values).unwrap();
+    assert_eq!(hits.len(), 65_537);
+    assert_eq!(hits.first(), Some(&1));
+    assert_eq!(hits.last(), Some(&65_537));
 }
 
 #[test]
