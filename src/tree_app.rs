@@ -148,6 +148,13 @@ pub struct Viewer {
     search_page: Option<crate::tree_worker::SearchPage>,
     search_start: u64,
     page_request: Option<(u64, u64, u64)>,
+    jsonpath: String,
+    query_snapshot: Option<crate::paged_query_worker::Snapshot>,
+    query_page: Option<crate::tree_worker::ResultPage>,
+    query_page_error: Option<String>,
+    query_start: u64,
+    query_page_request: Option<(u64, u64, u64)>,
+    query_selected: Option<u64>,
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, path: PathBuf, backend: Backend) -> Self {
@@ -203,6 +210,13 @@ impl Viewer {
             search_page: None,
             search_start: 0,
             page_request: None,
+            jsonpath: String::new(),
+            query_snapshot: None,
+            query_page: None,
+            query_page_error: None,
+            query_start: 0,
+            query_page_request: None,
+            query_selected: None,
         }
     }
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
@@ -211,6 +225,12 @@ impl Viewer {
         }
         self.frame = None;
         self.search = None;
+        self.query_snapshot = None;
+        self.query_page = None;
+        self.query_page_error = None;
+        self.query_start = 0;
+        self.query_page_request = None;
+        self.query_selected = None;
         self.search_page = None;
         self.search_due = None;
         self.search_highlight = None;
@@ -250,6 +270,7 @@ impl Viewer {
     }
     fn command(&mut self, command: Navigation) {
         self.page_request = None;
+        self.query_page_request = None;
         if let Some(task) = &self.task
             && let Err(e) = task.command(command)
         {
@@ -292,6 +313,70 @@ impl Viewer {
             }
         }
     }
+    fn start_query(&mut self) {
+        self.query_page = None; self.query_page_error = None; self.query_page_request = None; self.query_start = 0; self.query_selected = None;
+        if let Some(task) = &self.task {
+            if self.jsonpath.trim().is_empty() { task.query_clear(true); self.query_snapshot = None; return; }
+            if let Err(error) = task.query_request(self.jsonpath.clone()) { self.notice = error; }
+            self.query_snapshot = Some(task.query.poll());
+        }
+    }
+    fn query_results(&mut self, ui: &mut egui::Ui) {
+        use crate::engine::results::Status;
+        let Some(snapshot) = &self.query_snapshot else { return; };
+        if snapshot.expression.is_empty() { return; }
+        ui.heading("JSONPath results");
+        ui.add(egui::Label::new(RichText::new(&snapshot.expression).monospace()).truncate()).on_hover_text(&snapshot.expression);
+        let state = snapshot.state.as_ref();
+        let count = state.map_or(0, |s| s.count);
+        let complete = state.is_some_and(|s| s.status == Status::Completed);
+        if snapshot.waiting { ui.spinner(); }
+        if let Some(state) = state {
+            ui.label(format!("{:?} · {}{} matches", state.status, if complete { "" } else { "≥" }, count));
+            if !state.error.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, &state.error); }
+        } else if snapshot.waiting { ui.label("Waiting for complete source validation / preparing query…"); }
+        if !snapshot.error.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, &snapshot.error); }
+        if let Some(elapsed) = snapshot.elapsed { ui.label(format!("{:.3} s", elapsed.as_secs_f64())); }
+        let (mut clear, mut cancel, mut target, mut selected, mut output) = (false, false, None, None, None);
+        ui.horizontal_wrapped(|ui| {
+            if snapshot.waiting || state.is_some_and(|s| s.status == Status::Scanning) { cancel = ui.button("Cancel query").clicked(); }
+            clear = ui.button("Clear query").clicked();
+            if ui.add_enabled(self.query_start > 0, egui::Button::new("Previous page")).clicked() { target = Some(self.query_start.saturating_sub(16)); }
+            if ui.add_enabled(self.query_start.saturating_add(16) < count, egui::Button::new("Next page")).clicked() { target = Some(self.query_start + 16); }
+        });
+        if let Some(page) = &self.query_page {
+            ui.label(format!("{}–{} / {}{}", if page.rows.is_empty() { 0 } else { page.start + 1 }, page.start + page.rows.len() as u64, if complete { "" } else { "≥" }, count));
+            egui::ScrollArea::vertical().id_salt("paged_query_values").max_height(200.0).show(ui, |ui| {
+                for row in &page.rows {
+                    if ui.selectable_label(self.query_selected == Some(row.index), format!("{} {}", row.index + 1, row.path)).clicked() { selected = Some(row.index); }
+                    ui.add(egui::Label::new(crate::ui::json_job(&row.preview, self.colors.active())).truncate());
+                }
+            });
+        } else if count > 0 && self.query_page_error.is_none() { ui.label("Loading result page…"); }
+        if let Some(error) = &self.query_page_error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
+        if self.query_page_error.is_some() && ui.button("Retry page").clicked() { self.query_page_error = None; self.query_page_request = None; }
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(complete, egui::Button::new("Copy all")).clicked() { output = Some((false, false)); }
+            if ui.add_enabled(complete, egui::Button::new("Export all")).clicked() { output = Some((true, false)); }
+            if !complete {
+                if ui.add_enabled(count > 0, egui::Button::new("Copy partial")).clicked() { output = Some((false, true)); }
+                if ui.add_enabled(count > 0, egui::Button::new("Export partial")).clicked() { output = Some((true, true)); }
+            }
+        });
+        ui.small("Copy is limited to 8 MiB; use Export for larger results.");
+        if let Some(start) = target { self.query_start = start; self.query_page = None; self.query_page_error = None; self.query_page_request = None; }
+        if let Some(task) = &self.task {
+            if let Some(index) = selected {
+                match task.query_select(index) { Ok(()) => self.query_selected = Some(index), Err(error) => self.notice = error }
+            }
+            if cancel { task.query_clear(false); self.query_page_request = None; }
+            if clear { task.query_clear(true); self.jsonpath.clear(); self.query_snapshot = None; self.query_page = None; self.query_page_error = None; self.query_page_request = None; }
+            if let Some((export, partial)) = output {
+                let path = if export { rfd::FileDialog::new().add_filter("JSON", &["json"]).set_file_name(if partial { "query-partial.json" } else { "query-results.json" }).save_file() } else { None };
+                if (!export || path.is_some()) && let Err(error) = task.query_output(path, partial.then_some(count)) { self.notice = error; }
+            }
+        }
+    }
     fn keyboard(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(Key::F1)) {
             self.help = !self.help;
@@ -303,6 +388,7 @@ impl Viewer {
             ctx.memory_mut(|m| {
                 m.surrender_focus(egui::Id::new("paged_path"));
                 m.surrender_focus(egui::Id::new("paged_search"));
+                m.surrender_focus(egui::Id::new("paged_jsonpath"));
             });
         }
         if self.help {
@@ -478,6 +564,24 @@ impl Viewer {
         }
         if let Some(task) = &self.task {
             let poll = task.poll();
+            self.query_snapshot = Some(task.query.poll());
+            if let Some(page) = poll.query_page
+                && page.generation == task.query.generation() && page.start == self.query_start
+                && self.query_page_request.is_none_or(|(_, _, count)| page.count >= count)
+            { self.query_page = Some(page); self.query_page_error = None; }
+            if let Some((generation, start, error)) = poll.query_page_error
+                && generation == task.query.generation() && start == self.query_start
+            { self.query_page_error = Some(error); }
+            if let Some(snapshot) = &self.query_snapshot && let Some(state) = &snapshot.state {
+                let key = (snapshot.generation, self.query_start, state.count.min(self.query_start.saturating_add(16)));
+                if state.count > self.query_start && self.query_page_request != Some(key) {
+                    match task.query_page(self.query_start) {
+                        Ok(()) => self.query_page_request = Some(key),
+                        Err(error) => self.notice = error,
+                    }
+                }
+            }
+            if let Some((generation, clip)) = poll.query_clipboard && generation == task.query.generation() { ctx.copy_text(clip.text); }
             let previous_cursor = self.search.as_ref().and_then(|s| s.cursor);
             self.search = Some(task.search.poll());
             if let Some(cursor) = self.search.as_ref().and_then(|s| s.cursor)
@@ -559,6 +663,7 @@ impl Viewer {
             self.start_search();
         }
         if self.search_due.is_some()
+            || self.query_snapshot.as_ref().is_some_and(|s| s.waiting)
             || self.search.as_ref().is_some_and(|s| {
                 s.waiting
                     || s.state
@@ -649,6 +754,15 @@ impl Viewer {
                         Ok(n) if n > 0 => self.command(Navigation::Row(n - 1)),
                         _ => self.notice = "Enter a positive integer row number".into(),
                     }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("JSONPath");
+                let response = ui.add(egui::TextEdit::singleline(&mut self.jsonpath)
+                    .id(egui::Id::new("paged_jsonpath")).hint_text("$.items[?@.active]").desired_width(360.0));
+                if (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) || ui.button("Run query").clicked() { self.start_query(); }
+                if ui.button("Clear query").clicked() {
+                    self.jsonpath.clear(); self.start_query();
                 }
             });
             ui.horizontal_wrapped(|ui| {
@@ -840,6 +954,8 @@ impl Viewer {
             .resizable(true)
             .default_width(420.0)
             .show(ctx, |ui| {
+                self.query_results(ui);
+                ui.separator();
                 let mut copy = false;
                 let mut path = false;
                 let mut export = false;
@@ -990,7 +1106,7 @@ impl Viewer {
                     "[ / ]: history; yy / Ctrl+C: copy JSON; yp / Ctrl+P: copy path",
                     ".: focus Path (JSON Pointer, e.g. /items/0)",
                     "F5: reload; F1: help; Esc: cancel pending jump and key sequence",
-                    "Search: / ? or Ctrl+F; n / N with counts. JSONPath is available through the CLI; this paged view has no query panel.",
+                    "Search: / ? or Ctrl+F; n / N with counts. JSONPath: Run query / Enter; results have independent paging, cancel and output.",
                     "During validation, only committed content is browsable; complete output waits for Ready.",
                 ] { ui.label(line); }
             });

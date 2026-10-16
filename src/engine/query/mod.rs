@@ -6,8 +6,30 @@ mod syntax;
 mod predicate;
 pub mod stream;
 
+/// Legacy compiled-query alias; retained for source compatibility. See compatibility.
 pub use plan::CompiledQuery;
 pub use request::QueryRequest;
+/// Explicit legacy contract: full NodeIds collection and D-stage Indexed grammar.
+/// New callers use run/collect, whose capabilities are described by Backend.
+pub mod compatibility {
+    pub use super::plan::CompiledQuery;
+    use crate::document::{Document, NodeIds};
+    pub fn collect(doc: &Document, expression: &str, cancelled: &dyn Fn() -> bool) -> Result<NodeIds, String> {
+        CompiledQuery::compile(doc, expression, cancelled)?.execute(doc, cancelled)
+    }
+    pub fn capabilities(backend: super::Backend) -> super::Capabilities {
+        use super::{Backend, Cancellation, Capabilities, Support};
+        match backend {
+            Backend::Memory => backend.capabilities(),
+            Backend::Indexed => Capabilities { pointer: Support::Supported, selectors: Support::Supported,
+                filters: Support::Unsupported, functions: Support::Unsupported,
+                cancellation: Cancellation::DuringTraversal, incremental_results: false },
+            Backend::Sparse => Capabilities { pointer: Support::Supported, selectors: Support::Unsupported,
+                filters: Support::Unsupported, functions: Support::Unsupported,
+                cancellation: Cancellation::DuringTraversal, incremental_results: false },
+        }
+    }
+}
 use crate::{
     document::{Document, NodeIds},
     engine::sparse::{Node, SparseIndex},
@@ -82,9 +104,21 @@ impl Backend {
 pub struct QueryEngine;
 
 impl QueryEngine {
+    /// Collect the new execution semantics only when a caller explicitly needs NodeIds.
+    /// Results and collection capacity remain subject to the shared resource budget.
+    pub fn collect(doc: std::sync::Arc<Document>, request: &QueryRequest, cancelled: &dyn Fn() -> bool) -> Result<NodeIds, String> {
+        let store = Self::run(stream::Input::Document(doc.clone()), request, 0, cancelled, &mut |_| Ok(()))?;
+        let state = store.state();
+        if state.status != crate::engine::results::Status::Completed { return Err(state.error); }
+        let mut ids = NodeIds::new(doc.budget());
+        let mut cursor = store.cursor(None)?;
+        while let Some(node) = cursor.next_node(cancelled)? { ids.push(doc.resolve(node.reference)? as u32)?; }
+        Ok(ids)
+    }
     pub fn run(input: stream::Input, request: &QueryRequest, generation: u64, cancelled: &dyn Fn() -> bool, notify: &mut dyn FnMut(stream::Event) -> Result<(), String>) -> Result<crate::engine::results::ResultStore, String> {
         stream::run(input, request, generation, cancelled, notify)
     }
+    /// Legacy alias; see compatibility::collect. New callers use run or collect.
     pub fn execute(doc: &Document, request: &QueryRequest, cancelled: &dyn Fn() -> bool) -> Result<NodeIds, String> {
         Self::document(doc, &request.expression, cancelled)
     }
@@ -93,10 +127,12 @@ impl QueryEngine {
         if doc.value().is_some() { Backend::Memory } else { Backend::Indexed }
     }
 
+    /// Legacy alias preserving D-stage grammar and NodeIds behavior.
     pub fn document(doc: &Document, expression: &str, cancelled: &dyn Fn() -> bool) -> Result<NodeIds, String> {
-        CompiledQuery::compile(doc, expression, cancelled)?.execute(doc, cancelled)
+        compatibility::collect(doc, expression, cancelled)
     }
 
+    /// Legacy single-result convenience; uses compatibility grammar and collection.
     pub fn find(doc: &Document, expression: &str, cancelled: &dyn Fn() -> bool) -> Result<usize, String> {
         let ids = Self::document(doc, expression, cancelled)?;
         match ids.as_slice() {

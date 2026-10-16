@@ -1,8 +1,10 @@
 # FerrisJson
 
-当前版本：**0.7.7**。
+当前版本：**0.7.8**。
 
-0.7.7（本次版本提交）收录阶段 E：[流式 JSONPath 与结果分页](docs/search-query-stage-e.md) 已接入默认 GUI、主 CLI 和 `sparse_index --query`。查询逐条写入磁盘结果，GUI 每页 16 条，支持取消及完整／部分结果复制和导出；Indexed／Sparse 新增存在性、标量比较及逻辑过滤。Memory 的过滤／高级语法仍走原库完整收集，文件后端不支持函数或容器比较；旧 NodeIds 兼容接口仍保留 D 的范围，分页树 GUI 查询面板留待 F。按用户明确要求提交，未运行测试、构建或性能测量，不将提交授权写为实测通过。
+0.7.8（本次版本提交）收录阶段 F：[分页树查询与兼容入口收口](docs/search-query-stage-f.md) 已实现。`--sparse`／`--paged-tree [--indexed]` 增加独立 JSONPath 输入、16 条结果分页、点击定位、取消及完整／部分结果复制和导出；源验证完成前等待最新请求。分页树查询复制最多 8 MiB，较大结果用导出；`--sparse-pages` 仍为旧有限页浏览器。新增显式的新语义 collect 与旧 compatibility 入口，没有扩展 E 的文件后端语法范围。按用户明确要求提交，未运行测试、构建或性能测量，不将提交授权写为实测通过。
+
+0.7.7 / `b730729` 收录阶段 E：[流式 JSONPath 与结果分页](docs/search-query-stage-e.md) 已接入默认 GUI、主 CLI 和 `sparse_index --query`。查询逐条写入磁盘结果，GUI 每页 16 条，支持取消及完整／部分结果复制和导出；Indexed／Sparse 新增存在性、标量比较及逻辑过滤。Memory 的过滤／高级语法仍走原库完整收集，文件后端不支持函数或容器比较；旧 NodeIds 兼容接口仍保留 D 的范围，分页树 GUI 查询面板留待 F。按用户明确要求提交，未运行测试、构建或性能测量，不将提交授权写为实测通过。
 
 0.7.6 / `f21db89` 收录阶段 D：[独立查询引擎与后端适配](docs/search-query-stage-d.md) 已实现。GUI／CLI 查询经 QueryEngine 编译和分派，Document 保留兼容包装；Memory／Indexed 原有语义与 Sparse 单 Pointer 范围保持，JSONPath 仍完整收集结果，流式查询和新过滤语法留给 E。按用户要求提交，未运行测试、构建或性能测量，不将提交授权写为实测通过。
 

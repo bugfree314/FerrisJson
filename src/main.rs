@@ -16,6 +16,7 @@ mod palette;
 mod preview_worker;
 mod query_worker;
 mod query_stream_worker;
+mod paged_query_worker;
 mod row_cache;
 mod shutdown;
 mod task_worker;

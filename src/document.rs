@@ -584,7 +584,7 @@ impl Document {
         (matches!(node.kind, Kind::Array) && index < node.child_count as usize)
             .then(|| self.children[node.child_start as usize + index] as usize)
     }
-    /// Compatibility entry; query semantics belong to engine::query.
+    /// Legacy collected API; use engine::query::QueryEngine::run/collect for streaming semantics.
     pub fn find_path(&self, path: &str) -> Result<usize, String> {
         crate::engine::query::QueryEngine::find(self, path, &|| false)
     }
@@ -596,7 +596,7 @@ impl Document {
         expression: &str,
         cancelled: impl Fn() -> bool,
     ) -> Result<NodeIds, String> {
-        crate::engine::query::QueryEngine::document(self, expression, &cancelled)
+        crate::engine::query::compatibility::collect(self, expression, &cancelled)
     }
 
     pub fn row_preview(&self, id: usize) -> String {

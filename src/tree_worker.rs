@@ -1,4 +1,4 @@
-//! One builder, one interactive lane, one search lane, one output lane. Latest read view/frame,
+//! One builder, independent search/query producers, one interactive lane and one output lane.
 //! bounded commands, independent output; never a thread per click.
 use crate::{
     document::{Document, LoadProgress},
@@ -44,6 +44,10 @@ enum Request {
     Output(Location, Option<PathBuf>, bool),
     SearchWake,
     SearchPage(u64, u64),
+    QueryWake,
+    QueryPage(u64, u64),
+    QueryReveal(u64, u64),
+    QueryOutput(u64, crate::engine::results::ResultStore, Option<u64>, Option<PathBuf>),
     SearchExport(
         PathBuf,
         bool,
@@ -55,6 +59,7 @@ enum Job {
     Copy(OutputSelection),
     Export(OutputSelection, PathBuf),
     Path(String, Reservation),
+    Query(crate::engine::query::stream::Input, crate::engine::results::ResultStore, Option<u64>, Option<PathBuf>, u64),
     Search(
         crate::engine::search::Input,
         crate::engine::search::ResultStore,
@@ -74,11 +79,15 @@ struct Inbox {
     notice: String,
     output_busy: bool,
     search_page: Option<SearchPage>,
+    query_page: Option<ResultPage>,
+    query_page_error: Option<(u64, u64, String)>,
+    query_clipboard: Option<(u64, Clipboard)>,
     _queues: Reservation,
 }
 type Shared = Arc<(Mutex<Inbox>, Condvar)>;
 pub struct Task {
     pub search: crate::search_worker::SearchHub,
+    pub query: crate::paged_query_worker::QueryHub,
     shared: Shared,
     pub epoch: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -86,20 +95,24 @@ pub struct Task {
     threads: Vec<JoinHandle<()>>,
     budget: BudgetManager,
 }
-pub struct SearchRow {
+pub struct ResultRow {
     pub index: u64,
     pub path: String,
     pub preview: String,
 }
-pub struct SearchPage {
+pub struct ResultPage {
     pub generation: u64,
     pub start: u64,
     pub count: u64,
-    pub rows: Vec<SearchRow>,
+    pub rows: Vec<ResultRow>,
     _lease: Reservation,
 }
+pub type SearchPage = ResultPage;
 pub struct Poll {
     pub search_page: Option<SearchPage>,
+    pub query_page: Option<ResultPage>,
+    pub query_page_error: Option<(u64, u64, String)>,
+    pub query_clipboard: Option<(u64, Clipboard)>,
     pub frame: Option<(u64, Result<TreeFrame, String>)>,
     pub status: Status,
     pub clipboard: Option<Clipboard>,
@@ -136,6 +149,9 @@ impl Task {
                 notice: String::new(),
                 output_busy: false,
                 search_page: None,
+                query_page: None,
+                query_page_error: None,
+                query_clipboard: None,
                 _queues: queues,
             }),
             Condvar::new(),
@@ -150,6 +166,10 @@ impl Task {
             ctx.clone(),
             Arc::new(move || wake_shared.1.notify_all()),
         )?;
+        let query_shared = shared.clone();
+        let (query, query_thread) = crate::paged_query_worker::QueryHub::new(
+            budget.clone(), stop.clone(), ctx.clone(), Arc::new(move || query_shared.1.notify_all()),
+        );
         let build_shared = shared.clone();
         let build_epoch = epoch.clone();
         let build_stop = stop.clone();
@@ -301,6 +321,7 @@ impl Task {
         let worker_stop = stop.clone();
         let worker_ctx = ctx.clone();
         let worker_search = search.clone();
+        let worker_query = query.clone();
         let interactive = std::thread::spawn(move || {
             let mut navigator: Option<Navigator> = None;
             loop {
@@ -337,6 +358,7 @@ impl Task {
                     )
                 };
                 if failed {
+                    worker_query.cancel(true);
                     return;
                 }
                 let cancelled = || {
@@ -377,6 +399,38 @@ impl Task {
                             );
                             let result = match command {
                                 Request::SearchWake => Ok(()),
+                                Request::QueryWake => Ok(()),
+                                Request::QueryReveal(generation, index) => (|| {
+                                    if *generation != worker_query.generation() { return Ok(()); }
+                                    let store = worker_query.store().ok_or("No query results")?;
+                                    let query_cancel = || cancelled() || *generation != worker_query.generation();
+                                    let location = store.location(*index, &query_cancel)?;
+                                    nav.apply(Navigation::Reveal(location), &query_cancel)
+                                })(),
+                                Request::QueryPage(generation, start) => (|| {
+                                    if *generation != worker_query.generation() { return Ok(()); }
+                                    let store = worker_query.store().ok_or("No query results")?;
+                                    let count = store.state().count;
+                                    let lease = nav.tree.provider.budget().reserve(Resource::Memory, 64 * 1024, "bounded query presentation page")?;
+                                    let mut rows = Vec::with_capacity(16);
+                                    let query_cancel = || cancelled() || *generation != worker_query.generation();
+                                    for index in *start..start.saturating_add(16).min(count) {
+                                        let loc = store.location(index, &query_cancel)?;
+                                        let loc = nav.tree.normalize(&loc, &query_cancel)?;
+                                        rows.push(ResultRow { index, path: nav.tree.path(&loc, 512, false, &query_cancel)?,
+                                            preview: nav.tree.provider.preview(loc.node, 160, &query_cancel)? });
+                                    }
+                                    if !query_cancel() { worker_shared.0.lock().unwrap().query_page = Some(ResultPage {
+                                        generation: *generation, start: *start, count, rows, _lease: lease,
+                                    }); }
+                                    Ok(())
+                                })(),
+                                Request::QueryOutput(generation, store, prefix, path) => (|| {
+                                    if *generation != worker_query.generation() { return Err("Query output capture cancelled".into()); }
+                                    let input = nav.tree.provider.query_input()?;
+                                    worker_shared.0.lock().unwrap().job = Some(Job::Query(input, store.clone(), *prefix, path.clone(), *generation));
+                                    worker_shared.1.notify_all(); Ok(())
+                                })(),
                                 Request::SearchPage(generation, start) => (|| {
                                     if *generation != worker_search.generation() {
                                         return Ok(());
@@ -394,7 +448,7 @@ impl Task {
                                     for index in *start..start.saturating_add(16).min(count) {
                                         let loc = store.location(index, &page_cancel)?;
                                         let loc = nav.tree.normalize(&loc, &page_cancel)?;
-                                        rows.push(SearchRow {
+                                        rows.push(ResultRow {
                                             index,
                                             path: nav.tree.path(&loc, 512, false, &page_cancel)?,
                                             preview: nav.tree.provider.preview(
@@ -513,10 +567,13 @@ impl Task {
                                 inbox.commands.pop_front();
                             }
                             if let Err(e) = result {
+                                if let Request::QueryPage(generation, start) = command
+                                    && *generation == worker_query.generation()
+                                { inbox.query_page_error = Some((*generation, *start, bounded(e.clone()))); }
                                 inbox.notice = bounded(e);
                                 if matches!(
                                     command,
-                                    Request::Output(..) | Request::SearchExport(..)
+                                    Request::Output(..) | Request::SearchExport(..) | Request::QueryOutput(..)
                                 ) {
                                     inbox.output_busy = false;
                                 }
@@ -525,6 +582,12 @@ impl Task {
                         }
                         if worker_search.pending() && nav.tree.provider.complete() {
                             worker_search.dispatch(nav.tree.provider.search_input()?);
+                        }
+                        if worker_query.pending() && nav.tree.provider.complete() {
+                            match nav.tree.provider.query_input() {
+                                Ok(input) => worker_query.dispatch(input),
+                                Err(error) => worker_query.fail_pending(error),
+                            }
                         }
                         if let Some((generation, index, store)) = worker_search.take_selection() {
                             let selection_cancel =
@@ -565,6 +628,12 @@ impl Task {
                             }
                         }
                         Err(e) => {
+                            if let Some((_, Request::QueryPage(generation, start))) = &command
+                                && *generation == worker_query.generation()
+                            { inbox.query_page_error = Some((*generation, *start, bounded(e.clone()))); }
+                            if command.as_ref().is_some_and(|(_, command)| matches!(command, Request::Output(..) | Request::SearchExport(..) | Request::QueryOutput(..))) {
+                                inbox.output_busy = false;
+                            }
                             inbox.notice = bounded(e);
                             if let Some((id, _)) = command
                                 && inbox
@@ -584,6 +653,7 @@ impl Task {
         let output_shared = shared.clone();
         let output_stop = stop.clone();
         let output_ctx = ctx.clone();
+        let output_query = query.clone();
         let output = std::thread::spawn(move || {
             loop {
                 let job = {
@@ -597,10 +667,22 @@ impl Task {
                     inbox.job.take().unwrap()
                 };
                 let cancelled = || output_stop.load(Ordering::Relaxed);
+                let query_generation = match &job { Job::Query(_, _, _, _, generation) => Some(*generation), _ => None };
                 let result = with_io_context(
                     Priority::User,
                     Cancellation::Flag(output_stop.clone()),
                     || match job {
+                        Job::Query(input, store, prefix, path, generation) => {
+                            let provider = input.provider();
+                            if let Some(path) = path {
+                                provider.and_then(|provider| crate::engine::results::output::export(provider, &store, &path, false, prefix, &output_stop))
+                                    .map(|()| (None, None, "Exported query results".into()))
+                            } else {
+                                provider.and_then(|provider| crate::engine::results::output::copy(provider, &store, prefix,
+                                    &|| cancelled() || output_query.generation() != generation))
+                                    .map(|clip| (Some(clip), None, "Copied query results".into()))
+                            }
+                        }
                         Job::Search(input, store, path, paths, prefix) => {
                             crate::engine::search::output::export(
                                 input,
@@ -642,7 +724,9 @@ impl Task {
                     inbox.output_busy = false;
                     match result {
                         Ok((clip, path, notice)) => {
-                            inbox.clipboard = clip;
+                            if let Some(generation) = query_generation {
+                                if generation == output_query.generation() { inbox.query_clipboard = clip.map(|clip| (generation, clip)); }
+                            } else { inbox.clipboard = clip; }
                             inbox.path_copy = path;
                             inbox.notice = bounded(notice);
                         }
@@ -655,16 +739,63 @@ impl Task {
         });
         Ok(Self {
             search,
+            query,
             shared,
             epoch,
             stop,
             progress,
-            threads: vec![builder, interactive, output, search_thread],
+            threads: vec![builder, interactive, output, search_thread, query_thread],
             budget,
         })
     }
     pub fn budget(&self) -> BudgetManager {
         self.budget.clone()
+    }
+    pub fn query_request(&self, expression: String) -> Result<(), String> {
+        let mut b = self.shared.0.lock().unwrap();
+        if matches!(b.status.state, SessionStatus::Failed | SessionStatus::Cancelled) { return Err("Session unavailable".into()); }
+        if b.commands.len() >= 16 { return Err("Navigation queue full; retry query".into()); }
+        self.query.request(crate::engine::query::QueryRequest::new(expression))?;
+        b.query_page = None; b.query_page_error = None; b.query_clipboard = None;
+        b.commands.retain(|(_, c)| !matches!(c, Request::QueryWake | Request::QueryPage(..) | Request::QueryReveal(..)));
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        b.commands.push_back((epoch, Request::QueryWake));
+        drop(b); self.shared.1.notify_all(); Ok(())
+    }
+    pub fn query_clear(&self, clear: bool) {
+        self.query.cancel(clear);
+        let mut b = self.shared.0.lock().unwrap();
+        b.query_page = None; b.query_page_error = None; b.query_clipboard = None;
+        b.commands.retain(|(_, c)| !matches!(c, Request::QueryWake | Request::QueryPage(..) | Request::QueryReveal(..)));
+        drop(b); self.shared.1.notify_all();
+    }
+    pub fn query_page(&self, start: u64) -> Result<(), String> {
+        self.query_command(Request::QueryPage(self.query.generation(), start))
+    }
+    pub fn query_select(&self, index: u64) -> Result<(), String> {
+        self.search.cancel_selection();
+        self.query_command(Request::QueryReveal(self.query.generation(), index))
+    }
+    fn query_command(&self, request: Request) -> Result<(), String> {
+        let mut b = self.shared.0.lock().unwrap();
+        if matches!(request, Request::QueryPage(..)) { b.commands.retain(|(_, c)| !matches!(c, Request::QueryPage(..))); }
+        if matches!(request, Request::QueryReveal(..)) { b.commands.retain(|(_, c)| !matches!(c, Request::QueryReveal(..))); }
+        if b.commands.len() >= 16 { return Err("Navigation queue full; retry query action".into()); }
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        b.commands.push_back((epoch, request)); drop(b); self.shared.1.notify_all(); Ok(())
+    }
+    pub fn query_output(&self, path: Option<PathBuf>, prefix: Option<u64>) -> Result<(), String> {
+        let store = self.query.store().ok_or("No query results")?;
+        let state = store.state();
+        if prefix.is_none() && state.status != crate::engine::results::Status::Completed { return Err("Complete output requires a completed query".into()); }
+        if prefix.is_some_and(|count| count > state.count) { return Err("Requested query prefix is not committed".into()); }
+        let mut b = self.shared.0.lock().unwrap();
+        if b.status.state != SessionStatus::Ready { return Err("Pending: full validation required".into()); }
+        if b.output_busy || b.commands.len() >= 16 { return Err("Output lane is busy".into()); }
+        b.output_busy = true;
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        b.commands.push_back((epoch, Request::QueryOutput(self.query.generation(), store, prefix, path)));
+        drop(b); self.shared.1.notify_all(); Ok(())
     }
     pub fn search_query(
         &self,
@@ -674,7 +805,7 @@ impl Task {
         self.search.request(query, reverse)?;
         let mut b = self.shared.0.lock().unwrap();
         b.commands
-            .retain(|(_, c)| matches!(c, Request::Output(..) | Request::SearchExport(..)));
+            .retain(|(_, c)| matches!(c, Request::Output(..) | Request::SearchExport(..) | Request::QueryOutput(..) | Request::QueryPage(..) | Request::QueryWake));
         let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         b.commands
             .push_back((epoch, Request::Navigation(Navigation::CancelPending)));
@@ -764,7 +895,7 @@ impl Task {
         ) {
             inbox
                 .commands
-                .retain(|(_, c)| matches!(c, Request::Output(..) | Request::SearchExport(..)));
+                .retain(|(_, c)| matches!(c, Request::Output(..) | Request::SearchExport(..) | Request::QueryOutput(..) | Request::QueryPage(..) | Request::QueryWake));
         }
         if matches!(command, Navigation::Anchor(_)) {
             inbox
@@ -812,6 +943,9 @@ impl Task {
         }
         Poll {
             search_page: inbox.search_page.take(),
+            query_page: inbox.query_page.take(),
+            query_page_error: inbox.query_page_error.take(),
+            query_clipboard: inbox.query_clipboard.take(),
             frame: inbox.frame.take(),
             status,
             clipboard: inbox.clipboard.take(),
@@ -822,6 +956,8 @@ impl Task {
     pub fn cancel(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.search.stop();
+        self.query.cancel(true);
+        self.query.stop();
         self.epoch.fetch_add(1, Ordering::Relaxed);
         let mut inbox = self.shared.0.lock().unwrap();
         inbox.status.state = SessionStatus::Cancelled;

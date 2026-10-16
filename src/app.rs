@@ -759,7 +759,7 @@ impl Viewer {
             }
         } else {
             let started = Instant::now();
-            let result = QueryEngine::document(doc, &self.query, &|| false).map(|ids| {
+            let result = QueryEngine::collect(doc.clone(), &QueryRequest::new(self.query.clone()), &|| false).map(|ids| {
                 let preview = doc.results_preview(&ids);
                 (ids, preview)
             });

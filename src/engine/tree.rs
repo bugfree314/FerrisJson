@@ -128,6 +128,9 @@ fn kind_name(n: u64) -> Result<&'static str, String> {
     }
 }
 pub trait Provider: Send {
+    fn query_input(&self) -> Result<super::query::stream::Input, String> {
+        Err("Query unavailable for this provider".into())
+    }
     fn next_child(&mut self, parent: TreeNode, ordinal: u64, _previous: Option<TreeNode>, cancel: &dyn Fn() -> bool) -> Result<TreeNode, String> {
         self.child(parent, ordinal, cancel)
     }
@@ -275,6 +278,9 @@ impl LegacyProvider {
     }
 }
 impl Provider for LegacyProvider {
+    fn query_input(&self) -> Result<super::query::stream::Input, String> {
+        Ok(super::query::stream::Input::Document(self.0.clone()))
+    }
     fn next_child(&mut self, parent: TreeNode, ordinal: u64, previous: Option<TreeNode>, cancel: &dyn Fn() -> bool) -> Result<TreeNode, String> {
         check(cancel)?;
         let parent_id = self.id(parent)?;
@@ -472,6 +478,9 @@ impl SparseProvider {
     }
 }
 impl Provider for SparseProvider {
+    fn query_input(&self) -> Result<super::query::stream::Input, String> {
+        Ok(super::query::stream::Input::Sparse(Box::new(self.index.read_view()?)))
+    }
     fn named_child(&mut self, parent: TreeNode, name: &str, cancel: &dyn Fn() -> bool) -> Result<Option<(u64, TreeNode)>, String> {
         if parent.kind != "object" { return Ok(None); }
         let native = self.native(parent)?;
@@ -599,7 +608,7 @@ pub enum OutputSelection {
 }
 pub struct Clipboard {
     pub text: String,
-    _lease: Reservation,
+    pub(crate) _lease: Reservation,
 }
 impl OutputSelection {
     pub fn write(

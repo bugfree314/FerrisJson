@@ -1,11 +1,9 @@
 //! Independent JSONPath task lane; semantics and requests live in engine::query.
-use crate::{
-    document::{Document, NodeIds},
-    task_worker::Work,
-};
+use crate::document::NodeIds;
+#[cfg(test)]
+use crate::{document::Document, task_worker::Work};
 
 pub use crate::engine::query::QueryRequest;
-use crate::engine::query::QueryEngine;
 
 pub struct QueryOutput {
     pub expression: String,
@@ -15,8 +13,9 @@ pub struct QueryOutput {
 
 pub use crate::query_stream_worker::QueryWorker;
 
-// Collected compatibility lane for existing internal callers; the GUI uses the
-// streamed worker above. Do not use this adapter to claim bounded query results.
+// Preserve the scheduler's existing fixture adapter only in test builds.
+// Production callers submit the streamed worker, never this collected job.
+#[cfg(test)]
 impl Work for QueryRequest {
     type Output = QueryOutput;
 
@@ -25,7 +24,7 @@ impl Work for QueryRequest {
     }
 
     fn execute(self, doc: &Document, cancelled: &dyn Fn() -> bool) -> Result<QueryOutput, String> {
-        let ids = QueryEngine::execute(doc, &self, cancelled)?;
+        let ids = crate::engine::query::compatibility::collect(doc, &self.expression, cancelled)?;
         if cancelled() {
             return Err("Query cancelled".into());
         }

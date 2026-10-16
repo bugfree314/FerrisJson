@@ -391,7 +391,7 @@ impl Viewer {
             if self.status==SessionStatus::Validating{ui.label("Pending full validation. Completed array values are provisional document content; totals and complete export wait for Ready.");}
             if matches!(self.status,SessionStatus::Failed|SessionStatus::Cancelled){ui.colored_label(egui::Color32::LIGHT_RED,"This document has not completed validation. Navigation and export are disabled.");}
             ui.label(&self.notice);
-            ui.label("Experimental finite-page browser. JSONPath, search and full Vim tree navigation are pending S5–S7.");
+            ui.label("Legacy finite-page browser. Use --sparse for the paged tree with independent search and JSONPath queries.");
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut enter = None;

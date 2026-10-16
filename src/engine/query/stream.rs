@@ -8,6 +8,14 @@ use serde_json_path::JsonPath;
 use std::{mem::size_of, sync::Arc, time::Instant};
 
 pub enum Input { Document(Arc<Document>), Sparse(Box<SparseIndex>) }
+impl Input {
+    pub fn provider(self) -> Result<Box<dyn Provider>, String> {
+        match self {
+            Self::Document(doc) => Ok(Box::new(LegacyProvider(doc))),
+            Self::Sparse(index) => Ok(Box::new(SparseProvider::new(*index)?)),
+        }
+    }
+}
 pub enum Event { Started(ResultStore), Batch { start: u64, count: u64 }, Progress { visited: u64 }, Finished(State) }
 enum Program { Pipeline(Plan), Library(JsonPath, Arc<Document>), Pointer(Option<Vec<String>>) }
 
