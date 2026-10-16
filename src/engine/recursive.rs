@@ -1,5 +1,5 @@
-//! Progressive file session with resident tree metadata and on-demand source reads.
-//! Search hits remain disk-backed until the M3 migration.
+//! Progressive file session with resident tree metadata and search results.
+//! Source JSON is read on demand; exports stream to their destination file.
 use super::{
     budget::{BudgetManager, Limits, Reservation, Resource},
     sparse::store::{Record, Store},
@@ -61,8 +61,7 @@ struct HitWriter {
 }
 impl HitWriter {
     fn new(s: &Shared, cancel: &dyn Fn() -> bool, publish: bool) -> Result<Self, String> {
-        let mut store = Store::new(&s.budget, cancel)?;
-        store.enable_live_cache(&s.budget)?;
+        let store = Store::memory(&s.budget, cancel)?;
         Ok(Self {
             hits: Hits {
                 generation: s.search_epoch.load(Ordering::Relaxed),

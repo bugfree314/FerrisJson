@@ -501,6 +501,10 @@ impl Store {
     }
     /// Only for a single live ephemeral owner. No external file views or
     /// persistence are used by this owner; dirty entries may die with it.
+    #[allow(
+        dead_code,
+        reason = "Retained disk adapter API; resident sessions need no write-back cache"
+    )]
     pub(crate) fn enable_live_cache(&mut self, budget: &BudgetManager) -> Result<(), String> {
         self.require_file()?;
         let lease = budget.reserve(
