@@ -590,14 +590,35 @@ impl Session {
     ) -> Result<Self, String> {
         Self::start(Source::open(path)?, cancel, ctx)
     }
+    pub fn open_with_memory_percent(
+        path: &std::path::Path,
+        percent: u8,
+        cancel: Arc<AtomicBool>,
+        ctx: eframe::egui::Context,
+    ) -> Result<Self, String> {
+        Self::start_with_memory_percent(Source::open(path)?, percent, cancel, ctx)
+    }
     pub fn start(
         source: Arc<Source>,
         cancel: Arc<AtomicBool>,
         ctx: eframe::egui::Context,
     ) -> Result<Self, String> {
+        Self::start_with_memory_percent(
+            source,
+            super::resident_memory::DEFAULT_PERCENT,
+            cancel,
+            ctx,
+        )
+    }
+    fn start_with_memory_percent(
+        source: Arc<Source>,
+        percent: u8,
+        cancel: Arc<AtomicBool>,
+        ctx: eframe::egui::Context,
+    ) -> Result<Self, String> {
         let budget = BudgetManager::resident(Limits {
-            // Fixed for this session. Blocks are charged on allocation, not preallocated.
-            memory: super::resident_memory::limit_from_env()?,
+            // The UI can refresh the cap; blocks are charged only on allocation.
+            memory: super::resident_memory::limit(percent)?,
             disk: 64usize * 1024 * 1024 * 1024,
         });
         let snapshot = Snapshot::protected(source.duplicate_file()?, &budget)?;

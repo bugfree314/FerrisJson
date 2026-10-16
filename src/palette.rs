@@ -147,8 +147,20 @@ pub struct ColorSettings {
     pub low_memory_load: bool,
     pub indexed_files: bool,
     pub live_search: bool,
+    #[serde(deserialize_with = "read_memory_percent")]
+    pub memory_percent: u8,
     pub custom_dark: Palette,
     pub custom_light: Palette,
+}
+fn read_memory_percent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    let value = u8::deserialize(d)?;
+    if (1..=100).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "memory_percent must be from 1 to 100",
+        ))
+    }
 }
 impl Default for ColorSettings {
     fn default() -> Self {
@@ -160,6 +172,7 @@ impl Default for ColorSettings {
             low_memory_load: false,
             indexed_files: false,
             live_search: false,
+            memory_percent: crate::engine::resident_memory::DEFAULT_PERCENT,
             custom_dark: Palette::builtin(Preset::Ferris, true),
             custom_light: Palette::builtin(Preset::Ferris, false),
         }

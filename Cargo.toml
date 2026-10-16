@@ -1,6 +1,6 @@
 [package]
 name = "FerrisJson"
-version = "0.8.8"
+version = "0.8.9"
 edition = "2024"
 description = "A local JSON viewer with JSONPath queries and Vim navigation"
 license = "GPL-3.0-or-later"
@@ -21,4 +21,4 @@ serde = { version = "1", features = ["derive"] }
 winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_System_SystemInformation"] }

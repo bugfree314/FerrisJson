@@ -2,6 +2,22 @@ use super::*;
 use crate::engine::recursive::{
     Action as FileAction, Operation as FileOperation, Output as FileOutput, Page, Session,
 };
+pub(super) struct MemorySettings {
+    pub percent: u8,
+    checked: Option<Instant>,
+    total: Option<Result<u64, String>>,
+    message: Option<String>,
+}
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            percent: crate::engine::resident_memory::DEFAULT_PERCENT,
+            checked: None,
+            total: None,
+            message: None,
+        }
+    }
+}
 #[derive(Default)]
 pub(super) struct View {
     pub session: Option<Session>,
@@ -42,6 +58,91 @@ impl View {
     }
 }
 impl Viewer {
+    pub(super) fn refresh_memory_budget(&mut self, ctx: &egui::Context, force: bool) {
+        ctx.request_repaint_after(Duration::from_secs(5));
+        if !force
+            && self
+                .memory_settings
+                .checked
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.memory_settings.checked = Some(Instant::now());
+        let total = crate::engine::resident_memory::total_memory();
+        self.memory_settings.total = Some(total.clone());
+        let result = total
+            .and_then(|total| {
+                crate::engine::resident_memory::limit_for_total(total, self.colors.memory_percent)
+            })
+            .and_then(|limit| {
+                self.progressive
+                    .session
+                    .as_ref()
+                    .map_or(Ok(()), |s| s.budget().set_memory_limit(limit))
+            });
+        self.memory_settings.message = result.err();
+    }
+    pub(super) fn memory_settings_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.set_max_width(360.0);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.label(RichText::new("Memory budget").strong());
+        ui.add(egui::Slider::new(&mut self.memory_settings.percent, 1..=100).suffix("%"));
+        ui.label("Percentage of total system memory (default 25%).");
+        if let Some(Ok(total)) = self.memory_settings.total {
+            ui.label(format!(
+                "System total: {:.2} GiB",
+                total as f64 / 1073741824.0
+            ));
+            if let Ok(limit) =
+                crate::engine::resident_memory::limit_for_total(total, self.memory_settings.percent)
+            {
+                ui.label(format!(
+                    "Selected limit: {:.1} MiB",
+                    limit as f64 / 1048576.0
+                ));
+            }
+        }
+        if let Some(session) = &self.progressive.session {
+            let budget = session.budget();
+            let usage = budget.usage();
+            ui.label(format!(
+                "Current managed use / limit: {:.1} / {:.1} MiB",
+                usage.memory as f64 / 1048576.0,
+                budget.limits().memory as f64 / 1048576.0
+            ));
+        }
+        ui.label("Covers managed structures, not total process RSS.");
+        if let Some(message) = &self.memory_settings.message {
+            ui.colored_label(Color32::YELLOW, message);
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Reset to 25%").clicked() {
+                self.memory_settings.percent = crate::engine::resident_memory::DEFAULT_PERCENT;
+            }
+            if ui.button("Apply").clicked() {
+                let previous = self.colors.memory_percent;
+                self.colors.memory_percent = self.memory_settings.percent;
+                match self.colors.save() {
+                    Ok(()) => {
+                        self.refresh_memory_budget(ctx, true);
+                        self.notice = if self.memory_settings.message.is_some() {
+                            "Memory setting saved; current budget change is pending.".into()
+                        } else {
+                            "Memory setting saved and applied.".into()
+                        };
+                        ui.close();
+                    }
+                    Err(e) => {
+                        self.colors.memory_percent = previous;
+                        self.error = Some(e);
+                    }
+                }
+            }
+        });
+    }
+}
+impl Viewer {
     pub(super) fn clear_progressive(&mut self) {
         self.progressive.page = None;
         if let Some(s) = self.progressive.session.take() {
@@ -71,6 +172,7 @@ impl Viewer {
         self.source = path.display().to_string();
         let cancel = self.loading_cancelled.clone();
         let ctx = ctx.clone();
+        let percent = self.colors.memory_percent;
         let waiting = self.waiting_for_old.clone();
         let (tx, rx) = mpsc::sync_channel(1);
         self.progressive.opening = Some(rx);
@@ -78,7 +180,8 @@ impl Viewer {
             if !wait_for_old_document(old, &waiting, &cancel, &ctx) {
                 return;
             }
-            let result = Session::open(&path, cancel, ctx.clone()).map(|s| (s, path));
+            let result = Session::open_with_memory_percent(&path, percent, cancel, ctx.clone())
+                .map(|s| (s, path));
             let _ = tx.send(result);
             ctx.request_repaint();
         }));
@@ -88,6 +191,7 @@ impl Viewer {
             match rx.try_recv() {
                 Ok(Ok((s, path))) => {
                     self.progressive.session = Some(s);
+                    self.memory_settings.checked = None;
                     self.progressive.opening = None;
                     self.file = Some(path);
                 }
@@ -258,7 +362,7 @@ impl Viewer {
                         usage.peak_memory as f64 / mib
                     ));
                     ui.label("Includes reserved workspaces; this is not process RSS.");
-                    ui.label("Set FERRISJSON_MEMORY_MIB before starting the app (64–32768 MiB).");
+                    ui.label("Configure the system-memory percentage in Settings (right of Help).");
                 }
             });
         ui.separator();

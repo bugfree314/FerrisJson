@@ -66,6 +66,21 @@ impl BudgetManager {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).limits
     }
 
+    /// Existing allocations are retained; reject a cap that they already exceed.
+    pub fn set_memory_limit(&self, limit: usize) -> Result<(), String> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if limit < state.usage.memory {
+            return Err(format!(
+                "Current managed use is {:.1} MiB, above the requested {:.1} MiB. \
+                The current budget is retained; the saved percentage applies after memory is released or on reopening.",
+                state.usage.memory as f64 / 1048576.0,
+                limit as f64 / 1048576.0
+            ));
+        }
+        state.limits.memory = limit;
+        Ok(())
+    }
+
     pub fn usage(&self) -> Usage {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).usage
     }
@@ -111,11 +126,10 @@ impl Reservation {
                 return Err(format!(
                     "Memory budget exceeded: {:.1} MiB requested, {:.1} MiB limit. \
                      Nodes and search matches share this file's budget. \
-                     Restart with a larger {} setting, or use fewer nodes/matches. \
+                     Increase the memory percentage in Settings, or use fewer nodes/matches. \
                      This is managed memory, not process RSS.",
                     next as f64 / (1024.0 * 1024.0),
                     limit as f64 / (1024.0 * 1024.0),
-                    super::resident_memory::SETTING,
                 ));
             }
             return Err(format!(
@@ -154,9 +168,8 @@ impl Reservation {
         if self.resource == Resource::Memory && resident {
             format!(
                 "Could not allocate managed memory. Free system memory and reopen the file, \
-                 or restart with a smaller {} budget. \
+                 or lower the memory percentage in Settings. \
                  The configured limit does not reserve system RAM. Details: {error}",
-                super::resident_memory::SETTING,
             )
         } else {
             format!("Cannot allocate vector: {error}")

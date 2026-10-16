@@ -1,25 +1,47 @@
-//! Per-file resident structure budget. This is not a process RSS or free-RAM limit.
-pub(super) const SETTING: &str = "FERRISJSON_MEMORY_MIB";
-const MIB: u64 = 1024 * 1024;
-const DEFAULT_MIB: u64 = 512;
-const MIN_MIB: u64 = 64;
-const MAX_MIB: u64 = 32_768;
+//! Resident structure budgets derived from total physical RAM, not free RAM or RSS.
+pub const DEFAULT_PERCENT: u8 = 25;
 
-pub(super) fn limit_from_env() -> Result<usize, String> {
-    let invalid = || {
-        format!(
-            "{SETTING} must be a whole number from {MIN_MIB} to {MAX_MIB} MiB. \
-             Set it before starting FerrisJson, or remove it to use {DEFAULT_MIB} MiB."
-        )
-    };
-    let mib = match std::env::var(SETTING) {
-        Ok(value) => value.trim().parse::<u64>().map_err(|_| invalid())?,
-        Err(std::env::VarError::NotPresent) => DEFAULT_MIB,
-        Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
-    };
-    if !(MIN_MIB..=MAX_MIB).contains(&mib) {
-        return Err(invalid());
+pub fn limit_for_total(total: u64, percent: u8) -> Result<usize, String> {
+    if !(1..=100).contains(&percent) {
+        return Err("Memory budget percentage must be from 1 to 100".into());
     }
-    usize::try_from(mib * MIB)
-        .map_err(|_| format!("{SETTING} exceeds this platform's addressable budget"))
+    if total == 0 {
+        return Err("System total memory is unavailable".into());
+    }
+    let bytes = u128::from(total) * u128::from(percent) / 100;
+    let limit = usize::try_from(bytes)
+        .map_err(|_| "Memory budget exceeds this platform's addressable size")?;
+    if limit == 0 {
+        return Err("Memory budget is too small".into());
+    }
+    Ok(limit)
+}
+
+#[cfg(windows)]
+pub fn total_memory() -> Result<u64, String> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // The buffer is initialized and its documented length matches the binding type.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return Err(format!(
+            "Cannot read system total memory: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if status.ullTotalPhys == 0 {
+        return Err("System total memory is unavailable".into());
+    }
+    Ok(status.ullTotalPhys)
+}
+
+#[cfg(not(windows))]
+pub fn total_memory() -> Result<u64, String> {
+    Err("Total-memory budgets for the resident file backend require Windows".into())
+}
+
+pub(super) fn limit(percent: u8) -> Result<usize, String> {
+    limit_for_total(total_memory()?, percent)
 }

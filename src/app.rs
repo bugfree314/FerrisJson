@@ -103,6 +103,7 @@ pub struct Viewer {
     detail: String,
     dark: bool,
     colors: ColorSettings,
+    memory_settings: recursive_ui::MemorySettings,
     colors_open: bool,
     logo: Option<egui::TextureHandle>,
 }
@@ -265,6 +266,7 @@ impl Viewer {
             }
             Err(error) => app.error = Some(error),
         }
+        app.memory_settings.percent = app.colors.memory_percent;
         app.colors.active().apply(&cc.egui_ctx, app.dark);
         if indexed {
             app.colors.indexed_files = true;
@@ -342,6 +344,7 @@ impl Viewer {
             detail: String::new(),
             dark: true,
             colors: ColorSettings::default(),
+            memory_settings: Default::default(),
             colors_open: false,
             logo: None,
         }
@@ -1577,6 +1580,7 @@ impl Viewer {
         self.path_worker
             .get_or_insert_with(|| Worker::new(ctx.clone()));
         self.poll();
+        self.refresh_memory_budget(ctx, false);
         if let Some(text) = self.progressive.clipboard.take() {
             ctx.copy_text(text);
         }
@@ -1612,11 +1616,12 @@ impl Viewer {
                         self.save_colors();
                     }
                     if ui.checkbox(&mut self.colors.indexed_files, "Indexed files")
-                        .on_hover_text("Windows files use the progressive disk index. This setting applies to legacy file paths on other platforms; paste/stdin keep their memory backend.").changed() { self.save_colors(); }
+                        .on_hover_text("Windows files use resident tree and search metadata. This setting applies to legacy file paths on other platforms; paste/stdin keep their memory backend.").changed() { self.save_colors(); }
                 });
                 if ui.button("Help").clicked() {
                     self.help = true;
                 }
+                ui.menu_button("Settings", |ui| self.memory_settings_menu(ui, ctx));
                 if self.pending.is_some() || (self.progressive.opening() && self.progressive.page.is_none()) {
                     ui.spinner();
                     if (self.indexing || self.progressive.opening()) && ui.button("Cancel open").clicked() {
