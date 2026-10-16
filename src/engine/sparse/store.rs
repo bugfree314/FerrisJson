@@ -57,12 +57,8 @@ impl Drop for Store {
     }
 }
 impl Store {
-    /// M1 foundation; the progressive session switches to this constructor in M2.
+    /// Resident metadata for the progressive session; source content stays in its file.
     /// Virtual record offsets preserve IDs and the existing AVL/duplicate-key logic.
-    #[allow(
-        dead_code,
-        reason = "M1 foundation; default session integration follows in M2"
-    )]
     pub(crate) fn memory(
         budget: &BudgetManager,
         cancelled: &dyn Fn() -> bool,

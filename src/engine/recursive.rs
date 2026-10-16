@@ -1,4 +1,5 @@
-//! Progressive disk-backed file session for the original UI.
+//! Progressive file session with resident tree metadata and on-demand source reads.
+//! Search hits remain disk-backed until the M3 migration.
 use super::{
     budget::{BudgetManager, Limits, Reservation, Resource},
     sparse::store::{Record, Store},
@@ -596,12 +597,13 @@ impl Session {
         ctx: eframe::egui::Context,
     ) -> Result<Self, String> {
         let budget = BudgetManager::new(Limits {
-            memory: 64 * 1024 * 1024,
+            // Transitional resident-tree ceiling; policy and user-facing limits follow in M4.
+            // Blocks are charged on allocation, not preallocated up to this limit.
+            memory: 512 * 1024 * 1024,
             disk: 64usize * 1024 * 1024 * 1024,
         });
         let snapshot = Snapshot::protected(source.duplicate_file()?, &budget)?;
-        let mut store = Store::new(&budget, &|| false)?;
-        store.enable_live_cache(&budget)?;
+        let store = Store::memory(&budget, &|| cancel.load(Ordering::Relaxed))?;
         let s = Arc::new(Shared {
             session: super::session::SessionId::fresh(),
             search_epoch: AtomicU64::new(0),
