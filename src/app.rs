@@ -6,7 +6,7 @@ use crate::{
     export::{self, COPY_LIMIT, CopyError, Selection},
     palette::{ColorSettings, Preset, color},
     row_cache::RowCache,
-    ui::{json_preview, kind_color},
+    ui::{json_preview_highlighted as json_preview, kind_color},
     vim::{Action, Command, Vim},
     worker::{Operation, Output, Worker},
 };
@@ -43,6 +43,7 @@ pub struct Viewer {
     search_worker: Option<Worker>,
     path_worker: Option<Worker>,
     search_due: Option<Instant>,
+    search_highlight: Option<crate::ui::SearchHighlight>,
     pending_expression: String,
     row_labels: RowCache,
     pending_export: Option<Receiver<Result<PathBuf, String>>>,
@@ -144,6 +145,7 @@ impl Viewer {
             search_worker: None,
             path_worker: None,
             search_due: None,
+            search_highlight: None,
             pending_expression: String::new(),
             row_labels: RowCache::default(),
             pending_export: None,
@@ -643,6 +645,7 @@ impl Viewer {
         self.scroll_to = true;
     }
     fn cancel_operations(&mut self) {
+        self.search_highlight = None;
         self.search_due = None;
         self.requested_rows.clear();
         if let Some(worker) = &mut self.preview_worker {
@@ -656,6 +659,7 @@ impl Viewer {
         }
     }
     fn schedule_search(&mut self, ctx: &egui::Context) {
+        self.search_highlight = None;
         if let Some(worker) = &mut self.search_worker {
             worker.cancel();
         }
@@ -670,6 +674,7 @@ impl Viewer {
         }
     }
     fn search(&mut self) {
+        self.search_highlight = crate::ui::SearchHighlight::new(&self.term, self.case, self.regex, self.scope);
         self.search_due = None;
         self.matches = NodeIds::default();
         self.search_error = None;
@@ -708,7 +713,10 @@ impl Viewer {
         let started = Instant::now();
         match result {
             Ok(ids) => self.matches = ids,
-            Err(error) => self.search_error = Some(error),
+            Err(error) => {
+                self.search_highlight = None;
+                self.search_error = Some(error);
+            }
         }
         if !self.matches.is_empty() {
             self.match_index = if self.search_reverse {
@@ -1146,6 +1154,7 @@ impl Viewer {
             self.colors.active(),
             "value_preview",
             self.colors.wrap_values,
+            self.search_highlight.as_ref(),
         );
     }
     fn results_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1189,6 +1198,7 @@ impl Viewer {
                 self.colors.active(),
                 "path_results",
                 self.colors.wrap_results,
+                self.search_highlight.as_ref(),
             );
         }
         if copy || export {
@@ -1631,12 +1641,13 @@ impl Viewer {
                             } else {
                                 ui.add_space(26.0);
                             }
-                            let mut key = RichText::new(row_key.as_str())
-                                .monospace()
-                                .color(kind_color(node.kind(), self.colors.active()));
-                            if is_match {
-                                key = key.background_color(color(palette.search_match));
-                            }
+                            let foreground = kind_color(node.kind(), palette);
+                            let highlight = self.search_highlight.as_ref().filter(|_| is_match);
+                            let key: egui::WidgetText = if let Some(highlight) = highlight {
+                                highlight.text_job(row_key, foreground, palette, true).into()
+                            } else {
+                                RichText::new(row_key.as_str()).monospace().color(foreground).into()
+                            };
                             let response =
                                 ui.add(egui::Label::new(key).sense(egui::Sense::click()));
                             if response.clicked() {
@@ -1648,9 +1659,7 @@ impl Viewer {
                             ui.label(":");
                             let response = ui.add(
                                 egui::Label::new(
-                                    RichText::new(row_preview.as_str())
-                                        .monospace()
-                                        .color(kind_color(node.kind(), self.colors.active())),
+                                    crate::ui::json_job_highlighted(row_preview, palette, highlight),
                                 )
                                 .sense(egui::Sense::click()),
                             );

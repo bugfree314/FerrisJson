@@ -1,10 +1,90 @@
 use crate::palette::{ColorSettings, Palette, Preset};
 use eframe::egui::{self, Color32, RichText};
 
+#[derive(Clone)]
+pub struct SearchHighlight {
+    signature: (String, bool, bool, crate::document::SearchScope),
+    matcher: regex::Regex,
+}
+impl SearchHighlight {
+    pub fn new(term: &str, case: bool, regex: bool, scope: crate::document::SearchScope) -> Option<Self> {
+        if term.is_empty() || term.len() > 64 * 1024 {
+            return None;
+        }
+        let pattern = if regex { term.to_owned() } else { regex::escape(term) };
+        let matcher = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(!case)
+            .size_limit(4 * 1024 * 1024)
+            .dfa_size_limit(2 * 1024 * 1024)
+            .build().ok()?;
+        Some(Self { signature: (term.to_owned(), case, regex, scope), matcher })
+    }
+    pub fn same_query(&self, other: &Self) -> bool {
+        self.signature == other.signature
+    }
+    fn includes(&self, key: bool) -> bool {
+        use crate::document::SearchScope;
+        match self.signature.3 {
+            SearchScope::All => true,
+            SearchScope::Keys => key,
+            SearchScope::Values => !key,
+        }
+    }
+    pub fn text_job(&self, text: &str, foreground: Color32, palette: Palette, key: bool) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        let format = egui::TextFormat {
+            font_id: egui::FontId::monospace(13.0), color: foreground, ..Default::default()
+        };
+        self.append(&mut job, text, format, palette, key, false);
+        job
+    }
+    fn append(&self, job: &mut egui::text::LayoutJob, text: &str, format: egui::TextFormat, palette: Palette, key: bool, quoted: bool) {
+        if !self.includes(key) {
+            job.append(text, 0.0, format);
+            return;
+        }
+        // Search decoded JSON strings, then map matches back to their displayed escapes.
+        let decoded = if quoted { serde_json::from_str::<String>(text).ok() } else { None };
+        let search = decoded.as_deref().unwrap_or(text);
+        let mut boundaries = Vec::new();
+        if let Some(decoded) = &decoded {
+            let mut raw = 1;
+            for (offset, ch) in decoded.char_indices() {
+                let start = raw;
+                if text.as_bytes()[raw] == b'\\' {
+                    raw += if text.as_bytes().get(raw + 1) == Some(&b'u') {
+                        if ch.len_utf16() == 2 { 12 } else { 6 }
+                    } else { 2 };
+                } else {
+                    raw += ch.len_utf8();
+                }
+                boundaries.push((offset, offset + ch.len_utf8(), start, raw));
+            }
+        }
+        let mut end = 0;
+        for found in self.matcher.find_iter(search).filter(|m| !m.is_empty()) {
+            let (start, finish) = if decoded.is_some() {
+                let start = boundaries.partition_point(|b| b.1 <= found.start());
+                let finish = boundaries.partition_point(|b| b.0 < found.end());
+                (boundaries[start].2, boundaries[finish - 1].3)
+            } else { (found.start(), found.end()) };
+            job.append(&text[end..start], 0.0, format.clone());
+            let mut highlighted = format.clone();
+            highlighted.background = crate::palette::color(palette.search_match);
+            job.append(&text[start..finish], 0.0, highlighted);
+            end = finish;
+        }
+        job.append(&text[end..], 0.0, format);
+    }
+}
+
 pub fn kind_color(kind: &str, palette: Palette) -> Color32 {
     palette.kind(kind)
 }
 pub fn json_job(text: &str, palette: Palette) -> egui::text::LayoutJob {
+    json_job_highlighted(text, palette, None)
+}
+pub fn json_job_highlighted(text: &str, palette: Palette, highlight: Option<&SearchHighlight>) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -56,15 +136,18 @@ pub fn json_job(text: &str, palette: Palette) -> egui::text::LayoutJob {
                 "punctuation"
             }
         };
-        job.append(
-            &text[start..i],
-            0.0,
-            egui::TextFormat {
+        let format = egui::TextFormat {
                 font_id: egui::FontId::monospace(13.0),
                 color: kind_color(kind, palette),
                 ..Default::default()
-            },
-        );
+            };
+        let quoted = bytes[start] == b'"';
+        let key = quoted && text[i..].trim_start().starts_with(':');
+        if let Some(highlight) = highlight.filter(|_| quoted || matches!(kind, "number" | "boolean" | "null")) {
+            highlight.append(&mut job, &text[start..i], format, palette, key, quoted);
+        } else {
+            job.append(&text[start..i], 0.0, format);
+        }
     }
     job
 }
@@ -84,7 +167,7 @@ fn preview_job(text: &str, palette: Palette, wrap: bool, width: f32) -> egui::te
     job.wrap.break_anywhere = wrap;
     job
 }
-pub fn json_preview(ui: &mut egui::Ui, mut text: &str, palette: Palette, id: &str, wrap: bool) {
+pub fn json_preview_highlighted(ui: &mut egui::Ui, mut text: &str, palette: Palette, id: &str, wrap: bool, highlight: Option<&SearchHighlight>) {
     let area = if wrap {
         egui::ScrollArea::vertical()
     } else {
@@ -92,7 +175,13 @@ pub fn json_preview(ui: &mut egui::Ui, mut text: &str, palette: Palette, id: &st
     };
     area.id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
         let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
-            let job = preview_job(buffer.as_str(), palette, wrap, wrap_width);
+            let mut job = if highlight.is_some() {
+                json_job_highlighted(buffer.as_str(), palette, highlight)
+            } else {
+                preview_job(buffer.as_str(), palette, wrap, wrap_width)
+            };
+            job.wrap.max_width = if wrap { wrap_width.max(1.0) } else { f32::INFINITY };
+            job.wrap.break_anywhere = wrap;
             ui.fonts_mut(|fonts| fonts.layout_job(job))
         };
         ui.add(

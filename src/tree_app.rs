@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 struct LayoutCache {
+    highlight: Option<crate::ui::SearchHighlight>,
     key: Option<(usize, Palette, u32, bool, u32)>,
     galley: Option<Arc<egui::Galley>>,
     _lease: Option<Reservation>,
@@ -25,11 +26,23 @@ struct LayoutCache {
 impl LayoutCache {
     fn new() -> Self {
         Self {
+            highlight: None,
             key: None,
             galley: None,
             _lease: None,
             builds: 0,
             content: None,
+        }
+    }
+    fn set_highlight(&mut self, highlight: Option<&crate::ui::SearchHighlight>) {
+        let same = match (&self.highlight, highlight) {
+            (None, None) => true,
+            (Some(old), Some(new)) => old.same_query(new),
+            _ => false,
+        };
+        if !same {
+            self.highlight = highlight.cloned();
+            self.key = None;
         }
     }
     fn show(
@@ -64,7 +77,7 @@ impl LayoutCache {
                     while !text.is_char_boundary(n) {
                         n -= 1;
                     }
-                    let mut job = crate::ui::json_job(&text[..n], palette);
+                    let mut job = crate::ui::json_job_highlighted(&text[..n], palette, self.highlight.as_ref());
                     job.wrap.max_width = if wrap { width } else { f32::INFINITY };
                     job.wrap.break_anywhere = wrap;
                     self.galley = Some(ui.fonts_mut(|fonts| fonts.layout_job(job)));
@@ -130,6 +143,7 @@ pub struct Viewer {
     search_reverse: bool,
     focus_search: bool,
     search_due: Option<Instant>,
+    search_highlight: Option<crate::ui::SearchHighlight>,
     search: Option<crate::search_worker::Snapshot>,
     search_page: Option<crate::tree_worker::SearchPage>,
     search_start: u64,
@@ -184,6 +198,7 @@ impl Viewer {
             search_reverse: false,
             focus_search: false,
             search_due: None,
+            search_highlight: None,
             search: None,
             search_page: None,
             search_start: 0,
@@ -198,6 +213,7 @@ impl Viewer {
         self.search = None;
         self.search_page = None;
         self.search_due = None;
+        self.search_highlight = None;
         self.search_start = 0;
         self.page_request = None;
         self.status = SessionStatus::Preparing;
@@ -252,6 +268,9 @@ impl Viewer {
         }
     }
     fn start_search(&mut self) {
+        self.search_highlight = crate::ui::SearchHighlight::new(
+            &self.search_term, self.search_case, self.search_regex, self.search_scope,
+        );
         self.search_due = None;
         self.search_page = None;
         self.search_start = 0;
@@ -268,6 +287,7 @@ impl Viewer {
                 scope: self.search_scope,
             };
             if let Err(e) = task.search_query(q, self.search_reverse) {
+                self.search_highlight = None;
                 self.notice = e;
             }
         }
@@ -671,6 +691,7 @@ impl Viewer {
                     changed = true;
                 }
                 if changed {
+                    self.search_highlight = None;
                     if let Some(task) = &self.task {
                         task.search_clear(false);
                     }
@@ -777,14 +798,23 @@ impl Viewer {
                                         .selectable_label(
                                             self.search.as_ref().and_then(|s| s.cursor)
                                                 == Some(row.index),
-                                            format!("{} {}", row.index + 1, row.path),
+                                            if let Some(highlight) = &self.search_highlight {
+                                                highlight.text_job(
+                                                    &format!("{} {}", row.index + 1, row.path),
+                                                    ui.visuals().text_color(), self.colors.active(), true,
+                                                ).into()
+                                            } else {
+                                                egui::WidgetText::from(format!("{} {}", row.index + 1, row.path))
+                                            },
                                         )
                                         .clicked()
                                         && let Some(task) = &self.task
                                     {
                                         task.search_select(row.index);
                                     }
-                                    ui.add(egui::Label::new(&row.preview).truncate());
+                                    ui.add(egui::Label::new(crate::ui::json_job_highlighted(
+                                        &row.preview, self.colors.active(), self.search_highlight.as_ref(),
+                                    )).truncate());
                                 }
                             });
                     }
@@ -833,6 +863,7 @@ impl Viewer {
                             .clicked();
                         export = ui.add_enabled(ready, egui::Button::new("Export")).clicked();
                     });
+                    self.layout.set_highlight(self.search_highlight.as_ref());
                     self.layout.show(
                         ui,
                         frame,
@@ -881,9 +912,25 @@ impl Viewer {
                         } else {
                             ui.add_space(18.0);
                         }
-                        let text = RichText::new(format!("{}  {}", row.label, row.preview))
-                            .monospace()
-                            .color(self.colors.active().kind(row.location.node.kind));
+                        let palette = self.colors.active();
+                        let foreground = palette.kind(row.location.node.kind);
+                        let mut text = if let Some(highlight) = &self.search_highlight {
+                            highlight.text_job(&row.label, foreground, palette, true)
+                        } else {
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(&row.label, 0.0, egui::TextFormat {
+                                font_id: egui::FontId::monospace(13.0), color: foreground, ..Default::default()
+                            });
+                            job
+                        };
+                        text.append("  ", 0.0, egui::TextFormat::default());
+                        let preview = crate::ui::json_job_highlighted(&row.preview, palette, self.search_highlight.as_ref());
+                        let offset = text.text.len();
+                        text.text.push_str(&preview.text);
+                        text.sections.extend(preview.sections.into_iter().map(|mut section| {
+                            section.byte_range = section.byte_range.start + offset..section.byte_range.end + offset;
+                            section
+                        }));
                         if ui
                             .add(
                                 egui::Button::selectable(
