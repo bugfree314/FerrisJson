@@ -13,3 +13,6 @@ pub use crate::document::Document as Session;
 pub mod sparse;
 
 pub mod search;
+
+/// Ordered result storage shared by search and JSONPath.
+pub mod results;

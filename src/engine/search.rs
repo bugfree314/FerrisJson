@@ -5,8 +5,7 @@ use crate::{
 };
 use std::sync::Arc;
 pub mod output;
-mod results;
-pub use results::{ResultStore, ResultWriter, State, Status};
+pub use super::results::{ResultStore, ResultWriter, State, Status};
 #[derive(Clone, Debug)]
 pub struct Query {
     pub term: String,

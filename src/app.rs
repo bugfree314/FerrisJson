@@ -7,7 +7,7 @@ use crate::{
     palette::{ColorSettings, Preset, color},
     query_worker::{QueryRequest, QueryWorker},
     row_cache::RowCache,
-    search_worker::{SearchRequest, SearchWorker},
+    legacy_search::{SearchRequest, SearchResults, SearchWorker},
     ui::{json_preview_highlighted as json_preview, kind_color},
     vim::{Action, Command, Vim},
 };
@@ -68,8 +68,8 @@ pub struct Viewer {
     preview_resource: Option<Reservation>,
     selected: usize,
     rows: NodeIds,
-    matches: NodeIds,
-    match_index: usize,
+    matches: SearchResults,
+    match_index: Option<usize>,
     term: String,
     case: bool,
     regex: bool,
@@ -171,8 +171,8 @@ impl Viewer {
             preview_resource: None,
             selected: 0,
             rows: NodeIds::default(),
-            matches: NodeIds::default(),
-            match_index: 0,
+            matches: SearchResults::default(),
+            match_index: None,
             term: String::new(),
             case: false,
             regex: false,
@@ -325,7 +325,7 @@ impl Viewer {
         self.expanded = Vec::new();
         self.expanded_resource = None;
         self.preview_resource = None;
-        self.matches = NodeIds::default();
+        self.matches = SearchResults::default();
         self.path_results = None;
         self.row_labels.clear();
         self.detail = String::new();
@@ -333,7 +333,7 @@ impl Viewer {
         self.history = Vec::new();
         self.history_index = 0;
         self.selected = 0;
-        self.match_index = 0;
+        self.match_index = None;
         self.source.clear();
         self.file = None;
         self.term.clear();
@@ -398,7 +398,7 @@ impl Viewer {
                         self.file = file;
                         self.selected = 0;
                         self.term.clear();
-                        self.matches = NodeIds::default();
+                        self.matches = SearchResults::default();
                         self.search_error = None;
                         self.search_duration = None;
                         self.path_duration = None;
@@ -668,7 +668,7 @@ impl Viewer {
         if let Some(worker) = &mut self.search_worker {
             worker.cancel();
         }
-        self.matches = NodeIds::default();
+        self.matches = SearchResults::default();
         self.search_error = None;
         self.search_duration = None;
         if self.term.is_empty() || !self.colors.live_search {
@@ -681,9 +681,9 @@ impl Viewer {
     fn search(&mut self) {
         self.search_highlight = crate::ui::SearchHighlight::new(&self.term, self.case, self.regex, self.scope);
         self.search_due = None;
-        self.matches = NodeIds::default();
+        self.matches = SearchResults::default();
         self.search_error = None;
-        self.match_index = 0;
+        self.match_index = None;
         self.search_duration = None;
         if let Some(worker) = &mut self.search_worker {
             worker.cancel();
@@ -703,6 +703,8 @@ impl Viewer {
                     regex: self.regex,
                     scope: self.scope,
                 },
+                self.search_origin,
+                self.search_reverse,
             );
             if let Err(error) = result {
                 self.search_highlight = None;
@@ -711,34 +713,27 @@ impl Viewer {
         } else {
             // Headless callers can use the same completion path without an egui context.
             let started = Instant::now();
-            let result = doc.search(&self.term, self.case, self.regex, self.scope);
+            let result = crate::legacy_search::run(doc.clone(), SearchRequest {
+                term: self.term.clone(), case: self.case, regex: self.regex, scope: self.scope,
+            });
             self.finish_search(result, started.elapsed());
         }
     }
-    fn finish_search(&mut self, result: Result<NodeIds, String>, elapsed: Duration) {
-        let started = Instant::now();
+    fn finish_search(&mut self, result: Result<SearchResults, String>, elapsed: Duration) {
         match result {
-            Ok(ids) => self.matches = ids,
-            Err(error) => {
-                self.search_highlight = None;
-                self.search_error = Some(error);
+            Ok(results) => {
+                self.matches = results;
+                if let Some(store) = &self.matches.store {
+                    match crate::legacy_search::initial(store, self.search_origin, self.search_reverse) {
+                        Ok(Some((index, id))) => { self.match_index = Some(index as usize); self.reveal(id); }
+                        Ok(None) => {}
+                        Err(error) => self.search_error = Some(error),
+                    }
+                }
             }
+            Err(error) => { self.search_highlight = None; self.search_error = Some(error); }
         }
-        if !self.matches.is_empty() {
-            self.match_index = if self.search_reverse {
-                self.matches
-                    .iter()
-                    .rposition(|&id| (id as usize) < self.search_origin)
-                    .unwrap_or(self.matches.len() - 1)
-            } else {
-                self.matches
-                    .iter()
-                    .position(|&id| id as usize > self.search_origin)
-                    .unwrap_or(0)
-            };
-            self.reveal(self.matches[self.match_index] as usize);
-        }
-        self.search_duration = Some(elapsed + started.elapsed());
+        self.search_duration = Some(elapsed);
     }
     fn go_to_path(&mut self) {
         self.path_duration = None;
@@ -797,8 +792,14 @@ impl Viewer {
         if self.search_due.is_some_and(|due| Instant::now() >= due) {
             self.search();
         }
-        if let Some(completed) = self.search_worker.as_mut().and_then(SearchWorker::poll) {
-            self.finish_search(completed.result, completed.elapsed);
+        if let Some(update) = self.search_worker.as_mut().and_then(SearchWorker::poll) {
+            self.matches = update.results;
+            if let Some((index, id)) = update.selection {
+                self.match_index = Some(index as usize);
+                self.reveal(id);
+            }
+            if let Some(elapsed) = update.elapsed { self.search_duration = Some(elapsed); }
+            self.search_error = update.error;
         }
         if let Some(completed) = self.path_worker.as_mut().and_then(QueryWorker::poll) {
             let result = completed.result.map(|output| {
@@ -856,16 +857,24 @@ impl Viewer {
         self.match_step(backwards, 1);
     }
     fn match_step(&mut self, backwards: bool, count: usize) {
-        if self.matches.is_empty() {
+        if let Some(worker) = &mut self.search_worker {
+            worker.next(backwards, count);
             return;
         }
+        // Existing headless callers read synchronously; real GUI reads use the worker above.
+        if self.matches.is_empty() { return; }
         let count = count % self.matches.len();
-        self.match_index = if backwards {
-            (self.match_index + self.matches.len() - count) % self.matches.len()
-        } else {
-            (self.match_index + count) % self.matches.len()
-        };
-        self.reveal(self.matches[self.match_index] as usize);
+        let current = self.match_index.unwrap_or(0);
+        let index = if backwards {
+            (current + self.matches.len() - count) % self.matches.len()
+        } else { (current + count) % self.matches.len() };
+        self.match_index = Some(index);
+        if let Some(store) = &self.matches.store {
+            match store.node(index as u64, &|| false) {
+                Ok(node) => self.reveal(node.reference.address as usize),
+                Err(error) => self.search_error = Some(error),
+            }
+        }
     }
     fn copy(&mut self, ctx: &egui::Context, path: bool) {
         if path {
@@ -893,6 +902,40 @@ impl Viewer {
         if let Some(doc) = &self.doc {
             self.export_selection(Arc::clone(doc), Selection::Node(self.selected));
         }
+    }
+    fn export_matches(&mut self, paths: bool, partial: bool) {
+        if self.pending_export.is_some() {
+            self.notice = "An export is already in progress".into();
+            return;
+        }
+        let (Some(doc), Some(store)) = (&self.doc, &self.matches.store) else { return; };
+        let doc = doc.clone();
+        let store = store.clone();
+        let prefix = partial.then(|| store.state().count);
+        if !partial && !self.matches.completed() {
+            self.search_error = Some("Complete export requires completed search results".into());
+            return;
+        }
+        let name = match (partial, paths) {
+            (false, false) => "search-values.json",
+            (false, true) => "search-paths.json",
+            (true, false) => "search-partial-values.json",
+            (true, true) => "search-partial-paths.json",
+        };
+        let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).set_file_name(name).save_file() else { return; };
+        self.export_cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = self.export_cancelled.clone();
+        let (tx, rx) = mpsc::channel();
+        self.pending_export = Some(rx);
+        self.notice = if partial { "Exporting partial search results..." } else { "Exporting complete search results..." }.into();
+        self.export_thread = Some(std::thread::spawn(move || {
+            let result = with_io_context(Priority::User, Cancellation::Flag(cancelled.clone()), || {
+                crate::engine::search::output::export(
+                    crate::engine::search::Input::Legacy(doc), &store, &path, paths, prefix, &cancelled,
+                )
+            }).map(|()| path);
+            let _ = tx.send(result);
+        }));
     }
     fn export_selection(&mut self, doc: Arc<Document>, selection: Selection) {
         if self.pending_export.is_some() {
@@ -1366,15 +1409,28 @@ impl Viewer {
                 if changed {
                     self.schedule_search(ctx);
                 }
+            });
+            ui.horizontal_wrapped(|ui| {
                 if self.search_due.is_some() || self.search_worker.as_ref().is_some_and(|w| w.busy)
                 {
                     ui.spinner();
                 }
-                ui.label(if self.matches.is_empty() {
-                    "0 / 0".into()
-                } else {
-                    format!("{} / {}", self.match_index + 1, self.matches.len())
-                });
+                let total = self.matches.len();
+                let position = self.match_index.map_or("—".into(), |i| (i + 1).to_string());
+                ui.label(if self.matches.completed() {
+                    format!("{position} / {total}")
+                } else if self.matches.store.is_some() {
+                    format!("{position} / at least {total}")
+                } else { "0 / 0".into() });
+                if let Some(store) = &self.matches.store {
+                    use crate::engine::results::Status;
+                    ui.label(match store.state().status {
+                        Status::Scanning => "Scanning",
+                        Status::Completed => "Complete",
+                        Status::Cancelled => "Cancelled (partial)",
+                        Status::Failed => "Failed (partial)",
+                    });
+                }
                 if ui.button("<").clicked() {
                     self.next_match(true);
                 }
@@ -1385,6 +1441,25 @@ impl Viewer {
                     self.term.clear();
                     self.search();
                 }
+                if ui.button("Cancel search").clicked()
+                    && let Some(worker) = &mut self.search_worker
+                {
+                    worker.cancel_scan();
+                }
+                ui.menu_button("Export matches", |ui| {
+                    if ui.add_enabled(self.matches.completed(), egui::Button::new("All values")).clicked() {
+                        ui.close(); self.export_matches(false, false);
+                    }
+                    if ui.add_enabled(self.matches.completed(), egui::Button::new("All paths")).clicked() {
+                        ui.close(); self.export_matches(true, false);
+                    }
+                    if ui.add_enabled(!self.matches.is_empty(), egui::Button::new("Partial values (committed prefix)")).clicked() {
+                        ui.close(); self.export_matches(false, true);
+                    }
+                    if ui.add_enabled(!self.matches.is_empty(), egui::Button::new("Partial paths (committed prefix)")).clicked() {
+                        ui.close(); self.export_matches(true, true);
+                    }
+                });
             });
             if let Some(error) = &self.search_error {
                 ui.colored_label(Color32::LIGHT_RED, error);
@@ -1590,6 +1665,9 @@ impl Viewer {
             let mut toggle = None;
             area.show_rows(ui, row_height, self.rows.len(), |ui, range| {
                 self.viewport_first = range.start;
+                if let Some(worker) = &mut self.search_worker {
+                    worker.visible(&self.rows[range.clone()]);
+                }
                 for row in range {
                     let id = self.rows[row] as usize;
                     let doc = self.doc.as_ref().unwrap();
@@ -1603,7 +1681,7 @@ impl Viewer {
                         Cow::Owned((doc.key(id).chars().take(160).collect(), "Loading...".into()))
                     };
                     let (row_key, row_preview) = labels.as_ref();
-                    let is_match = self.matches.binary_search(&(id as u32)).is_ok();
+                    let is_match = self.matches.contains(id as u32);
                     let palette = self.colors.active();
                     let fill = if id == self.selected {
                         color(palette.selection)
@@ -1873,7 +1951,7 @@ mod tests {
         assert!(app.doc.is_none());
         assert_eq!(app.rows.capacity(), 0);
         assert_eq!(app.expanded.capacity(), 0);
-        assert_eq!(app.matches.capacity(), 0);
+        assert!(app.matches.store.is_none());
         assert!(app.path_results.is_none());
         assert!(!app.search_worker.as_ref().unwrap().busy);
         assert!(app.waiting_for_old.load(Ordering::Relaxed));
@@ -2342,7 +2420,7 @@ mod tests {
         app.start_search(true);
         app.search();
         let first = app.selected;
-        assert_eq!(first, *app.matches.last().unwrap() as usize);
+        assert_eq!(first, app.matches.store.as_ref().unwrap().node((app.matches.len() - 1) as u64, &|| false).unwrap().reference.address as usize);
         app.execute_vim(
             Command {
                 action: Action::Match(false),
@@ -2351,7 +2429,7 @@ mod tests {
             },
             &ctx,
         );
-        assert_eq!(app.selected, app.matches[0] as usize);
+        assert_eq!(app.selected, app.matches.store.as_ref().unwrap().node(0, &|| false).unwrap().reference.address as usize);
         app.execute_vim(
             Command {
                 action: Action::Match(true),

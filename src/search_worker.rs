@@ -4,10 +4,6 @@ use crate::engine::{
     file_source::{Cancellation, Priority, with_io_context},
     search::{Event, Input, Query, ResultStore, State, Status},
 };
-use crate::{
-    document::{Document, NodeIds},
-    task_worker::{TaskWorker, Work},
-};
 use eframe::egui;
 
 use std::{
@@ -18,22 +14,6 @@ use std::{
     },
     thread::JoinHandle,
 };
-/// The default viewer keeps its collected result adapter until the result-store migration.
-pub type SearchRequest = Query;
-pub type SearchWorker = TaskWorker<SearchRequest>;
-
-impl Work for SearchRequest {
-    type Output = NodeIds;
-
-    fn input_bytes(&self) -> usize {
-        self.term.capacity()
-    }
-
-    fn execute(self, doc: &Document, cancelled: &dyn Fn() -> bool) -> Result<NodeIds, String> {
-        doc.search_cancellable(&self.term, self.case, self.regex, self.scope, cancelled)
-    }
-}
-
 #[derive(Clone)]
 pub struct Snapshot {
     pub generation: u64,
@@ -132,6 +112,9 @@ impl SearchHub {
                                 return Err("Search event cancelled".into());
                             }
                             let mut b = worker.0.inbox.lock().unwrap();
+                            if cancel() {
+                                return Err("Search event cancelled".into());
+                            }
                             if matches!(event, Event::Progress { .. }) {
                                 b.events.retain(|e| !matches!(e, Event::Progress { .. }));
                             }
@@ -163,9 +146,11 @@ impl SearchHub {
                     && !cancel()
                 {
                     let mut b = worker.0.inbox.lock().unwrap();
-                    b.error = short(e);
-                    if let Some(s) = &b.store {
-                        s.fail(b.error.clone());
+                    if !cancel() {
+                        b.error = short(e);
+                        if let Some(s) = &b.store {
+                            s.fail(b.error.clone());
+                        }
                     }
                     drop(b);
                     (worker.0.wake)();

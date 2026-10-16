@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 pub trait Work: Send + 'static {
     type Output: Send + 'static;
     fn input_bytes(&self) -> usize;
+    fn priority(&self) -> Priority { Priority::User }
     fn execute(self, doc: &Document, cancelled: &dyn Fn() -> bool) -> Result<Self::Output, String>;
 }
 pub struct Completion<T> {
@@ -71,8 +72,9 @@ impl<W: Work> TaskWorker<W> {
                     continue;
                 }
                 let started = Instant::now();
+                let priority = request.work.priority();
                 let result = with_io_context(
-                    Priority::User,
+                    priority,
                     Cancellation::Generation(Arc::clone(&epoch), request.generation),
                     || request.work.execute(&request.doc, &cancelled),
                 );

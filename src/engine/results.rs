@@ -1,20 +1,23 @@
-use super::*;
+//! Ordered, budgeted disk results shared by search and structural queries.
+pub mod output;
+use super::budget::{BudgetManager, Reservation, Resource};
 use crate::engine::{
     session::SessionId,
-    tree::{Edge, Location},
+    tree::{Edge, Location, TreeNode},
 };
 use std::{
     fs::{self, File, OpenOptions},
     io,
     path::PathBuf,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
 const RECORD: usize = 88;
 const HEADER: u64 = 32;
 const NONE: u64 = u64::MAX;
+pub const PAGE_LIMIT: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Scanning,
@@ -61,7 +64,36 @@ pub struct ResultWriter {
     buffers: [Vec<u8>; 2],
     written: [u64; 2],
     counts: [u64; 2],
+    finished: bool,
     _lease: Reservation,
+}
+
+pub struct ResultPage {
+    pub start: u64,
+    pub locations: Vec<Location>,
+    pub state: State,
+    _lease: Reservation,
+}
+
+/// A fixed committed prefix. Duplicate node selections retain distinct ordinals.
+pub struct ResultCursor {
+    store: ResultStore,
+    next: u64,
+    end: u64,
+}
+
+impl ResultCursor {
+    pub fn next(&mut self, cancel: &dyn Fn() -> bool) -> Result<Option<Location>, String> {
+        if cancel() {
+            return Err("Result cursor cancelled".into());
+        }
+        if self.next == self.end {
+            return Ok(None);
+        }
+        let location = self.store.location(self.next, cancel)?;
+        self.next += 1;
+        Ok(Some(location))
+    }
 }
 fn checksum(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, b| {
@@ -204,12 +236,45 @@ impl ResultStore {
             buffers: [Vec::with_capacity(64 * 1024), Vec::with_capacity(64 * 1024)],
             written: [HEADER, HEADER],
             counts: [0, 0],
+            finished: false,
             _lease: lease,
         };
         Ok((store, writer))
     }
     pub fn generation(&self) -> u64 {
         self.0.generation
+    }
+    pub fn session(&self) -> SessionId {
+        self.0.session
+    }
+    pub fn page(&self, start: u64, limit: usize, cancel: &dyn Fn() -> bool) -> Result<ResultPage, String> {
+        if limit > PAGE_LIMIT { return Err("Result page exceeds 128 records".into()); }
+        let state = self.state();
+        if start > state.count { return Err("Result page is not committed".into()); }
+        let count = (state.count - start).min(limit as u64) as usize;
+        let lease = self.0.budget.reserve(
+            Resource::Memory,
+            count * (std::mem::size_of::<Location>() + 128 * std::mem::size_of::<Edge>()),
+            "bounded result page and ancestor paths",
+        )?;
+        let mut locations = Vec::with_capacity(count);
+        for index in start..start + count as u64 { locations.push(self.location(index, cancel)?); }
+        Ok(ResultPage { start, locations, state, _lease: lease })
+    }
+    pub fn cursor(&self, prefix: Option<u64>) -> Result<ResultCursor, String> {
+        let state = self.state();
+        let end = match prefix {
+            Some(count) if count <= state.count => count,
+            Some(_) => return Err("Requested prefix is not committed".into()),
+            None if state.status == Status::Completed => state.count,
+            None => return Err("Complete results require a completed task; choose a partial prefix".into()),
+        };
+        Ok(ResultCursor { store: self.clone(), next: 0, end })
+    }
+    /// Read only a node, without constructing its ancestor chain.
+    pub fn node(&self, index: u64, cancel: &dyn Fn() -> bool) -> Result<TreeNode, String> {
+        let hit = self.hit_record(index, cancel)?;
+        TreeNode::restore(self.0.session, hit[..8].try_into().unwrap())
     }
     pub fn budget(&self) -> BudgetManager {
         self.0.budget.clone()
@@ -224,7 +289,7 @@ impl ResultStore {
         let mut s = self.0.state.lock().unwrap();
         if s.status == Status::Scanning {
             s.status = Status::Cancelled;
-            s.error = "Search cancelled; committed results are partial".into();
+            s.error = "Result production cancelled; committed results are partial".into();
         }
     }
     pub fn fail(&self, error: String) {
@@ -330,6 +395,25 @@ impl ResultStore {
     }
 }
 impl ResultWriter {
+    /// Append one selection without sorting or deduplication.
+    /// Search may keep using shared ancestor records for denser storage.
+    pub fn selection(&mut self, location: &Location, cancel: &dyn Fn() -> bool) -> Result<u64, String> {
+        if location.node.reference.session != self.store.session()
+            || location.ancestors.iter().any(|edge| edge.parent.reference.session != self.store.session())
+        {
+            return Err("Result selection belongs to another session".into());
+        }
+        if location.ancestors.len() >= 128 {
+            return Err("Result ancestor depth limit".into());
+        }
+        let mut parent = NONE;
+        let mut ordinal = 0;
+        for edge in &location.ancestors {
+            parent = self.ancestor(edge.parent, parent, ordinal, cancel)?;
+            ordinal = edge.ordinal;
+        }
+        self.hit(location.node, parent, ordinal, cancel)
+    }
     pub fn count(&self) -> u64 {
         self.counts[0]
     }
@@ -341,6 +425,9 @@ impl ResultWriter {
         ordinal: u64,
         cancel: &dyn Fn() -> bool,
     ) -> Result<u64, String> {
+        if self.finished { return Err("Result writer is already finished".into()); }
+        if cancel() { return Err("Result append cancelled".into()); }
+        if node.reference.session != self.store.session() { return Err("Result node belongs to another session".into()); }
         if self.buffers[file].len() + RECORD > 64 * 1024 {
             self.flush(file, cancel)?;
         }
@@ -406,6 +493,9 @@ impl ResultWriter {
         Ok(())
     }
     pub fn finish(&mut self, status: Status, scanned: u64, error: String) -> Result<(), String> {
+        if self.finished || status == Status::Scanning {
+            return Err("Result writer requires one terminal finish".into());
+        }
         crate::engine::file_source::with_io_context(
             crate::engine::file_source::Priority::Background,
             crate::engine::file_source::Cancellation::Flag(Arc::new(
@@ -419,13 +509,23 @@ impl ResultWriter {
             s.error = error;
         }
         s.scanned = scanned;
+        self.finished = true;
         Ok(())
+    }
+}
+
+impl Drop for ResultWriter {
+    fn drop(&mut self) {
+        // A consumer waiting for a complete task must not wait forever when its
+        // producer exits without finish(). Only already published records survive.
+        self.store.cancel();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{document::Document, engine::tree::LegacyProvider};
     #[test]
     fn corrupted_result_record_is_rejected_before_location_decode() {
         let budget = BudgetManager::new(crate::engine::budget::Limits {

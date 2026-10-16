@@ -11,6 +11,7 @@ mod tree_app;
 mod tree_worker;
 use FerrisJson::{document, engine, export, loading};
 mod fonts;
+mod legacy_search;
 mod palette;
 mod preview_worker;
 mod query_worker;
