@@ -23,6 +23,7 @@ pub struct Usage {
 struct State {
     limits: Limits,
     usage: Usage,
+    resident_messages: bool,
 }
 
 /// All clones share one ledger, including old and new documents and queued results.
@@ -46,10 +47,23 @@ impl Default for BudgetManager {
 
 impl BudgetManager {
     pub fn new(limits: Limits) -> Self {
+        Self::with_messages(limits, false)
+    }
+
+    pub(crate) fn resident(limits: Limits) -> Self {
+        Self::with_messages(limits, true)
+    }
+
+    fn with_messages(limits: Limits, resident_messages: bool) -> Self {
         Self(Arc::new(Mutex::new(State {
             limits,
             usage: Usage::default(),
+            resident_messages,
         })))
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).limits
     }
 
     pub fn usage(&self) -> Usage {
@@ -93,6 +107,17 @@ impl Reservation {
             .and_then(|n| n.checked_add(bytes))
             .ok_or_else(|| format!("Resource budget overflow: {}", self.label))?;
         if next > limit {
+            if self.resource == Resource::Memory && state.resident_messages {
+                return Err(format!(
+                    "Memory budget exceeded: {:.1} MiB requested, {:.1} MiB limit. \
+                     Nodes and search matches share this file's budget. \
+                     Restart with a larger {} setting, or use fewer nodes/matches. \
+                     This is managed memory, not process RSS.",
+                    next as f64 / (1024.0 * 1024.0),
+                    limit as f64 / (1024.0 * 1024.0),
+                    super::resident_memory::SETTING,
+                ));
+            }
             return Err(format!(
                 "{:?} budget exceeded for {}: requested total {next} bytes, limit {limit} bytes",
                 self.resource, self.label
@@ -117,6 +142,25 @@ impl Reservation {
     }
     pub(crate) fn label(&self) -> &'static str {
         self.label
+    }
+
+    fn allocation_error(&self, error: &std::collections::TryReserveError) -> String {
+        let resident = self
+            .manager
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resident_messages;
+        if self.resource == Resource::Memory && resident {
+            format!(
+                "Could not allocate managed memory. Free system memory and reopen the file, \
+                 or restart with a smaller {} budget. \
+                 The configured limit does not reserve system RAM. Details: {error}",
+                super::resident_memory::SETTING,
+            )
+        } else {
+            format!("Cannot allocate vector: {error}")
+        }
     }
 }
 
@@ -149,7 +193,7 @@ pub(crate) fn reserve_vec<T>(
     lease.resize(old.checked_add(new).ok_or("Vector byte overflow")?)?;
     if let Err(error) = values.try_reserve_exact(additional) {
         lease.resize(old)?;
-        return Err(format!("Cannot allocate vector: {error}"));
+        return Err(lease.allocation_error(&error));
     }
     lease.resize(
         values

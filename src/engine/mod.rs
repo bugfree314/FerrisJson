@@ -3,6 +3,7 @@ pub mod budget;
 pub mod file_source;
 pub mod ids;
 pub mod recursive;
+mod resident_memory;
 pub mod session;
 pub mod top_level;
 pub mod tree;

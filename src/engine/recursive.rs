@@ -595,10 +595,9 @@ impl Session {
         cancel: Arc<AtomicBool>,
         ctx: eframe::egui::Context,
     ) -> Result<Self, String> {
-        let budget = BudgetManager::new(Limits {
-            // Transitional resident-tree ceiling; policy and user-facing limits follow in M4.
-            // Blocks are charged on allocation, not preallocated up to this limit.
-            memory: 512 * 1024 * 1024,
+        let budget = BudgetManager::resident(Limits {
+            // Fixed for this session. Blocks are charged on allocation, not preallocated.
+            memory: super::resident_memory::limit_from_env()?,
             disk: 64usize * 1024 * 1024 * 1024,
         });
         let snapshot = Snapshot::protected(source.duplicate_file()?, &budget)?;

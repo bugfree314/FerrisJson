@@ -241,7 +241,26 @@ impl Viewer {
         let Some(page) = self.progressive.page.clone() else {
             return;
         };
-        ui.label(RichText::new(&self.source).strong());
+        ui.label(RichText::new(&self.source).strong())
+            .on_hover_ui(|ui| {
+                if let Some(session) = &self.progressive.session {
+                    let budget = session.budget();
+                    let usage = budget.usage();
+                    let limit = budget.limits().memory;
+                    let mib = 1024.0 * 1024.0;
+                    ui.label(format!(
+                        "Managed memory: {:.1} / {:.1} MiB",
+                        usage.memory as f64 / mib,
+                        limit as f64 / mib,
+                    ));
+                    ui.label(format!(
+                        "Peak managed memory: {:.1} MiB",
+                        usage.peak_memory as f64 / mib
+                    ));
+                    ui.label("Includes reserved workspaces; this is not process RSS.");
+                    ui.label("Set FERRISJSON_MEMORY_MIB before starting the app (64–32768 MiB).");
+                }
+            });
         ui.separator();
         let mut wanted = page.start;
         let mut actions = Vec::new();
