@@ -5,10 +5,11 @@ use crate::{
     document::{Document, LoadProgress, NodeIds, SearchScope},
     export::{self, COPY_LIMIT, CopyError, Selection},
     palette::{ColorSettings, Preset, color},
+    query_worker::{QueryRequest, QueryWorker},
     row_cache::RowCache,
+    search_worker::{SearchRequest, SearchWorker},
     ui::{json_preview_highlighted as json_preview, kind_color},
     vim::{Action, Command, Vim},
-    worker::{Operation, Output, Worker},
 };
 use eframe::egui::{self, Color32, Key, RichText};
 use std::borrow::Cow;
@@ -40,8 +41,8 @@ pub struct Viewer {
     doc: Option<Arc<Document>>,
     preview_worker: Option<PreviewWorker>,
     requested_rows: Vec<usize>,
-    search_worker: Option<Worker>,
-    path_worker: Option<Worker>,
+    search_worker: Option<SearchWorker>,
+    path_worker: Option<QueryWorker>,
     search_due: Option<Instant>,
     search_highlight: Option<crate::ui::SearchHighlight>,
     pending_expression: String,
@@ -60,7 +61,8 @@ pub struct Viewer {
     indexing: bool,
     load_started: Option<Instant>,
     open_duration: Option<Duration>,
-    query_duration: Option<(&'static str, Duration)>,
+    search_duration: Option<Duration>,
+    path_duration: Option<Duration>,
     expanded: Vec<bool>,
     expanded_resource: Option<Reservation>,
     preview_resource: Option<Reservation>,
@@ -162,7 +164,8 @@ impl Viewer {
             indexing: false,
             load_started: None,
             open_duration: None,
-            query_duration: None,
+            search_duration: None,
+            path_duration: None,
             expanded: Vec::new(),
             expanded_resource: None,
             preview_resource: None,
@@ -336,7 +339,8 @@ impl Viewer {
         self.term.clear();
         self.query = "$".into();
         self.pending_expression.clear();
-        self.query_duration = None;
+        self.search_duration = None;
+        self.path_duration = None;
         self.search_error = None;
         self.vim.cancel();
         self.notice =
@@ -396,7 +400,8 @@ impl Viewer {
                         self.term.clear();
                         self.matches = NodeIds::default();
                         self.search_error = None;
-                        self.query_duration = None;
+                        self.search_duration = None;
+                        self.path_duration = None;
                         self.path_results = None;
                         self.query = "$".into();
                         self.history.clear();
@@ -665,7 +670,7 @@ impl Viewer {
         }
         self.matches = NodeIds::default();
         self.search_error = None;
-        self.query_duration = None;
+        self.search_duration = None;
         if self.term.is_empty() || !self.colors.live_search {
             self.search_due = None;
         } else {
@@ -679,7 +684,7 @@ impl Viewer {
         self.matches = NodeIds::default();
         self.search_error = None;
         self.match_index = 0;
-        self.query_duration = None;
+        self.search_duration = None;
         if let Some(worker) = &mut self.search_worker {
             worker.cancel();
         }
@@ -692,7 +697,7 @@ impl Viewer {
         if let Some(worker) = &mut self.search_worker {
             let result = worker.submit(
                 Arc::clone(doc),
-                Operation::Search {
+                SearchRequest {
                     term: self.term.clone(),
                     case: self.case,
                     regex: self.regex,
@@ -700,6 +705,7 @@ impl Viewer {
                 },
             );
             if let Err(error) = result {
+                self.search_highlight = None;
                 self.search_error = Some(error);
             }
         } else {
@@ -732,15 +738,15 @@ impl Viewer {
             };
             self.reveal(self.matches[self.match_index] as usize);
         }
-        self.query_duration = Some(("Search", elapsed + started.elapsed()));
+        self.search_duration = Some(elapsed + started.elapsed());
     }
     fn go_to_path(&mut self) {
+        self.path_duration = None;
         if let Some(worker) = &mut self.path_worker {
             worker.cancel();
         }
         if self.query.trim().is_empty() {
             self.path_results = None;
-            self.query_duration = None;
             return;
         }
         let Some(doc) = &self.doc else {
@@ -748,7 +754,7 @@ impl Viewer {
         };
         self.pending_expression = self.query.clone();
         if let Some(worker) = &mut self.path_worker {
-            if let Err(error) = worker.submit(Arc::clone(doc), Operation::Query(self.query.clone()))
+            if let Err(error) = worker.submit(Arc::clone(doc), QueryRequest::new(self.query.clone()))
             {
                 self.finish_path(Err(error), Duration::ZERO);
             }
@@ -765,7 +771,6 @@ impl Viewer {
         let started = Instant::now();
         match result {
             Ok((ids, preview)) => {
-                self.error = None;
                 let first = ids.first().copied();
                 self.path_results = Some(PathResults {
                     expression: self.pending_expression.clone(),
@@ -786,32 +791,19 @@ impl Viewer {
                 });
             }
         }
-        self.query_duration = Some(("Path", elapsed + started.elapsed()));
+        self.path_duration = Some(elapsed + started.elapsed());
     }
     fn poll_operations(&mut self, ctx: &egui::Context) {
         if self.search_due.is_some_and(|due| Instant::now() >= due) {
             self.search();
         }
-        if let Some(completed) = self.search_worker.as_mut().and_then(Worker::poll) {
-            self.finish_search(
-                completed.result.map(|output| match output {
-                    Output::Search(ids) => ids,
-                    _ => unreachable!(),
-                }),
-                completed.elapsed,
-            );
+        if let Some(completed) = self.search_worker.as_mut().and_then(SearchWorker::poll) {
+            self.finish_search(completed.result, completed.elapsed);
         }
-        if let Some(completed) = self.path_worker.as_mut().and_then(Worker::poll) {
-            let result = completed.result.map(|output| match output {
-                Output::Query {
-                    expression,
-                    ids,
-                    preview,
-                } => {
-                    self.pending_expression = expression;
-                    (ids, preview)
-                }
-                _ => unreachable!(),
+        if let Some(completed) = self.path_worker.as_mut().and_then(QueryWorker::poll) {
+            let result = completed.result.map(|output| {
+                self.pending_expression = output.expression;
+                (output.ids, output.preview)
             });
             self.finish_path(result, completed.elapsed);
         }
@@ -1216,7 +1208,7 @@ impl Viewer {
                 worker.cancel();
             }
             self.query.clear();
-            self.query_duration = None;
+            self.path_duration = None;
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
@@ -1232,9 +1224,9 @@ impl Viewer {
             ctx.request_repaint_after(Duration::from_millis(25));
         }
         self.search_worker
-            .get_or_insert_with(|| Worker::new(ctx.clone()));
+            .get_or_insert_with(|| SearchWorker::new(ctx.clone()));
         self.path_worker
-            .get_or_insert_with(|| Worker::new(ctx.clone()));
+            .get_or_insert_with(|| QueryWorker::new(ctx.clone()));
         self.poll();
         self.poll_export(ctx);
         self.poll_operations(ctx);
@@ -1414,7 +1406,7 @@ impl Viewer {
                     if let Some(worker) = &mut self.path_worker {
                         worker.cancel();
                     }
-                    self.query_duration = None;
+                    self.path_duration = None;
                 }
                 if ui.button("Go").clicked()
                     || (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
@@ -1431,7 +1423,7 @@ impl Viewer {
                     if let Some(worker) = &mut self.path_worker {
                         worker.cancel();
                     }
-                    self.query_duration = None;
+                    self.path_duration = None;
                 }
                 if ui.button("Expand all").clicked() {
                     self.expanded.fill(true);
@@ -1448,8 +1440,10 @@ impl Viewer {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some((label, duration)) = self.query_duration {
-                        ui.label(format!("{label}: {}", format_duration(duration))).on_hover_text("Includes query, node reveal and selection preview; excludes painting.");
+                    for (label, duration) in [("Path", self.path_duration), ("Search", self.search_duration)] {
+                        if let Some(duration) = duration {
+                            ui.label(format!("{label}: {}", format_duration(duration))).on_hover_text("Includes execution and node reveal; selection preview may finish asynchronously; excludes painting.");
+                        }
                     }
                     if self.pending.is_some() {
                         if self.indexing { ui.label(self.indexed_progress.status()); }
@@ -1872,7 +1866,7 @@ mod tests {
         let owner = Arc::clone(app.doc.as_ref().unwrap());
         let weak = Arc::downgrade(&owner);
         app.colors.low_memory_load = true;
-        app.search_worker = Some(Worker::new(ctx.clone()));
+        app.search_worker = Some(SearchWorker::new(ctx.clone()));
         app.term = "name".into();
         app.search();
         app.load_text("{bad}".into(), "invalid".into(), &ctx);
@@ -2044,8 +2038,8 @@ mod tests {
     fn background_operations_update_navigation_and_loading_invalidates_old_results() {
         let mut app = loaded();
         let ctx = egui::Context::default();
-        app.search_worker = Some(Worker::new(ctx.clone()));
-        app.path_worker = Some(Worker::new(ctx.clone()));
+        app.search_worker = Some(SearchWorker::new(ctx.clone()));
+        app.path_worker = Some(QueryWorker::new(ctx.clone()));
         app.term = "email".into();
         app.scope = SearchScope::Keys;
         app.search();
@@ -2082,7 +2076,7 @@ mod tests {
         let mut app = loaded();
         app.colors.live_search = true;
         let ctx = egui::Context::default();
-        app.search_worker = Some(Worker::new(ctx.clone()));
+        app.search_worker = Some(SearchWorker::new(ctx.clone()));
         app.term = "email".into();
         app.schedule_search(&ctx);
         assert!(app.search_due.unwrap() > Instant::now());
@@ -2106,14 +2100,14 @@ mod tests {
     fn manual_search_waits_for_execution_and_edits_cancel_old_results() {
         let mut app = loaded();
         let ctx = egui::Context::default();
-        app.search_worker = Some(Worker::new(ctx.clone()));
+        app.search_worker = Some(SearchWorker::new(ctx.clone()));
         assert!(!app.colors.live_search);
         app.term = "email".into();
         app.scope = SearchScope::Keys;
         app.schedule_search(&ctx);
         wait_operations(&mut app, &ctx);
         assert!(app.matches.is_empty());
-        assert!(app.query_duration.is_none());
+        assert!(app.search_duration.is_none());
         app.search();
         wait_operations(&mut app, &ctx);
         assert_eq!(app.matches.len(), 2);
@@ -2121,7 +2115,7 @@ mod tests {
         app.schedule_search(&ctx);
         wait_operations(&mut app, &ctx);
         assert!(app.matches.is_empty());
-        assert!(app.query_duration.is_none());
+        assert!(app.search_duration.is_none());
     }
     #[test]
     fn search_reveals_match_and_collapsing_preserves_visible_selection() {
@@ -2189,15 +2183,17 @@ mod tests {
         let mut app = loaded();
         app.term = "email".into();
         app.search();
-        assert_eq!(app.query_duration.unwrap().0, "Search");
+        assert!(app.search_duration.is_some());
+        let search_duration = app.search_duration;
         app.query = "$.users[1].name".into();
         app.go_to_path();
-        assert_eq!(app.query_duration.unwrap().0, "Path");
+        assert!(app.path_duration.is_some());
+        assert_eq!(app.search_duration, search_duration);
         assert_eq!(app.doc.as_ref().unwrap().preview(app.selected), "\"张三\"");
         app.query = "$.missing".into();
         app.go_to_path();
         assert!(app.path_results.as_ref().unwrap().ids.is_empty());
-        assert!(app.query_duration.is_some());
+        assert!(app.path_duration.is_some());
         let (tx, rx) = mpsc::channel();
         app.pending = Some(rx);
         app.load_started = Some(Instant::now());
@@ -2205,7 +2201,8 @@ mod tests {
             .unwrap();
         app.poll();
         assert!(app.open_duration.is_some());
-        assert!(app.query_duration.is_none());
+        assert!(app.search_duration.is_none());
+        assert!(app.path_duration.is_none());
         assert!(app.load_started.is_none());
         assert_eq!(format_duration(Duration::from_micros(1234)), "1.23 ms");
         assert_eq!(format_duration(Duration::from_millis(1500)), "1.50 s");
@@ -2215,7 +2212,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = loaded();
         app.open_duration = Some(Duration::from_millis(150));
-        app.query_duration = Some(("Search", Duration::from_micros(250)));
+        app.search_duration = Some(Duration::from_micros(250));
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(

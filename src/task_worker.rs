@@ -1,5 +1,5 @@
-//! One active operation and one replaceable pending request per worker.
-use crate::document::{Document, NodeIds, SearchScope};
+//! Shared bounded scheduling only; search and query supply independent typed work.
+use crate::document::Document;
 use crate::engine::budget::{Reservation, Resource};
 use crate::engine::file_source::{Cancellation, Priority, with_io_context};
 use crate::engine::session::{SessionId, TaskId};
@@ -10,51 +10,45 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-pub enum Operation {
-    Search {
-        term: String,
-        case: bool,
-        regex: bool,
-        scope: SearchScope,
-    },
-    Query(String),
+/// Typed work executed by a bounded lane. Implementations own operation semantics.
+pub trait Work: Send + 'static {
+    type Output: Send + 'static;
+    fn input_bytes(&self) -> usize;
+    fn execute(self, doc: &Document, cancelled: &dyn Fn() -> bool) -> Result<Self::Output, String>;
 }
-pub enum Output {
-    Search(NodeIds),
-    Query {
-        expression: String,
-        ids: NodeIds,
-        preview: String,
-    },
-}
-pub struct Completion {
+pub struct Completion<T> {
     generation: u64,
     pub task: TaskId,
     _reservation: Option<Reservation>,
     pub elapsed: Duration,
-    pub result: Result<Output, String>,
+    pub result: Result<T, String>,
 }
-struct Request {
+struct Request<W: Work> {
     generation: u64,
     doc: Arc<Document>,
-    operation: Operation,
+    work: W,
     reservation: Option<Reservation>,
 }
-#[derive(Default)]
-struct Inbox {
-    pending: Option<Request>,
+struct Inbox<W: Work> {
+    pending: Option<Request<W>>,
     stopped: bool,
 }
-pub struct Worker {
-    inbox: Arc<(Mutex<Inbox>, Condvar)>,
+pub struct TaskWorker<W: Work> {
+    inbox: Arc<(Mutex<Inbox<W>>, Condvar)>,
     generation: Arc<AtomicU64>,
-    results: Receiver<Completion>,
+    results: Receiver<Completion<W::Output>>,
     pub busy: bool,
     session: Option<SessionId>,
 }
-impl Worker {
+impl<W: Work> TaskWorker<W> {
     pub fn new(ctx: eframe::egui::Context) -> Self {
-        let inbox = Arc::new((Mutex::new(Inbox::default()), Condvar::new()));
+        let inbox: Arc<(Mutex<Inbox<W>>, Condvar)> = Arc::new((
+            Mutex::new(Inbox {
+                pending: None,
+                stopped: false,
+            }),
+            Condvar::new(),
+        ));
         let generation = Arc::new(AtomicU64::new(0));
         let (tx, results) = mpsc::sync_channel(1);
         let shared = Arc::clone(&inbox);
@@ -80,36 +74,7 @@ impl Worker {
                 let result = with_io_context(
                     Priority::User,
                     Cancellation::Generation(Arc::clone(&epoch), request.generation),
-                    || match request.operation {
-                        Operation::Search {
-                            term,
-                            case,
-                            regex,
-                            scope,
-                        } => request
-                            .doc
-                            .search_cancellable(&term, case, regex, scope, cancelled)
-                            .map(Output::Search),
-                        Operation::Query(expression) => {
-                            // The library evaluates a whole query without a cancellation hook.
-                            // Suppress stale work before formatting; pending queries are coalesced.
-                            request
-                                .doc
-                                .query_path_cancellable(&expression, cancelled)
-                                .map(|ids| {
-                                    let preview = if cancelled() {
-                                        String::new()
-                                    } else {
-                                        request.doc.results_preview(&ids)
-                                    };
-                                    Output::Query {
-                                        expression,
-                                        ids,
-                                        preview,
-                                    }
-                                })
-                        }
-                    },
+                    || request.work.execute(&request.doc, &cancelled),
                 );
                 // A result-channel send can block. Never retain a document while
                 // waiting to deliver IDs/preview, especially during low-memory loading.
@@ -162,12 +127,9 @@ impl Worker {
         self.busy = false;
         self.session = None;
     }
-    pub fn submit(&mut self, doc: Arc<Document>, operation: Operation) -> Result<(), String> {
+    pub fn submit(&mut self, doc: Arc<Document>, work: W) -> Result<(), String> {
         self.cancel();
-        let input_bytes = match &operation {
-            Operation::Search { term, .. } => term.capacity(),
-            Operation::Query(expression) => expression.capacity(),
-        };
+        let input_bytes = work.input_bytes();
         let reservation = doc.budget().reserve(
             Resource::Memory,
             input_bytes.saturating_add(512 * 1024),
@@ -178,14 +140,14 @@ impl Worker {
         self.inbox.0.lock().unwrap().pending = Some(Request {
             generation,
             doc,
-            operation,
+            work,
             reservation: Some(reservation),
         });
         self.busy = true;
         self.inbox.1.notify_one();
         Ok(())
     }
-    pub fn poll(&mut self) -> Option<Completion> {
+    pub fn poll(&mut self) -> Option<Completion<W::Output>> {
         while let Ok(result) = self.results.try_recv() {
             if result.generation == self.generation.load(Ordering::Relaxed)
                 && Some(result.task.session) == self.session
@@ -197,7 +159,7 @@ impl Worker {
         None
     }
 }
-impl Drop for Worker {
+impl<W: Work> Drop for TaskWorker<W> {
     fn drop(&mut self) {
         self.cancel();
         self.inbox.0.lock().unwrap().stopped = true;
@@ -208,6 +170,9 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{document::NodeIds, query_worker::{QueryOutput, QueryRequest}};
+    type Worker = TaskWorker<QueryRequest>;
+    type Completion = super::Completion<QueryOutput>;
     #[test]
     fn full_result_channel_does_not_retain_documents() {
         let ctx = eframe::egui::Context::default();
@@ -218,7 +183,7 @@ mod tests {
             worker.inbox.0.lock().unwrap().pending = Some(Request {
                 generation: 0,
                 doc,
-                operation: Operation::Query("$[*]".into()),
+                work: QueryRequest::new("$[*]"),
                 reservation: None,
             });
             worker.inbox.1.notify_one();
@@ -247,42 +212,28 @@ mod tests {
         }
     }
     #[test]
-    fn newer_requests_replace_old_searches_and_use_the_new_document() {
+    fn newer_requests_replace_old_queries_and_use_the_new_document() {
         let mut worker = Worker::new(eframe::egui::Context::default());
         let old =
             Arc::new(Document::parse(&serde_json::json!(vec!["old"; 20_000]).to_string()).unwrap());
-        worker
-            .submit(
-                old,
-                Operation::Search {
-                    term: "old".into(),
-                    case: false,
-                    regex: false,
-                    scope: SearchScope::All,
-                },
-            )
-            .unwrap();
+        worker.submit(old, QueryRequest::new("$[*]")).unwrap();
         let new = Arc::new(Document::parse(r#"{"answer":42}"#).unwrap());
         for _ in 0..20 {
             worker
-                .submit(Arc::clone(&new), Operation::Query("$.missing".into()))
+                .submit(Arc::clone(&new), QueryRequest::new("$.missing"))
                 .unwrap();
         }
         worker
-            .submit(new, Operation::Query("$.answer".into()))
+            .submit(new, QueryRequest::new("$.answer"))
             .unwrap();
-        match wait(&mut worker).result.unwrap() {
-            Output::Query {
-                ids,
-                preview,
-                expression,
-            } => {
-                assert_eq!(ids, vec![1]);
-                assert_eq!(preview, "[\n  42\n]");
-                assert_eq!(expression, "$.answer");
-            }
-            _ => panic!("obsolete search was delivered"),
-        }
+        let QueryOutput {
+            ids,
+            preview,
+            expression,
+        } = wait(&mut worker).result.unwrap();
+        assert_eq!(ids, vec![1]);
+        assert_eq!(preview, "[\n  42\n]");
+        assert_eq!(expression, "$.answer");
         assert!(!worker.busy);
     }
     #[test]
@@ -290,7 +241,7 @@ mod tests {
         let mut worker = Worker::new(eframe::egui::Context::default());
         let doc = Arc::new(Document::parse(r#"{"x":1}"#).unwrap());
         worker
-            .submit(Arc::clone(&doc), Operation::Query("$.x".into()))
+            .submit(Arc::clone(&doc), QueryRequest::new("$.x"))
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while worker.results.try_recv().is_err() {
@@ -300,7 +251,7 @@ mod tests {
         worker.cancel();
         assert!(!worker.busy);
         assert!(worker.poll().is_none());
-        worker.submit(doc, Operation::Query("$[?".into())).unwrap();
+        worker.submit(doc, QueryRequest::new("$[?")).unwrap();
         assert!(
             matches!(wait(&mut worker).result, Err(error) if error.contains("Invalid JSONPath"))
         );
@@ -310,7 +261,10 @@ mod tests {
         let (tx, results) = mpsc::sync_channel(1);
         let session = Document::parse("null").unwrap().session_id();
         let mut worker = Worker {
-            inbox: Arc::new((Mutex::new(Inbox::default()), Condvar::new())),
+            inbox: Arc::new((
+                Mutex::new(Inbox { pending: None, stopped: false }),
+                Condvar::new(),
+            )),
             generation: Arc::new(AtomicU64::new(2)),
             results,
             busy: true,
@@ -324,9 +278,11 @@ mod tests {
             },
             _reservation: None,
             elapsed: Duration::ZERO,
-            result: Ok(Output::Search(
-                NodeIds::from_slice(&Default::default(), &[99]).unwrap(),
-            )),
+            result: Ok(QueryOutput {
+                expression: "$".into(),
+                ids: NodeIds::from_slice(&Default::default(), &[99]).unwrap(),
+                preview: String::new(),
+            }),
         })
         .unwrap();
         assert!(worker.poll().is_none());
@@ -339,7 +295,11 @@ mod tests {
             },
             _reservation: None,
             elapsed: Duration::ZERO,
-            result: Ok(Output::Search(NodeIds::default())),
+            result: Ok(QueryOutput {
+                expression: "$".into(),
+                ids: NodeIds::default(),
+                preview: String::new(),
+            }),
         })
         .unwrap();
         assert!(
@@ -354,12 +314,14 @@ mod tests {
             },
             _reservation: None,
             elapsed: Duration::ZERO,
-            result: Ok(Output::Search(
-                NodeIds::from_slice(&Default::default(), &[1]).unwrap(),
-            )),
+            result: Ok(QueryOutput {
+                expression: "$".into(),
+                ids: NodeIds::from_slice(&Default::default(), &[1]).unwrap(),
+                preview: String::new(),
+            }),
         })
         .unwrap();
-        assert!(matches!(worker.poll().unwrap().result, Ok(Output::Search(ids)) if ids == vec![1]));
+        assert!(matches!(worker.poll().unwrap().result, Ok(QueryOutput { ids, .. }) if ids == vec![1]));
         assert!(!worker.busy);
     }
 }

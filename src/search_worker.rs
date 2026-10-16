@@ -4,7 +4,12 @@ use crate::engine::{
     file_source::{Cancellation, Priority, with_io_context},
     search::{Event, Input, Query, ResultStore, State, Status},
 };
+use crate::{
+    document::{Document, NodeIds},
+    task_worker::{TaskWorker, Work},
+};
 use eframe::egui;
+
 use std::{
     collections::VecDeque,
     sync::{
@@ -13,6 +18,22 @@ use std::{
     },
     thread::JoinHandle,
 };
+/// The default viewer keeps its collected result adapter until the result-store migration.
+pub type SearchRequest = Query;
+pub type SearchWorker = TaskWorker<SearchRequest>;
+
+impl Work for SearchRequest {
+    type Output = NodeIds;
+
+    fn input_bytes(&self) -> usize {
+        self.term.capacity()
+    }
+
+    fn execute(self, doc: &Document, cancelled: &dyn Fn() -> bool) -> Result<NodeIds, String> {
+        doc.search_cancellable(&self.term, self.case, self.regex, self.scope, cancelled)
+    }
+}
+
 #[derive(Clone)]
 pub struct Snapshot {
     pub generation: u64,

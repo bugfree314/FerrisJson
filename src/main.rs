@@ -13,11 +13,12 @@ use FerrisJson::{document, engine, export, loading};
 mod fonts;
 mod palette;
 mod preview_worker;
+mod query_worker;
 mod row_cache;
 mod shutdown;
+mod task_worker;
 mod ui;
 mod vim;
-mod worker;
 use document::{Document, SearchScope};
 use std::{
     io::{self, IsTerminal, Read, Write},

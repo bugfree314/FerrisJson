@@ -198,7 +198,7 @@ cargo run --release --offline --locked --example sparse_index -- your-file.json 
 
 Export all values / paths 和 Export partial values / paths 分别输出 JSON 数组，完整路径不使用显示缩略字符串；通过临时文件成功替换目标。文件后端字符串/数字 Regex 原文范围限定 256 KiB，稀疏键 Regex 同样受限；旧后端已驻留的键直接匹配，字面量跨块解码；搜索词最多 64 KiB，完整导出路径最多 8 MiB，复制与其他既有输出限制不变。0.7.4 已取消旧默认界面/CLI 兼容收集器的 65,536 条命中上限；它仍完整收集结果并受共享资源预算保护，自动验证未运行，大结果可使用分页树的磁盘结果存储。默认后端策略仍待 S8；原生 GUI/GPU、跨平台及真实磁盘故障仍需验收。验证与专项测量见性能记录第 26 节。
 
-搜索与 JSONPath 双引擎拆分的阶段 A 行为矩阵、源码依据及待验收项目见 [阶段 A 行为基线](docs/search-query-separation.md)。本次未运行测试或构建，版本为 0.7.4；两个引擎的接口迁移尚未开始。
+搜索与 JSONPath 双引擎拆分的阶段 A 行为矩阵见 [阶段 A 行为基线](docs/search-query-separation.md)。A 已提交为 0.7.4 / `2ff76c0`；随后 [阶段 B 工作区实现](docs/search-query-stage-b.md) 拆分独立请求／Worker 和耗时状态，尚未测试或提交，包版本保持 0.7.4。默认 GUI 仍完整收集结果，分页树继续使用 SearchHub；公共结果存储及查询引擎迁移待后续阶段。
 
 ## 配色设置
 
