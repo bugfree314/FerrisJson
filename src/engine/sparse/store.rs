@@ -21,6 +21,7 @@ const BASE: u64 = HEADER + BUCKETS * 16;
 pub(crate) type Record = [u64; 12];
 
 pub(crate) struct Store {
+    memory: Option<super::memory_records::MemoryRecords>,
     write_cache: Option<Mutex<RecordCache>>,
     file: Option<File>,
     owner: Arc<Owner>,
@@ -56,11 +57,61 @@ impl Drop for Store {
     }
 }
 impl Store {
+    /// M1 foundation; the progressive session switches to this constructor in M2.
+    /// Virtual record offsets preserve IDs and the existing AVL/duplicate-key logic.
+    #[allow(
+        dead_code,
+        reason = "M1 foundation; default session integration follows in M2"
+    )]
+    pub(crate) fn memory(
+        budget: &BudgetManager,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, String> {
+        super::check(cancelled)?;
+        Ok(Self {
+            memory: Some(super::memory_records::MemoryRecords::new(
+                budget,
+                BUCKETS as usize,
+            )?),
+            write_cache: None,
+            file: None,
+            owner: Arc::new(Owner {
+                path: None,
+                disk: Mutex::new(budget.reserve(
+                    Resource::Disk,
+                    0,
+                    "resident index uses no disk",
+                )?),
+            }),
+            len: BASE,
+            readonly: false,
+            _directory_stack: budget.reserve(
+                Resource::Memory,
+                64 * 1024,
+                "resident directory stack",
+            )?,
+            undo: None,
+        })
+    }
+
+    fn require_file(&self) -> Result<(), String> {
+        if self.memory.is_some() {
+            Err(
+                "Resident indexes do not support file views, persistence or rollback transactions"
+                    .into(),
+            )
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn read_view(&self, budget: &BudgetManager) -> Result<Self, String> {
+        self.require_file()?;
         if self.write_cache.is_some() {
             return Err("Live cached indexes cannot create external file views".into());
         }
         Ok(Self {
+            memory: None,
             write_cache: None,
             file: Some(
                 self.file
@@ -88,6 +139,7 @@ impl Store {
         budget: &BudgetManager,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
+        self.require_file()?;
         if self.write_cache.is_some() {
             return Err("Live cached indexes cannot be persisted".into());
         }
@@ -121,6 +173,7 @@ impl Store {
         budget: &BudgetManager,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
+        self.require_file()?;
         let mut input = File::open(path).map_err(|e| e.to_string())?;
         if input.metadata().map_err(|e| e.to_string())?.len() != expected
             || expected < BASE
@@ -206,6 +259,7 @@ impl Store {
         let (file, path) = result.ok_or("Cannot create sparse index")?;
         #[allow(unused_mut)] // Unix unlinks the owner path after opening.
         let mut store = Self {
+            memory: None,
             write_cache: None,
             file: Some(file),
             owner: Arc::new(Owner {
@@ -245,6 +299,7 @@ impl Store {
         bytes: &mut [u8],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
+        self.require_file()?;
         if pos
             .checked_add(bytes.len() as u64)
             .is_none_or(|end| end > self.len)
@@ -282,6 +337,7 @@ impl Store {
         Ok(())
     }
     fn write_at(&self, pos: u64, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+        self.require_file()?;
         if self.readonly {
             return Err("Read-only index view".into());
         }
@@ -317,6 +373,10 @@ impl Store {
         self.len
     }
     pub(crate) fn head(&self, hash: u64, cancelled: &dyn Fn() -> bool) -> Result<u64, String> {
+        super::check(cancelled)?;
+        if let Some(memory) = &self.memory {
+            return Ok(memory.head(hash));
+        }
         let mut bytes = [0; 16];
         self.read_at(HEADER + hash % BUCKETS * 16, &mut bytes, cancelled)?;
         if hash_bytes(&bytes[..8]) != u64::from_le_bytes(bytes[8..].try_into().unwrap()) {
@@ -330,6 +390,11 @@ impl Store {
         head: u64,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
+        super::check(cancelled)?;
+        if let Some(memory) = &mut self.memory {
+            memory.set_head(hash, head);
+            return Ok(());
+        }
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&head.to_le_bytes());
         let sum = hash_bytes(&bytes[..8]);
@@ -341,10 +406,16 @@ impl Store {
         record: Record,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<u64, String> {
+        super::check(cancelled)?;
         let offset = self.len;
         let next = offset
             .checked_add(RECORD)
             .ok_or("Sparse index size overflow")?;
+        if let Some(memory) = &mut self.memory {
+            memory.append(record)?;
+            self.len = next;
+            return Ok(offset);
+        }
         self.owner.disk.lock().unwrap().resize(
             usize::try_from(next).map_err(|_| "Sparse index exceeds platform disk accounting")?,
         )?;
@@ -360,8 +431,12 @@ impl Store {
                 .is_some_and(|end| end <= self.len)
     }
     pub(crate) fn get(&self, offset: u64, cancelled: &dyn Fn() -> bool) -> Result<Record, String> {
+        super::check(cancelled)?;
         if !self.valid_offset(offset) {
             return Err("Invalid sparse record offset".into());
+        }
+        if let Some(memory) = &self.memory {
+            return memory.get((offset - BASE) / RECORD);
         }
         if let Some(cache) = &self.write_cache
             && let Some((r, _)) = cache.lock().unwrap().records.get(&offset)
@@ -386,8 +461,15 @@ impl Store {
         record: Record,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<(), String> {
+        super::check(cancelled)?;
+        if self.readonly {
+            return Err("Read-only index view".into());
+        }
         if !self.valid_offset(offset) {
             return Err("Invalid sparse record offset".into());
+        }
+        if let Some(memory) = &mut self.memory {
+            return memory.put((offset - BASE) / RECORD, record);
         }
         if self
             .undo
@@ -424,6 +506,7 @@ impl Store {
     /// Only for a single live ephemeral owner. No external file views or
     /// persistence are used by this owner; dirty entries may die with it.
     pub(crate) fn enable_live_cache(&mut self, budget: &BudgetManager) -> Result<(), String> {
+        self.require_file()?;
         let lease = budget.reserve(
             Resource::Memory,
             4 * 1024 * 1024,
@@ -469,6 +552,7 @@ impl Store {
         self.undo.is_some()
     }
     pub(crate) fn transaction(&mut self, budget: &BudgetManager) -> Result<(), String> {
+        self.require_file()?;
         if self.write_cache.is_some() {
             return Err("Live cached indexes do not use rollback transactions".into());
         }
@@ -515,6 +599,7 @@ impl Store {
         budget: &BudgetManager,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, String> {
+        self.require_file()?;
         if self.write_cache.is_some() {
             return Err("Live cached indexes cannot create external file copies".into());
         }

@@ -2,6 +2,7 @@
 //! scalar array elements have no permanent record. No GUI/default-backend integration.
 mod cache;
 mod directory;
+mod memory_records;
 mod navigation;
 mod search;
 pub use navigation::RawSelection;
