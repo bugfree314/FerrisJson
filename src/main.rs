@@ -15,6 +15,7 @@ mod legacy_search;
 mod palette;
 mod preview_worker;
 mod query_worker;
+mod query_stream_worker;
 mod row_cache;
 mod shutdown;
 mod task_worker;
@@ -158,17 +159,28 @@ fn run() -> Result<(), String> {
             };
             Document::parse_owned(text)?
         };
+        let doc = std::sync::Arc::new(doc);
         let stdout = io::stdout();
         let mut output = io::BufWriter::new(stdout.lock());
         if let Some(path) = get {
-            let id = engine::query::QueryEngine::find(&doc, &path, &|| false)?;
+            let request = engine::query::QueryRequest::new(path.clone());
+            let store = engine::query::QueryEngine::run(engine::query::stream::Input::Document(doc.clone()), &request, 0, &|| false, &mut |_| Ok(()))?;
+            let state = store.state();
+            if state.status != engine::results::Status::Completed { return Err(state.error); }
+            let id = match state.count {
+                0 => return Err(format!("Path not found: {path}")),
+                1 => doc.resolve(store.node(0, &|| false)?.reference)?,
+                _ => return Err("Path selected multiple nodes; use --query to retrieve all results".into()),
+            };
             doc.write_node(&mut output, id)
                 .map_err(|e| e.to_string())?;
             writeln!(output).map_err(|e| e.to_string())?;
         } else if let Some(expression) = query {
             let request = engine::query::QueryRequest::new(expression);
-            let ids = engine::query::QueryEngine::execute(&doc, &request, &|| false)?;
-            doc.write_results(&mut output, &ids)
+            let store = engine::query::QueryEngine::run(engine::query::stream::Input::Document(doc.clone()), &request, 0, &|| false, &mut |_| Ok(()))?;
+            let state = store.state();
+            if state.status != engine::results::Status::Completed { return Err(state.error); }
+            export::Selection::Stored { store, prefix: None }.write(&doc, &mut output)
                 .map_err(|e| e.to_string())?;
             writeln!(output).map_err(|e| e.to_string())?;
         } else if let Some(term) = search {

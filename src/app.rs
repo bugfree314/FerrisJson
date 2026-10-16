@@ -29,6 +29,8 @@ const DEMO: &str = include_str!("../examples/sample.json");
 type LoadResult = Result<(Document, String, Option<PathBuf>), String>;
 struct PathResults {
     expression: String,
+    store: Option<crate::engine::results::ResultStore>,
+    start: u64,
     ids: Arc<NodeIds>,
     preview: String,
     error: Option<String>,
@@ -749,6 +751,7 @@ impl Viewer {
             return;
         };
         self.pending_expression = self.query.clone();
+        self.path_results = None;
         if let Some(worker) = &mut self.path_worker {
             if let Err(error) = worker.submit(Arc::clone(doc), QueryRequest::new(self.query.clone()))
             {
@@ -769,6 +772,8 @@ impl Viewer {
             Ok((ids, preview)) => {
                 let first = ids.first().copied();
                 self.path_results = Some(PathResults {
+                    store: None,
+                    start: 0,
                     expression: self.pending_expression.clone(),
                     preview,
                     ids: Arc::new(ids),
@@ -780,6 +785,8 @@ impl Viewer {
             }
             Err(error) => {
                 self.path_results = Some(PathResults {
+                    store: None,
+                    start: 0,
                     expression: self.pending_expression.clone(),
                     ids: Arc::new(NodeIds::default()),
                     preview: String::new(),
@@ -802,12 +809,29 @@ impl Viewer {
             if let Some(elapsed) = update.elapsed { self.search_duration = Some(elapsed); }
             self.search_error = update.error;
         }
-        if let Some(completed) = self.path_worker.as_mut().and_then(QueryWorker::poll) {
-            let result = completed.result.map(|output| {
-                self.pending_expression = output.expression;
-                (output.ids, output.preview)
+        if let Some(update) = self.path_worker.as_mut().and_then(QueryWorker::poll) {
+            self.pending_expression = update.expression.clone();
+            let results = self.path_results.get_or_insert_with(|| PathResults {
+                expression: update.expression.clone(), store: None, start: 0,
+                ids: Arc::new(NodeIds::default()), preview: String::new(), error: None,
             });
-            self.finish_path(result, completed.elapsed);
+            results.expression = update.expression;
+            results.store = update.store;
+            results.error = update.error;
+            if results.start != update.start { results.ids = Arc::new(NodeIds::default()); results.preview.clear(); }
+            results.start = update.start;
+            if let Some(page) = update.page { results.expression = page.expression; results.ids = Arc::new(page.ids); results.preview = page.preview; }
+            if let Some(id) = update.first { self.reveal(id); }
+            if let Some(elapsed) = update.elapsed { self.path_duration = Some(elapsed); }
+            if let Some(clipboard) = update.clipboard {
+                match clipboard.result {
+                    Ok(text) => { ctx.copy_text(text); self.notice = "Query results copied".into(); }
+                    Err(CopyError::TooLarge) => if let Some(doc) = &self.doc {
+                        self.large_copy = Some(CopyRequest { doc: doc.clone(), selection: clipboard.selection });
+                    },
+                    Err(CopyError::Serialization(error)) => self.error = Some(error),
+                }
+            }
         }
         if self.search_due.is_some()
             || self.search_worker.as_ref().is_some_and(|w| w.busy)
@@ -964,7 +988,7 @@ impl Viewer {
                 Cancellation::Flag(Arc::clone(&cancelled)),
                 || {
                     export::atomic_write_with_budget(&path, &cancelled, doc.budget(), |writer| {
-                        selection.write(&doc, writer)
+                        selection.write_cancellable(&doc, writer, &|| cancelled.load(Ordering::Relaxed))
                     })
                 },
             )
@@ -1208,65 +1232,69 @@ impl Viewer {
         );
     }
     fn results_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        use crate::engine::results::Status;
         ui.horizontal_wrapped(|ui| {
             ui.heading("JSONPath results");
-            if ui
-                .checkbox(&mut self.colors.wrap_results, "Wrap")
-                .on_hover_text("Automatically wrap query results")
-                .changed()
-            {
-                self.save_colors();
-            }
+            if ui.checkbox(&mut self.colors.wrap_results, "Wrap").on_hover_text("Automatically wrap long query values").changed() { self.save_colors(); }
         });
         let Some(results) = &self.path_results else {
-            ui.add_space(12.0);
             ui.label("Run a JSONPath query to explore matching values.");
-            ui.monospace("$.users[*].name");
-            ui.monospace("$..email");
-            return;
+            ui.monospace("$.users[*].name"); ui.monospace("$..email"); return;
         };
-        ui.add(egui::Label::new(RichText::new(&results.expression).monospace()).truncate())
-            .on_hover_text(&results.expression);
-        let mut copy = false;
-        let mut export = false;
-        let mut reset = false;
+        ui.add(egui::Label::new(RichText::new(&results.expression).monospace()).truncate()).on_hover_text(&results.expression);
+        let state = results.store.as_ref().map(|store| store.state());
+        let count = state.as_ref().map_or(results.ids.len() as u64, |s| s.count);
+        let completed = state.as_ref().map_or(results.error.is_none() && !self.path_worker.as_ref().is_some_and(|w| w.busy), |s| s.status == Status::Completed);
+        let scanning = state.as_ref().is_some_and(|s| s.status == Status::Scanning)
+            || (results.store.is_none() && self.path_worker.as_ref().is_some_and(|w| w.busy));
+        let (mut copy, mut export, mut target, mut reset, mut cancel) = (None, None, None, false, false);
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{} matches", results.ids.len()));
-            ui.add_enabled_ui(results.error.is_none(), |ui| {
-                copy = ui.button("Copy").clicked();
-                export = ui.button("Export").clicked();
-            });
+            ui.label(if completed { format!("{count} matches") } else { format!("at least {count} matches") });
+            if scanning { ui.spinner(); }
+            if ui.add_enabled(completed, egui::Button::new("Copy all")).clicked() { copy = Some(false); }
+            if ui.add_enabled(completed, egui::Button::new("Export all")).clicked() { export = Some(false); }
+            if results.store.is_some() && !completed {
+                if ui.add_enabled(count > 0, egui::Button::new("Copy partial")).clicked() { copy = Some(true); }
+                if ui.add_enabled(count > 0, egui::Button::new("Export partial")).clicked() { export = Some(true); }
+            }
+            if scanning { cancel = ui.button("Cancel query").clicked(); }
             reset = ui.button("Clear").clicked();
         });
-        ui.separator();
-        if let Some(error) = &results.error {
-            ui.colored_label(Color32::LIGHT_RED, error);
-        } else {
-            json_preview(
-                ui,
-                &results.preview,
-                self.colors.active(),
-                "path_results",
-                self.colors.wrap_results,
-                self.search_highlight.as_ref(),
-            );
+        if results.store.is_some() {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(results.start > 0, egui::Button::new("Previous page")).clicked() { target = Some(results.start.saturating_sub(crate::query_stream_worker::PAGE)); }
+                ui.label(if results.ids.is_empty() { "Loading / empty page".into() }
+                    else { format!("{}–{}", results.start + 1, results.start + results.ids.len() as u64) });
+                let next = results.start.saturating_add(crate::query_stream_worker::PAGE);
+                if ui.add_enabled(next < count || (scanning && results.ids.len() as u64 == crate::query_stream_worker::PAGE), egui::Button::new("Next page")).clicked() { target = Some(next); }
+            });
         }
-        if copy || export {
-            let doc = Arc::clone(self.doc.as_ref().unwrap());
-            let selection = Selection::Results(Arc::clone(&results.ids));
-            if copy {
-                self.copy_selection(doc, selection, ctx);
-            } else {
-                self.export_selection(doc, selection);
-            }
+        if let Some(error) = &results.error { ui.colored_label(Color32::LIGHT_RED, error); }
+        if !results.preview.is_empty() {
+            json_preview(ui, &results.preview, self.colors.active(), "path_results", self.colors.wrap_results, self.search_highlight.as_ref());
         }
-        if reset {
-            self.path_results = None;
+        let selection = |partial: bool| match &results.store {
+            Some(store) => Selection::Stored { store: store.clone(), prefix: partial.then_some(count) },
+            None => Selection::Results(results.ids.clone()),
+        };
+        let copy = copy.map(|partial| selection(partial));
+        let export = export.map(|partial| (selection(partial), partial));
+        if let Some(selection) = copy {
             if let Some(worker) = &mut self.path_worker {
-                worker.cancel();
-            }
-            self.query.clear();
-            self.path_duration = None;
+                if let Err(error) = worker.copy(selection, Some(COPY_LIMIT)) { self.error = Some(error); }
+            } else if let Some(doc) = &self.doc { self.copy_selection(doc.clone(), selection, ctx); }
+        }
+        if let Some((selection, partial)) = export {
+            if self.pending_export.is_some() { self.notice = "An export is already in progress".into(); }
+            else if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"])
+                .set_file_name(if partial { "query-partial.json" } else { "query-results.json" }).save_file()
+            { if let Some(doc) = &self.doc { self.start_export(path, doc.clone(), selection); } }
+        }
+        if let Some(start) = target && let Some(worker) = &mut self.path_worker { worker.page(start); }
+        if cancel && let Some(worker) = &mut self.path_worker { worker.cancel_scan(); }
+        if reset {
+            if let Some(worker) = &mut self.path_worker { worker.cancel(); }
+            self.path_results = None; self.query.clear(); self.path_duration = None;
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
@@ -1839,12 +1867,17 @@ impl Viewer {
             if action != 0 {
                 let request = self.large_copy.take().unwrap();
                 match action {
-                    1 => match request.selection.json(&request.doc, None) {
-                        Ok(json) => {
-                            ctx.copy_text(json);
-                            self.notice = "JSON copied".into();
+                    1 => {
+                        if matches!(&request.selection, Selection::Stored { .. }) {
+                            if let Some(worker) = &mut self.path_worker {
+                                if let Err(error) = worker.copy(request.selection, None) { self.error = Some(error); }
+                            }
+                        } else {
+                            match request.selection.json(&request.doc, None) {
+                                Ok(json) => { ctx.copy_text(json); self.notice = "JSON copied".into(); }
+                                Err(error) => self.error = Some(format!("Cannot copy: {error:?}")),
+                            }
                         }
-                        Err(error) => self.error = Some(format!("Cannot copy: {error:?}")),
                     },
                     2 => self.export_selection(request.doc, request.selection),
                     _ => (),

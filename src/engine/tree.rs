@@ -128,6 +128,18 @@ fn kind_name(n: u64) -> Result<&'static str, String> {
     }
 }
 pub trait Provider: Send {
+    fn next_child(&mut self, parent: TreeNode, ordinal: u64, _previous: Option<TreeNode>, cancel: &dyn Fn() -> bool) -> Result<TreeNode, String> {
+        self.child(parent, ordinal, cancel)
+    }
+    fn named_child(&mut self, parent: TreeNode, name: &str, cancel: &dyn Fn() -> bool) -> Result<Option<(u64, TreeNode)>, String> {
+        if parent.kind != "object" { return Ok(None); }
+        for ordinal in 0..parent.children {
+            check(cancel)?;
+            let (key, truncated) = self.key(parent, ordinal, name.len().saturating_add(4), cancel)?;
+            if !truncated && key == name { return Ok(Some((ordinal, self.child(parent, ordinal, cancel)?))); }
+        }
+        Ok(None)
+    }
     fn search_input(&self) -> Result<super::search::Input, String> {
         Err("Search unavailable for this provider".into())
     }
@@ -263,6 +275,35 @@ impl LegacyProvider {
     }
 }
 impl Provider for LegacyProvider {
+    fn next_child(&mut self, parent: TreeNode, ordinal: u64, previous: Option<TreeNode>, cancel: &dyn Fn() -> bool) -> Result<TreeNode, String> {
+        check(cancel)?;
+        let parent_id = self.id(parent)?;
+        if parent.kind == "object" {
+            if ordinal >= parent.children { return Err("Child out of range".into()); }
+            let id = match previous {
+                Some(previous) => {
+                    let info = self.0.node_info(self.id(previous)?);
+                    if ordinal == 0 || info.parent() != Some(parent_id) { return Err("Previous child belongs to another cursor".into()); }
+                    info.end()
+                }
+                None if ordinal == 0 => parent_id + 1,
+                None => return self.child(parent, ordinal, cancel),
+            };
+            if id >= self.0.node_info(parent_id).end() { return Err("Child out of range".into()); }
+            return Ok(self.node(id));
+        }
+        self.child(parent, ordinal, cancel)
+    }
+    fn named_child(&mut self, parent: TreeNode, name: &str, cancel: &dyn Fn() -> bool) -> Result<Option<(u64, TreeNode)>, String> {
+        check(cancel)?;
+        let parent_id = self.id(parent)?;
+        let Some(id) = self.0.child_name(parent_id, name) else { return Ok(None); };
+        for (ordinal, child) in self.0.direct_children(parent_id).enumerate() {
+            check(cancel)?;
+            if child == id { return Ok(Some((ordinal as u64, self.node(id)))); }
+        }
+        Err("Object child has no ordinal".into())
+    }
     fn search_input(&self) -> Result<super::search::Input, String> {
         Ok(super::search::Input::Legacy(self.0.clone()))
     }
@@ -288,7 +329,11 @@ impl Provider for LegacyProvider {
         cancel: &dyn Fn() -> bool,
     ) -> Result<TreeNode, String> {
         check(cancel)?;
-        self.id(parent)?;
+        let id = self.id(parent)?;
+        if parent.kind == "array" {
+            let ordinal = usize::try_from(ordinal).map_err(|_| "Child ordinal overflow")?;
+            return self.0.child_index(id, ordinal).map(|child| self.node(child)).ok_or_else(|| "Child out of range".into());
+        }
         let page = self.0.children_page(parent.reference, ordinal, 1)?;
         let n = page.children.first().ok_or("Child out of range")?;
         Ok(self.node(n.reference.address as usize))
@@ -427,6 +472,14 @@ impl SparseProvider {
     }
 }
 impl Provider for SparseProvider {
+    fn named_child(&mut self, parent: TreeNode, name: &str, cancel: &dyn Fn() -> bool) -> Result<Option<(u64, TreeNode)>, String> {
+        if parent.kind != "object" { return Ok(None); }
+        let native = self.native(parent)?;
+        match self.index.field_entry(native, name, cancel)? {
+            Some((ordinal, node)) => Ok(Some((ordinal, self.node(node, cancel)?))),
+            None => Ok(None),
+        }
+    }
     fn search_input(&self) -> Result<super::search::Input, String> {
         Ok(super::search::Input::Sparse(Box::new(
             self.index.read_view()?,

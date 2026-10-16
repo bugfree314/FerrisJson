@@ -15,8 +15,10 @@ fn number(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<usize, 
 }
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let path = PathBuf::from(args.next().ok_or("Usage: sparse_index FILE [--pointer /path] [--memory-mib N] [--disk-mib N] [--expect-count N] [--check-array] [--raw] [--cache-dir DIR] [--events] [--stop-after-page | --crash-after-page]")?);
+    let path = PathBuf::from(args.next().ok_or("Usage: sparse_index FILE [--pointer /path | --query JSONPath] [--memory-mib N] [--disk-mib N] [--expect-count N] [--check-array] [--raw] [--cache-dir DIR] [--events] [--stop-after-page | --crash-after-page]")?);
     let mut pointer = String::new();
+    let mut pointer_set = false;
+    let mut query = None;
     let mut memory = 8usize;
     let mut disk = 4096usize;
     let mut expect = None;
@@ -28,7 +30,9 @@ fn run() -> Result<(), String> {
     let mut crash_after_page = false;
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--query" => query = Some(args.next().ok_or("Missing JSONPath expression")?),
             "--pointer" => {
+                pointer_set = true;
                 pointer = args.next().ok_or("Missing pointer")?;
                 if pointer.len() > 16 * 1024 {
                     return Err("Pointer exceeds 16 KiB".into());
@@ -47,6 +51,9 @@ fn run() -> Result<(), String> {
             "--crash-after-page" => crash_after_page = true,
             _ => return Err(format!("Unknown option: {flag}")),
         }
+    }
+    if query.is_some() && (pointer_set || expect.is_some() || check_array || raw || events || stop_after_page || crash_after_page) {
+        return Err("--query cannot combine with pointer/probe/raw/event/stop/crash options".into());
     }
     let budget = BudgetManager::new(Limits {
         memory: memory
@@ -98,6 +105,25 @@ fn run() -> Result<(), String> {
     } else {
         SparseIndex::open(&path, budget.clone(), &|| false)?
     };
+    if let Some(expression) = query {
+        use FerrisJson::engine::{query::{QueryEngine, QueryRequest, stream::Input}, results::Status, tree::{Provider, SparseProvider}};
+        let mut output = SparseProvider::new(index.read_view()?)?;
+        let store = QueryEngine::run(Input::Sparse(Box::new(index)), &QueryRequest::new(expression), 0, &|| false, &mut |_| Ok(()))?;
+        let state = store.state();
+        if state.status != Status::Completed { return Err(state.error); }
+        let mut cursor = store.cursor(None)?;
+        let stdout = io::stdout();
+        let mut writer = io::BufWriter::new(stdout.lock());
+        writer.write_all(b"[").map_err(|e| e.to_string())?;
+        let mut first = true;
+        while let Some(node) = cursor.next_node(&|| false)? {
+            if !first { writer.write_all(b",").map_err(|e| e.to_string())?; } first = false;
+            output.output(node, &|| false)?.write(&mut writer, &|| false).map_err(|e| e.to_string())?;
+        }
+        writer.write_all(b"]\n").map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     let selected = index.pointer(&pointer, &|| false)?;
     if expect.is_some_and(|count| count != selected.child_count()) {
         return Err("Unexpected child count".into());

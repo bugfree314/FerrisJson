@@ -990,7 +990,7 @@ impl Viewer {
                     "[ / ]: history; yy / Ctrl+C: copy JSON; yp / Ctrl+P: copy path",
                     ".: focus Path (JSON Pointer, e.g. /items/0)",
                     "F5: reload; F1: help; Esc: cancel pending jump and key sequence",
-                    "Search: / ? or Ctrl+F; n / N with counts; general JSONPath is pending S7.",
+                    "Search: / ? or Ctrl+F; n / N with counts. JSONPath is available through the CLI; this paged view has no query panel.",
                     "During validation, only committed content is browsable; complete output waits for Ready.",
                 ] { ui.label(line); }
             });

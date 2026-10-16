@@ -2,7 +2,7 @@
 pub mod output;
 use super::budget::{BudgetManager, Reservation, Resource};
 use crate::engine::{
-    session::SessionId,
+    session::{SessionId, NodeRef},
     tree::{Edge, Location, TreeNode},
 };
 use std::{
@@ -65,6 +65,8 @@ pub struct ResultWriter {
     written: [u64; 2],
     counts: [u64; 2],
     finished: bool,
+    selection_path: Vec<(NodeRef, u64, u64)>,
+    _selection_lease: Reservation,
     _lease: Reservation,
 }
 
@@ -83,6 +85,12 @@ pub struct ResultCursor {
 }
 
 impl ResultCursor {
+    pub fn next_node(&mut self, cancel: &dyn Fn() -> bool) -> Result<Option<TreeNode>, String> {
+        if cancel() { return Err("Result cursor cancelled".into()); }
+        if self.next == self.end { return Ok(None); }
+        let node = self.store.node(self.next, cancel)?;
+        self.next += 1; Ok(Some(node))
+    }
     pub fn next(&mut self, cancel: &dyn Fn() -> bool) -> Result<Option<Location>, String> {
         if cancel() {
             return Err("Result cursor cancelled".into());
@@ -231,12 +239,15 @@ impl ResultStore {
             write_at(store.0.files[i].as_ref().unwrap(), 0, &h, &|| false)?;
         }
         let lease = budget.reserve(Resource::Memory, 2 * 64 * 1024, "result append buffers")?;
+        let selection_lease = budget.reserve(Resource::Memory, 128 * std::mem::size_of::<(NodeRef, u64, u64)>(), "result selection prefix cache")?;
         let writer = ResultWriter {
             store: store.clone(),
             buffers: [Vec::with_capacity(64 * 1024), Vec::with_capacity(64 * 1024)],
             written: [HEADER, HEADER],
             counts: [0, 0],
             finished: false,
+            selection_path: Vec::with_capacity(128),
+            _selection_lease: selection_lease,
             _lease: lease,
         };
         Ok((store, writer))
@@ -408,10 +419,17 @@ impl ResultWriter {
         }
         let mut parent = NONE;
         let mut ordinal = 0;
-        for edge in &location.ancestors {
-            parent = self.ancestor(edge.parent, parent, ordinal, cancel)?;
+        for (depth, edge) in location.ancestors.iter().enumerate() {
+            parent = if let Some((reference, incoming, link)) = self.selection_path.get(depth)
+                && *reference == edge.parent.reference && *incoming == ordinal
+            { *link } else {
+                self.selection_path.truncate(depth);
+                let link = self.ancestor(edge.parent, parent, ordinal, cancel)?;
+                self.selection_path.push((edge.parent.reference, ordinal, link)); link
+            };
             ordinal = edge.ordinal;
         }
+        self.selection_path.truncate(location.ancestors.len());
         self.hit(location.node, parent, ordinal, cancel)
     }
     pub fn count(&self) -> u64 {

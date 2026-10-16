@@ -1,7 +1,7 @@
 //! Independent JSONPath task lane; semantics and requests live in engine::query.
 use crate::{
     document::{Document, NodeIds},
-    task_worker::{TaskWorker, Work},
+    task_worker::Work,
 };
 
 pub use crate::engine::query::QueryRequest;
@@ -13,8 +13,10 @@ pub struct QueryOutput {
     pub preview: String,
 }
 
-pub type QueryWorker = TaskWorker<QueryRequest>;
+pub use crate::query_stream_worker::QueryWorker;
 
+// Collected compatibility lane for existing internal callers; the GUI uses the
+// streamed worker above. Do not use this adapter to claim bounded query results.
 impl Work for QueryRequest {
     type Output = QueryOutput;
 

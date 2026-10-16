@@ -2,6 +2,9 @@
 mod adapters;
 mod plan;
 mod request;
+mod syntax;
+mod predicate;
+pub mod stream;
 
 pub use plan::CompiledQuery;
 pub use request::QueryRequest;
@@ -20,6 +23,7 @@ pub enum Backend {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Support {
     Supported,
+    ScalarSubset,
     /// Only the functions and grammar actually provided by serde_json_path.
     LibraryDefined,
     Unsupported,
@@ -43,6 +47,8 @@ pub struct Capabilities {
 }
 
 impl Backend {
+    /// Streaming API capabilities; Memory reports its worst-case library fallback.
+    /// The older NodeIds compatibility entry points retain their D-stage contract.
     pub fn capabilities(self) -> Capabilities {
         match self {
             Self::Memory => Capabilities {
@@ -56,18 +62,18 @@ impl Backend {
             Self::Indexed => Capabilities {
                 pointer: Support::Supported,
                 selectors: Support::Supported,
-                filters: Support::Unsupported,
+                filters: Support::ScalarSubset,
                 functions: Support::Unsupported,
                 cancellation: Cancellation::DuringTraversal,
-                incremental_results: false,
+                incremental_results: true,
             },
             Self::Sparse => Capabilities {
                 pointer: Support::Supported,
-                selectors: Support::Unsupported,
-                filters: Support::Unsupported,
+                selectors: Support::Supported,
+                filters: Support::ScalarSubset,
                 functions: Support::Unsupported,
                 cancellation: Cancellation::DuringTraversal,
-                incremental_results: false,
+                incremental_results: true,
             },
         }
     }
@@ -76,6 +82,9 @@ impl Backend {
 pub struct QueryEngine;
 
 impl QueryEngine {
+    pub fn run(input: stream::Input, request: &QueryRequest, generation: u64, cancelled: &dyn Fn() -> bool, notify: &mut dyn FnMut(stream::Event) -> Result<(), String>) -> Result<crate::engine::results::ResultStore, String> {
+        stream::run(input, request, generation, cancelled, notify)
+    }
     pub fn execute(doc: &Document, request: &QueryRequest, cancelled: &dyn Fn() -> bool) -> Result<NodeIds, String> {
         Self::document(doc, &request.expression, cancelled)
     }

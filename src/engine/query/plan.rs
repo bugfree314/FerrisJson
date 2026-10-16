@@ -13,7 +13,7 @@ enum Body {
 
 /// A compiled compatibility query bound to its source session and backend.
 /// Library AST allocations and the legacy Indexed parser are not fully ledgered.
-/// This is an execution boundary, not the streaming executor planned for E.
+/// This collected compatibility API is separate from QueryEngine::run.
 pub struct CompiledQuery {
     normalized: String,
     body: Body,

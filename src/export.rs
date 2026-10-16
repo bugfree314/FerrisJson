@@ -16,6 +16,7 @@ pub const COPY_LIMIT: usize = 8 * 1024 * 1024;
 pub enum Selection {
     Node(usize),
     Results(Arc<NodeIds>),
+    Stored { store: crate::engine::results::ResultStore, prefix: Option<u64> },
 }
 #[derive(Debug, PartialEq)]
 pub enum CopyError {
@@ -24,20 +25,42 @@ pub enum CopyError {
 }
 impl Selection {
     pub fn write(&self, doc: &Document, writer: impl Write) -> serde_json::Result<()> {
+        self.write_cancellable(doc, writer, &|| false)
+    }
+    pub fn write_cancellable(&self, doc: &Document, mut writer: impl Write, cancel: &dyn Fn() -> bool) -> serde_json::Result<()> {
         match self {
             Self::Node(id) => doc.write_node(writer, *id),
             Self::Results(ids) => doc.write_results(writer, ids),
+            Self::Stored { store, prefix } => {
+                let io = |error: String| serde_json::Error::io(io::Error::other(error));
+                if store.session() != doc.session_id() { return Err(io("Results belong to another document".into())); }
+                let mut cursor = store.cursor(*prefix).map_err(io)?;
+                writer.write_all(b"[").map_err(serde_json::Error::io)?;
+                let mut first = true;
+                while let Some(node) = cursor.next_node(cancel).map_err(io)? {
+                    if !first { writer.write_all(b",").map_err(serde_json::Error::io)?; }
+                    first = false;
+                    let id = doc.resolve(node.reference).map_err(io)?;
+                    doc.write_node(&mut writer, id)?;
+                }
+                writer.write_all(b"]").map_err(serde_json::Error::io)
+            }
         }
     }
     pub fn json(&self, doc: &Document, limit: Option<usize>) -> Result<String, CopyError> {
-        struct Buffer {
+        self.json_cancellable(doc, limit, &|| false)
+    }
+    pub fn json_cancellable(&self, doc: &Document, limit: Option<usize>, cancel: &dyn Fn() -> bool) -> Result<String, CopyError> {
+        struct Buffer<'a> {
             bytes: Vec<u8>,
             limit: usize,
             exceeded: bool,
             reservation: Reservation,
+            cancel: &'a dyn Fn() -> bool,
         }
-        impl Write for Buffer {
+        impl Write for Buffer<'_> {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if (self.cancel)() { return Err(io::Error::other("Copy cancelled")); }
                 let needed = self.bytes.len().saturating_add(bytes.len());
                 if needed > self.limit {
                     self.exceeded = true;
@@ -66,8 +89,9 @@ impl Selection {
                 .budget()
                 .reserve(Resource::Memory, 0, "clipboard serialization")
                 .map_err(CopyError::Serialization)?,
+            cancel,
         };
-        if let Err(error) = self.write(doc, &mut buffer) {
+        if let Err(error) = self.write_cancellable(doc, &mut buffer, cancel) {
             return Err(if buffer.exceeded {
                 CopyError::TooLarge
             } else {
