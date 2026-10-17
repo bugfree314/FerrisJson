@@ -1,0 +1,3 @@
+[alias]
+tui = ["build", "--release", "--locked", "--no-default-features", "--features", "tui", "--bin", "FerrisJson"]
+tui-pack = ["run", "--release", "--locked", "--no-default-features", "--features", "tui", "--example", "package"]

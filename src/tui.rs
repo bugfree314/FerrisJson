@@ -1,4 +1,4 @@
-//! Linux terminal frontend. All file, tree, search, query and output work stays
+//! Unix terminal frontend (Linux by default, macOS with the tui feature). All file, tree, search, query and output work stays
 //! on the existing bounded worker lanes; the UI only holds presentation pages.
 use crate::{
     document::SearchScope,
@@ -46,9 +46,9 @@ impl Drop for TerminalGuard {
 
 pub fn run(file: Option<PathBuf>, text: Option<String>, indexed: bool, sparse: bool,
     cache_dir: Option<PathBuf>) -> Result<(), String> {
-    let output = tty().map_err(|_| "Linux TUI requires an interactive terminal (/dev/tty); use --get, --query, --search or --pretty for noninteractive output".to_string())?;
+    let output = tty().map_err(|_| "TUI requires an interactive terminal (/dev/tty); use --get, --query, --search or --pretty for noninteractive output".to_string())?;
     if !output.is_terminal() || std::env::var("TERM").is_ok_and(|v| v == "dumb") {
-        return Err("Linux TUI requires an ANSI terminal; use CLI output options in this environment".into());
+        return Err("TUI requires an ANSI terminal; use CLI output options in this environment".into());
     }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| { restore_terminal(); previous(info); }));
@@ -985,7 +985,7 @@ fn copy_terminal(output: &mut impl Write, text: &str) -> Result<(), String> {
     write!(output, "\x1b]52;c;{encoded}\x07").and_then(|()| output.flush()).map_err(|e| e.to_string())
 }
 
-const HELP: &str = "FerrisJson Linux TUI - keyboard and mouse\n\n\
+const HELP: &str = "FerrisJson TUI (Linux / macOS) - keyboard and mouse\n\n\
 Tab / Shift+Tab: cycle Tree, Preview, Search, JSONPath. Alt+1/2/3/4: choose a pane.\n\
 Click a pane/tab to focus. Mouse wheel scrolls under the pointer. F9: maximize/restore focused pane.\n\
 Wide: tree + search on the left, preview + JSONPath on the right. Medium: tree + chosen detail pane. Small: one pane.\n\n\

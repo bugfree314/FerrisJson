@@ -8,6 +8,13 @@
 
 ## tui 分支：Linux TUI（2026-10-17）
 
+- [x] 当前工作区：项目 Cargo alias `cargo tui`／`cargo tui-pack`，分别展开纯 TUI Release 编译／打包参数，不修改全局配置。
+- [ ] alias 尚未实际执行；未构建、测试或提交，版本保持 0.7.9+3。
+
+- [x] 当前工作区：新增 macOS 可选 `tui` feature，推荐 `--no-default-features --features tui`；默认 macOS／Windows GUI 与 Linux 自动 TUI 保留，打包内部构建传递 feature 并输出终端可执行文件。
+- [x] 静态核对目标条件和离线锁定 metadata：macOS GUI／纯 TUI 的根依赖分别隔离；Linux 关闭默认 feature 仍有终端依赖。Cargo.lock 和依赖版本未变。
+- [ ] Linux 默认 feature 完整 metadata 因本地源码缓存缺项未完成；未运行构建、check、测试、Clippy、格式检查、打包或程序。Mac TUI 及默认 GUI／Linux／Windows 实机验收待用户；版本仍为 0.7.9+3，未提交。
+
 - [x] 当前工作区：TUI 单节点定位标题及多节点提示改为 F2／`:` 查询、Alt+4 查看结果，只映射终端显示，不改变 CLI／GUI 或自动执行查询。
 - [ ] 本项未构建／测试、未提交；用户验收多节点错误提示、F2 查询及 Alt+4 结果显示。
 

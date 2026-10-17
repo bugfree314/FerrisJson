@@ -2,6 +2,10 @@
 
 当前版本：**0.7.9+3**。
 
+当前工作区新增 macOS 可选 TUI：使用 `--no-default-features --features tui` 编译终端版；macOS 默认 GUI、Windows 默认 GUI、Linux 默认 TUI 保持原选择。仅检查依赖元数据，未运行构建／测试，尚未提交。
+
+项目内短命令：`cargo tui` 编译 Release 终端版，`cargo tui-pack` 编译并打包终端版；对应参数保存在 `.cargo/config.toml`，不修改全局 Cargo 配置。本轮未执行这些命令，未构建／测试、未提交。
+
 tui 分支改动：新增 Linux 纯终端 TUI，按目标系统自动选择；Windows/macOS 保留 GUI。包含树／预览、搜索、JSONPath、结果分页、取消与导出，并扩展 Linux 自动编译打包。按用户明确要求提交到 `tui` 分支，未运行测试、构建或实机验收，版本号保持 0.7.9+3；详见 [Linux TUI 说明](docs/linux-tui.md)。
 
 此前警告清理已收录于 `b913ba6`：针对用户 Release 日志中的 7 条未使用项警告，收窄桌面专用接口的编译范围，处理终端不使用的剪贴板传输，并显示查询耗时。未复跑构建或测试，警告清理结果仍待用户确认。
@@ -134,6 +138,17 @@ Windows 构建后启动：
 图标可通过 SVG 源文件继续编辑，再导出 PNG 和多尺寸 ICO。正常构建直接使用仓库中的图标文件。
 
 ### 自动编译与打包（Windows / macOS / Linux）
+
+macOS 若要终端版，可直接编译或使用同一打包入口；`--no-default-features` 排除 GUI 依赖，`--features tui` 选择 TUI：
+
+```sh
+cargo build --release --locked --no-default-features --features tui --bin FerrisJson
+./target/release/FerrisJson /path/to/data.json
+# 可选：编译并复制终端程序、README 和 LICENSE 到 bundle
+cargo run --release --locked --no-default-features --features tui --example package
+```
+
+macOS TUI 的 bundle 产物为 `target/release/bundle/FerrisJson`，不生成 `.app`。省略这些参数仍按原流程生成 GUI／`.app`；TUI 快捷键使用 Ctrl 和 Vim 键，终端无法把 macOS GUI 的 ⌘ 快捷键直接当作应用按键。以下默认命令及上述新命令本轮均未执行编译，等待用户验收。
 
 在项目目录执行同一个命令，程序会自动识别当前系统和 Rust 工具链架构，编译 Release 版本并打包：
 

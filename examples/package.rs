@@ -39,6 +39,10 @@ fn package() -> Result<(), Box<dyn std::error::Error>> {
             "--target-dir",
         ])
         .arg(&target);
+    // Forward frontend selection to the nested build; otherwise macOS TUI
+    // packaging would accidentally rebuild the default desktop executable.
+    if !cfg!(feature = "desktop") { build.arg("--no-default-features"); }
+    if cfg!(feature = "tui") { build.args(["--features", "tui"]); }
     // Explicitly use the host target, even if a Cargo config specifies a default target.
     let host = host_target()?;
     build.args(["--target", &host]);
@@ -50,10 +54,10 @@ fn package() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "windows")]
     package_windows(&root, &binary_dir, &output)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "tui")))]
     package_macos(&root, &binary_dir, &output)?;
-    #[cfg(target_os = "linux")]
-    package_linux(&root, &binary_dir, &output)?;
+    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+    package_terminal(&root, &binary_dir, &output)?;
     Ok(())
 }
 
@@ -99,7 +103,7 @@ fn package_windows(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "tui")))]
 fn package_macos(
     root: &Path,
     binary_dir: &Path,
@@ -167,8 +171,8 @@ fn package_macos(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn package_linux(
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+fn package_terminal(
     root: &Path,
     binary_dir: &Path,
     output: &Path,
@@ -178,6 +182,6 @@ fn package_linux(
     fs::copy(binary_dir.join("FerrisJson"), &executable)?;
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
     distribution_files(root, output)?;
-    println!("Linux TUI executable: {}", executable.display());
+    println!("TUI executable: {}", executable.display());
     Ok(())
 }

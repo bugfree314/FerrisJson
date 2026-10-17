@@ -1,6 +1,26 @@
-# Linux TUI 接入记录
+# FerrisJson TUI 接入记录（Linux / macOS）
 
 2026-10-17，基于 0.7.9+3，按用户明确要求提交到 `tui` 分支；版本号保持不变，功能与跨平台验收仍待用户执行。
+
+## 当前工作区：macOS 可选 TUI 编译
+
+项目内 `.cargo/config.toml` 提供两个 Cargo alias：`cargo tui` 等价于下方纯 TUI Release 编译命令，`cargo tui-pack` 等价于终端打包命令。需在项目目录（或其子目录）执行，不修改全局配置；alias 本轮仅写入并静态阅读，未运行构建或测试、未提交。
+
+增加 Cargo `desktop`（默认）和 `tui` feature。Linux 按目标自动使用终端界面；macOS 仅在启用 `tui` 时选择同一终端前端，默认 GUI 保留；Windows 维持默认 GUI，不支持 `tui` feature。TUI 的刷新适配、stdin、无固定内存配额、剪贴板和键盘／分页行为由两种 Unix 目标共用。
+
+以下命令由用户在 Mac 上执行，本轮未编译或运行：
+
+```sh
+cargo build --release --locked --no-default-features --features tui --bin FerrisJson
+./target/release/FerrisJson /path/to/data.json
+cargo run --release --locked --no-default-features --features tui --example package
+```
+
+直接编译产物为 `target/release/FerrisJson`，package 复制到 `target/release/bundle/FerrisJson` 并附带 README/LICENSE，权限 0755，不创建 `.app`。打包的内部 `cargo build` 同步传递 feature 选择，防止错误打成 GUI；只生成当前 Rust 主机架构。GUI 与 TUI 的可执行文件同名，需要同时保留时，直接 `cargo build` 可分别传入 `--target-dir target/macos-tui` 等目录；package 仍使用项目固定的 target/bundle 路径并更新同名产物。`--features tui` 单独使用也会选择 TUI，但推荐加 `--no-default-features` 排除默认 GUI 依赖。
+
+macOS TUI 使用 Ctrl／Vim 快捷键；⌘ 快捷键通常由终端应用处理。终端复制仍需 OSC 52 支持，无法承诺所有 Mac 终端均接受；stdin、路径与无终端 CLI 规则沿用现有实现。
+
+仅运行离线、锁定的 Cargo metadata 依赖解析：Apple Silicon macOS 默认模式根依赖含 eframe/rfd、不含终端库；macOS 纯 TUI 根依赖含 Ratatui/Crossterm 等、不含 eframe/rfd；Linux 关闭默认 feature 时仍有终端根依赖。Linux 开启默认 feature 的完整 metadata 因本地缺少 as-raw-xcb-connection 源码缓存而未完成，此结果不是编译失败或通过记录。不运行构建、check、测试、Clippy、格式检查、打包、TUI／GUI 或基准；Mac 编译、交互、信号／退出恢复与默认 GUI 回归待用户执行。依赖版本和 Cargo.lock 无变化，版本仍为 0.7.9+3，尚未提交。
 
 ## 当前工作区：快捷键、布局与分页一致性
 
@@ -62,7 +82,7 @@
 ## 平台与构建
 
 - Linux 目标默认编译 Ratatui/Crossterm TUI，不需要额外 feature，不编译 eframe、rfd、窗口或字体模块。
-- Windows/macOS 继续使用桌面入口、原 GUI 模块和原依赖配置；共享 worker 的桌面刷新通知仍为 `egui::Context`。
+- Windows/macOS 默认使用桌面入口和原 GUI 模块；macOS 可通过上述 feature 选择 TUI，纯 TUI 模式不启用 GUI 依赖，共享 worker 的桌面刷新通知仍为 `egui::Context`。
 - Linux 的 `terminal_wake::Context` 用原子标记通知刷新，TUI 每 50 ms 检查终端事件和后台消息。不复制搜索、查询、取消、会话隔离或输出引擎。
 - 共用 Cargo.lock；新增终端依赖，原有锁定包的名称和版本均保留。平台变化修改依赖位置和入口，不代表已有两系统通过回归。
 - 原 `package` 示例增加 Linux 分支，按主机 target 构建并复制可执行文件及 README/LICENSE，执行权限设为 0755。原 Windows/macOS 分支保留。

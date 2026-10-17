@@ -2,6 +2,10 @@
 
 ## tui 分支：Linux TUI（2026-10-17，基于 0.7.9+3）
 
+当前未提交命令简化：项目 `.cargo/config.toml` 增加 `cargo tui`／`cargo tui-pack`，等价于现有纯 TUI Release 编译／打包命令，不改变程序或资源策略。仅静态核对 alias 内容，未执行构建、测试或基准，无新增性能数据；版本保持 0.7.9+3。
+
+当前未提交 macOS TUI 开关：增加默认 desktop 与可选 tui feature，Mac 通过 `--no-default-features --features tui` 选择 Unix 终端前端并排除 GUI 依赖，默认两桌面平台 GUI／Linux TUI 保持原选择；打包传递相同参数，终端模式输出可执行文件。共用 TUI 资源与显示逻辑，不改搜索／查询算法，锁定依赖版本未变。仅静态阅读和 Cargo metadata：macOS GUI／纯 TUI 根依赖隔离及 Linux 无默认 feature 的终端依赖已解析；Linux 默认 feature 完整 metadata 缺本地源码缓存，未完成。未构建、测试、check、Clippy、格式检查、运行或测量，无性能／兼容性通过结论，仍为 0.7.9+3，S0 暂停。
+
 当前未提交提示修订：TUI 将单路径匹配多节点的旧 CLI 建议映射为 F2／`:` 查询和 Alt+4 查看结果，标题注明单节点；仅显示层变化，不修改引擎／CLI／GUI 契约或自动执行查询。未运行测试、构建或基准，无新增性能数据，版本保持 0.7.9+3。
 
 当前未提交 E0451 修复：用户编译日志指出 TUI 无法访问库 Clipboard 的预留字段，改用终端本地传输枚举持有原 Clipboard 或路径字符串及 Reservation，维持发送期间的资源记账生命周期，不改变库字段可见性。未运行构建、测试或基准，无新增性能数据；版本仍为 0.7.9+3。

@@ -5,9 +5,9 @@ use crate::engine::{
     query::{QueryEngine, QueryRequest, stream::{Event, Input}},
     results::{ResultStore, State},
 };
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 use eframe::egui;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
 use crate::terminal_wake as egui;
 use std::{sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, thread::JoinHandle, time::{Duration, Instant}};
 
