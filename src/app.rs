@@ -94,6 +94,7 @@ pub struct Viewer {
     paste: String,
     paste_recovery: Option<Receiver<String>>,
     help: bool,
+    jsonpath_help: bool,
     focus_search: bool,
     scroll_to: bool,
     detail: String,
@@ -197,6 +198,7 @@ impl Viewer {
             paste: String::new(),
             paste_recovery: None,
             help: false,
+            jsonpath_help: false,
             focus_search: false,
             scroll_to: false,
             detail: String::new(),
@@ -1051,6 +1053,11 @@ impl Viewer {
         self.rebuild_rows();
     }
     fn keyboard(&mut self, ctx: &egui::Context) {
+        if self.jsonpath_help {
+            if ctx.input(|i| i.key_pressed(Key::Escape)) { self.jsonpath_help = false; }
+            self.vim.cancel();
+            return;
+        }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.large_copy = None;
             self.help = false;
@@ -1530,6 +1537,10 @@ impl Viewer {
             }
             ui.horizontal(|ui| {
                 ui.label("JSONPath");
+                if ui.small_button("Cheatsheet").on_hover_text("常用 JSONPath 语法与示例").clicked() {
+                    self.vim.cancel();
+                    self.jsonpath_help = true;
+                }
                 if self.path_worker.as_ref().is_some_and(|w| w.busy) {
                     ui.spinner();
                 }
@@ -1881,7 +1892,8 @@ impl Viewer {
                 self.paste_open = false;
             }
         }
-        crate::ui::cheatsheet(ctx, &mut self.help, self.colors.active());
+        crate::ui::cheatsheet(ctx, &mut self.help, &mut self.jsonpath_help, self.colors.active());
+        crate::ui::jsonpath_cheatsheet(ctx, &mut self.jsonpath_help);
         let changed = crate::ui::color_editor(
             ctx,
             &mut self.colors_open,

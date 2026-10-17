@@ -202,7 +202,7 @@ pub fn json_preview_highlighted(ui: &mut egui::Ui, mut text: &str, palette: Pale
         );
     });
 }
-pub fn cheatsheet(ctx: &egui::Context, open: &mut bool, palette: Palette) {
+pub fn cheatsheet(ctx: &egui::Context, open: &mut bool, jsonpath_open: &mut bool, palette: Palette) {
     if !*open {
         return;
     }
@@ -228,7 +228,12 @@ pub fn cheatsheet(ctx: &egui::Context, open: &mut bool, palette: Palette) {
                         });
                     }); ui.add_space(8.0);
                 }
-                ui.label(RichText::new("JSONPath").strong());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("JSONPath").strong());
+                    if ui.small_button("Cheatsheet").on_hover_text("常用 JSONPath 语法与示例").clicked() {
+                        *jsonpath_open = true;
+                    }
+                });
                 ui.label("Press . outside text fields to focus JSONPath. The shortcut does not insert a dot.");
                 ui.monospace("$.users[*].name   $..email   $.users[?(@.active == true)]");
                 ui.label("Enter runs JSONPath in the default viewer; Run query / Enter in the paged tree. F4 / Shift+F4 jumps to the next / previous result and wraps around. The lower inspector keeps results; the upper always previews your selection. Drag the divider to resize.");
@@ -238,6 +243,76 @@ pub fn cheatsheet(ctx: &egui::Context, open: &mut bool, palette: Palette) {
             });
         });
 }
+pub fn jsonpath_cheatsheet(ctx: &egui::Context, open: &mut bool) {
+    if !*open { return; }
+    egui::Window::new("JSONPath cheatsheet")
+        .open(open).collapsible(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .default_width(700.0)
+        .max_width((ctx.content_rect().width() - 40.0).max(240.0))
+        .max_height((ctx.content_rect().height() - 60.0).max(180.0))
+        .show(ctx, |ui| {
+            ui.label("JSONPath 常用语法。点击 Copy 复制表达式，粘贴到 JSONPath 输入框后执行。Esc 关闭。示例假设根对象包含 users 数组。");
+            egui::ScrollArea::vertical().id_salt("jsonpath_syntax_scroll").show(ui, |ui| {
+                let groups: &[(&str, &[(&str, &str)])] = &[
+                    ("基础与字段", &[
+                        ("$", "根节点：选择整份 JSON。"),
+                        ("$.users", "选择根对象的 users 字段；多层字段可写 $.data.users。"),
+                        ("$['users']", "方括号字段访问，等价于 $.users。"),
+                        ("$['user.name']", "访问键名本身含点号的字段；空格、中文或特殊字符键也可用引号。"),
+                        ("$.*", "根对象的所有直接子节点。"),
+                        ("$..name", "递归查找任意深度的 name 字段。"),
+                    ]),
+                    ("数组、切片与多选", &[
+                        ("$.users[0]", "第一个用户；下标从 0 开始。"),
+                        ("$.users[-1]", "最后一个用户；负数从数组末尾计数。"),
+                        ("$.users[*]", "users 数组中的所有元素。"),
+                        ("$.users[*].name", "选取每个用户的 name 字段。"),
+                        ("$.users[0,2]", "按指定顺序选取下标 0、2；重复下标也会保留。"),
+                        ("$.users[0:10]", "前 10 项；切片格式为 [起点:终点:步长]，不包含终点。"),
+                        ("$.users[::2]", "从开头每隔一项选一项。"),
+                        ("$.users[::-1]", "按相反顺序选择数组元素。"),
+                        ("$.users[*]['name','age']", "选择每个用户的 name 和 age 节点；不会重组成对象或表格。"),
+                    ]),
+                    ("条件过滤：@ 表示当前候选元素", &[
+                        ("$.users[?(@.age >= 18)]", "筛选 age 至少为 18 的用户。"),
+                        ("$.users[?(@.name == '张三')]", "字符串相等；字符串必须用单引号或双引号包围。"),
+                        ("$.users[?(@.active == true)]", "布尔值为真；true、false、null 不加引号。"),
+                        ("$.users[?(@.email)]", "字段存在即可命中，即使值是 false 或 null。"),
+                        ("$.users[?(!@.email)]", "字段不存在；! 表示逻辑非。"),
+                        ("$.users[?(@.email == null)]", "字段值为 null；字段不存在与值为 null 有区别。"),
+                        ("$.users[?(@.active == true && @.age >= 18)].name", "&& 表示同时满足；过滤后可继续选取 name。"),
+                        ("$.users[?(@.age < 18 || @.age >= 60)]", "|| 表示任一满足；可加括号组合条件。"),
+                        ("$.users[?(@.age >= $.minimumAge)]", "$ 在过滤中仍表示根节点；与根对象的 minimumAge 比较。"),
+                        ("$.users[?(@.score > @.minimumScore)]", "比较同一元素中的两个字段。"),
+                    ]),
+                ];
+                for (title, rows) in groups {
+                    ui.add_space(8.0);
+                    ui.heading(*title);
+                    for (expression, explanation) in *rows {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(*expression).monospace());
+                                if ui.small_button("Copy").clicked() { ctx.copy_text((*expression).into()); }
+                            });
+                            ui.label(*explanation);
+                        });
+                    }
+                }
+                ui.add_space(8.0);
+                ui.heading("运算符与使用提示");
+                ui.monospace("==  !=  <  <=  >  >=     &&  ||  !");
+                ui.label("== 是比较，不能写成 =。字符串 '18' 与数字 18 不同；布尔 true 与字符串 'true' 也不同。JSONPath 区分字段名大小写。");
+                ui.label("Enter 执行默认界面的查询；分页树可用 Run query / Enter。F4 下一项、Shift+F4 上一项，首尾循环并自动定位。扫描中只遍历已发布的结果。查询选择节点，不提供 SQL 式 GROUP BY、排序或聚合。");
+                ui.heading("FerrisJson 当前支持范围");
+                ui.label("文件后端（Indexed / Sparse）支持上述选择器和标量过滤；过滤中的 @ / $ 操作数只能使用字段、数组下标组成的单节点路径。");
+                ui.label("文件后端暂不支持 length()、match() 等函数、数组或对象的深度比较，以及过滤操作数中的通配符 / 递归 / 多节点路径。内存模式的高级语法取决于原查询库，不保证所有模式通用。");
+                ui.label("结果保留顺序和重复选择；递归和通配符可能产生大量结果。文件后端需完成源文件验证后执行查询。");
+            });
+        });
+}
+
 pub fn color_editor(
     ctx: &egui::Context,
     open: &mut bool,

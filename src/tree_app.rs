@@ -123,6 +123,7 @@ pub struct Viewer {
     notice: String,
     colors: ColorSettings,
     help: bool,
+    jsonpath_help: bool,
     vim: Vim,
     focus_path: bool,
     wanted: u64,
@@ -182,6 +183,7 @@ impl Viewer {
             notice: String::new(),
             colors: ColorSettings::default(),
             help: false,
+            jsonpath_help: false,
             vim: Vim::default(),
             focus_path: false,
             wanted: 0,
@@ -406,6 +408,11 @@ impl Viewer {
         }
     }
     fn keyboard(&mut self, ctx: &egui::Context) {
+        if self.jsonpath_help {
+            if ctx.input(|i| i.key_pressed(Key::Escape)) { self.jsonpath_help = false; }
+            self.vim.cancel();
+            return;
+        }
         if ctx.input(|i| i.key_pressed(Key::F1)) {
             self.help = !self.help;
         }
@@ -797,6 +804,10 @@ impl Viewer {
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label("JSONPath");
+                if ui.small_button("Cheatsheet").on_hover_text("常用 JSONPath 语法与示例").clicked() {
+                    self.vim.cancel();
+                    self.jsonpath_help = true;
+                }
                 let response = ui.add(egui::TextEdit::singleline(&mut self.jsonpath)
                     .id(egui::Id::new("paged_jsonpath")).hint_text("$.items[?@.active]").desired_width(360.0));
                 if (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) || ui.button("Run query").clicked() { self.start_query(); }
@@ -1129,7 +1140,7 @@ impl Viewer {
                 self.command(Navigation::Select(location));
                 self.command(Navigation::Toggle);
             }
-            if !self.help
+            if !self.help && !self.jsonpath_help
                 && !ctx.wants_keyboard_input()
                 && ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| rect.contains(p)))
             {
@@ -1163,6 +1174,7 @@ impl Viewer {
                 ] { ui.label(line); }
             });
         }
+        crate::ui::jsonpath_cheatsheet(ctx, &mut self.jsonpath_help);
         if self.sample_lease.is_none() && self.retiring.is_none() {
             self.sample_lease = self
                 .layout_budget
