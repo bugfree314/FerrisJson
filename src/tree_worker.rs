@@ -14,7 +14,10 @@ use crate::{
         tree_navigation::{Navigation, Navigator},
     },
 };
+#[cfg(not(target_os = "linux"))]
 use eframe::egui;
+#[cfg(target_os = "linux")]
+use crate::terminal_wake as egui;
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -28,6 +31,8 @@ use std::{
 pub enum Backend {
     Sparse(OpenOptions),
     Legacy(bool),
+    #[cfg(target_os = "linux")]
+    Stdin(String),
 }
 #[derive(Clone)]
 pub struct Status {
@@ -180,7 +185,13 @@ impl Task {
             if build_stop.load(Ordering::Relaxed) {
                 return;
             }
+            #[cfg(not(target_os = "linux"))]
             let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            #[cfg(target_os = "linux")]
+            let total = match &backend {
+                Backend::Stdin(text) => text.len() as u64,
+                _ => std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            };
             build_shared.0.lock().unwrap().status.total = total;
             build_ctx.request_repaint();
             let cancelled = || build_stop.load(Ordering::Relaxed);
@@ -245,6 +256,14 @@ impl Task {
                                 },
                             )?;
                             Ok(Box::new(SparseProvider::new(index)?))
+                        }
+                        #[cfg(target_os = "linux")]
+                        Backend::Stdin(text) => {
+                            if cancelled() { return Err("Load cancelled".into()); }
+                            let doc = Document::parse_owned_recover_with_budget(text, build_budget)
+                                .map_err(|(error, _)| error)?;
+                            if cancelled() { return Err("Load cancelled".into()); }
+                            Ok(Box::new(LegacyProvider(Arc::new(doc))))
                         }
                         Backend::Legacy(indexed) => {
                             let doc = if indexed {

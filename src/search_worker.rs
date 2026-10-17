@@ -4,7 +4,10 @@ use crate::engine::{
     file_source::{Cancellation, Priority, with_io_context},
     search::{Event, Input, Query, ResultStore, State, Status},
 };
+#[cfg(not(target_os = "linux"))]
 use eframe::egui;
+#[cfg(target_os = "linux")]
+use crate::terminal_wake as egui;
 
 use std::{
     collections::VecDeque,
