@@ -6,6 +6,10 @@
 
 用户提供的 Release 日志显示编译完成，同时有 7 条未使用项警告。针对这些项：桌面／测试专用的队列峰值快照、预算访问、搜索相对导航和 Vim 辅助方法按目标条件编译；TUI 明确释放不使用的桌面剪贴板传输，查询表达式与耗时接入结果展示。Windows/macOS 及测试所需接口保留，没有全局关闭 dead_code 警告。此轮未运行测试、构建或其他检查，是否清零等待用户重编译确认；改动尚未提交，版本保持 0.7.9+3。
 
+## 后续工作区：移除 Linux TUI 固定内存配额
+
+按用户要求移除 Task 的 256 MiB 内存配额，Linux 使用 `usize::MAX` 作为预算账本边界，继续记录内存占用并检查计数溢出；Memory、Indexed、Sparse 及其搜索／查询共享此设置。实际分配受系统可用内存约束。Windows/macOS 仍为原 256 MiB，磁盘配额和内部缓存、单值／语法／结构边界不变；CLI 的独立默认预算不在此次 TUI 改动范围。未运行测试、构建、Clippy、格式检查或基准，尚未提交，版本保持 0.7.9+3。
+
 ## 平台与构建
 
 - Linux 目标默认编译 Ratatui/Crossterm TUI，不需要额外 feature，不编译 eframe、rfd、窗口或字体模块。
@@ -60,7 +64,7 @@ cat /path/to/data.json | ./target/release/FerrisJson --pretty
 
 ## 既有边界与验收
 
-- --sparse 保留实验性、渐进验证、目录密度／首屏延迟及缓存限制；--indexed 仍建立完整结构索引；Memory 使用共用分页任务的 256 MiB 管理预算，该数字不是进程 RSS 上限，大文件应显式选择 --sparse。
+- --sparse 保留实验性、渐进验证、目录密度／首屏延迟及缓存限制；--indexed 仍建立完整结构索引；Linux TUI 不再设置固定内存配额，Memory 会保留完整 Value，大文件可显式选择 --sparse。
 - --paged-tree 在 Linux 使用同一 TUI 树；--sparse-pages 是旧桌面有限页回退，在 Linux 明确拒绝。
 - `tree_bench` / `search_bench` 是复用桌面 Viewer 的 CPU harness，在 Linux 提示不适用，避免拉入 GUI；它们不是 TUI 基准。其他纯引擎示例保持可用范围。
 - 终端颜色、宽字符、中文、emoji、功能键和 SSH 交互依赖实际终端；没有 GUI 配色编辑器、拖放、桌面粘贴或系统剪贴板集成。

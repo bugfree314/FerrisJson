@@ -128,7 +128,9 @@ pub struct Poll {
 impl Task {
     pub fn new(path: PathBuf, backend: Backend, ctx: egui::Context) -> Result<Self, String> {
         let budget = BudgetManager::new(Limits {
-            memory: 256 * 1024 * 1024,
+            // Linux TUI has no fixed memory quota; retain accounting and checked
+            // arithmetic, while leaving the desktop quota unchanged.
+            memory: if cfg!(target_os = "linux") { usize::MAX } else { 256 * 1024 * 1024 },
             disk: 64usize.saturating_mul(1024 * 1024 * 1024),
         });
         let queues = budget.reserve(

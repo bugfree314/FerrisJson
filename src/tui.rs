@@ -618,7 +618,7 @@ Memory supports library advanced queries; Indexed/Sparse retain existing bounded
 --indexed: file snapshot backend. --sparse: experimental progressive large-file backend.\n\
 --cache-dir DIR requires --sparse. --paged-tree uses the same terminal tree.\n\
 --sparse-pages is a desktop-only legacy fallback. Stdin uses Memory; file backends require files.\n\
-The Memory task budget is 256 MiB (not an RSS cap); use --sparse for large files.\n\
+The TUI has no fixed memory quota; --sparse avoids retaining the full JSON Value.\n\
 Source validation must complete before queries/full export. Preview text can be truncated; export reads the value.\n\
 Unicode widths, emoji, colors and function keys depend on your terminal and SSH configuration.\n\
 No controlling terminal: use --get / --query / --search / --pretty for CLI output.";
