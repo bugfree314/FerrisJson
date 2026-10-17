@@ -2,7 +2,7 @@
 //! on the existing bounded worker lanes; the UI only holds presentation pages.
 use crate::{
     document::SearchScope,
-    engine::{results::{State, Status as ResultStatus}, search::Query,
+    engine::{budget::Reservation, results::{State, Status as ResultStatus}, search::Query,
         session::SessionStatus, sparse::OpenOptions, tree::{Clipboard, TreeFrame},
         tree_navigation::Navigation},
     terminal_wake::Context,
@@ -77,7 +77,7 @@ pub fn run(file: Option<PathBuf>, text: Option<String>, indexed: bool, sparse: b
             dirty |= wake.take_repaint();
             app.poll()?;
             if let Some(clipboard) = app.clipboard.take() {
-                match copy_terminal(terminal.backend_mut(), &clipboard.text) {
+                match copy_terminal(terminal.backend_mut(), clipboard.text()) {
                     Ok(()) => app.notice = "Copy sent to terminal (OSC 52 support required)".into(),
                     Err(error) => app.notice = error,
                 }
@@ -185,6 +185,17 @@ impl Results {
 #[derive(Clone, Copy)]
 enum UiAction { Focus(Pane), TreeRow(u64), Result(Pane, u64), Page(Pane, bool), Edit(Input), Option(u8), Reload, Cancel }
 struct Hit { area: Rect, action: UiAction }
+// Keep library clipboard values intact. Path transfers already own a separate
+// reservation; retain it until the terminal write finishes as well.
+enum ClipboardTransfer {
+    Value(Clipboard),
+    Path { text: String, _lease: Reservation },
+}
+impl ClipboardTransfer {
+    fn text(&self) -> &str {
+        match self { Self::Value(value) => &value.text, Self::Path { text, .. } => text }
+    }
+}
 struct App {
     task: Option<Task>, retiring: Option<JoinHandle<()>>, pending: Option<(PathBuf, Backend)>,
     wake: Context, indexed: bool, sparse: bool, cache_dir: Option<PathBuf>,
@@ -193,7 +204,7 @@ struct App {
     case: bool, regex: bool, scope: SearchScope, prompt: Option<Prompt>, help: bool, help_scroll: u16, help_height: u16,
     notice: String, vim: Vim, preview_scroll: usize, preview_rows: usize, preview_height: u16,
     preview_wrap: bool, preview_x: usize, viewport: u16, fullscreen: bool,
-    clipboard: Option<Clipboard>, hits: Vec<Hit>, panels: Vec<(Pane, Rect)>,
+    clipboard: Option<ClipboardTransfer>, hits: Vec<Hit>, panels: Vec<(Pane, Rect)>,
 }
 impl App {
     fn new(indexed: bool, sparse: bool, cache_dir: Option<PathBuf>, wake: Context) -> Self {
@@ -234,10 +245,10 @@ impl App {
         }
         let Some(task) = &self.task else { return Ok(()); };
         let poll = task.poll();
-        if let Some(clipboard) = poll.clipboard { self.clipboard = Some(clipboard); }
-        if let Some((text, lease)) = poll.path_copy { self.clipboard = Some(Clipboard { text, _lease: lease }); }
+        if let Some(clipboard) = poll.clipboard { self.clipboard = Some(ClipboardTransfer::Value(clipboard)); }
+        if let Some((text, lease)) = poll.path_copy { self.clipboard = Some(ClipboardTransfer::Path { text, _lease: lease }); }
         if let Some((generation, clipboard)) = poll.query_clipboard && generation == task.query.generation() {
-            self.clipboard = Some(clipboard);
+            self.clipboard = Some(ClipboardTransfer::Value(clipboard));
         }
         let search = task.search.poll();
         self.search.update(search.generation, search.state, search.waiting, search.error);
