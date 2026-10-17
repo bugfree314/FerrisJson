@@ -203,6 +203,11 @@ impl Viewer {
         viewer.open(path, &cc.egui_ctx);
         viewer
     }
+    fn open_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+            self.open(path, ctx);
+        }
+    }
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
         let previous = self.worker.take().and_then(|mut w| {
             w.cancelled.store(true, Ordering::Relaxed);
@@ -327,6 +332,9 @@ impl Viewer {
             ctx.copy_text(std::mem::take(&mut value.text));
             self.notice = "Copied complete source JSON value".into();
         }
+        if crate::ui::consume_open_file_shortcut(ctx) {
+            self.open_dialog(ctx);
+        }
         ctx.request_repaint_after(Duration::from_millis(25));
         if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()))
         {
@@ -335,12 +343,8 @@ impl Viewer {
         egui::TopBottomPanel::top("sparse_toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("FerrisJson · Progressive");
-                if ui.button("Open file").clicked()
-                    && let Some(p) = rfd::FileDialog::new()
-                        .add_filter("JSON", &["json"])
-                        .pick_file()
-                {
-                    self.open(p, ctx);
+                if ui.button("Open file").on_hover_text(crate::ui::open_file_shortcut_label()).clicked() {
+                    self.open_dialog(ctx);
                 }
                 if ui.button("Reload / Resume").clicked() {
                     self.open(self.source.clone(), ctx);

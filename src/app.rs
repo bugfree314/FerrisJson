@@ -1070,8 +1070,10 @@ impl Viewer {
         if self.help || self.paste_open || self.colors_open || self.large_copy.is_some() {
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::O)) {
+        if crate::ui::consume_open_file_shortcut(ctx) {
+            self.vim.cancel();
             self.open(ctx);
+            return;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::F)) {
             self.start_search(false);
@@ -1343,7 +1345,7 @@ impl Viewer {
                 );
                 ui.separator();
                 ui.add_enabled_ui(self.pending.is_none(), |ui| {
-                    if ui.button("Open file").clicked() {
+                    if ui.button("Open file").on_hover_text(crate::ui::open_file_shortcut_label()).clicked() {
                         self.open(ctx);
                     }
                     if ui.button("Paste JSON").clicked() {

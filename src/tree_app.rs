@@ -219,6 +219,11 @@ impl Viewer {
             query_selected: None,
         }
     }
+    fn open_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+            self.open(path, ctx);
+        }
+    }
     fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
         if let Some(previous) = self.task.take() {
             self.retiring = Some(previous.retire());
@@ -415,6 +420,11 @@ impl Viewer {
             });
         }
         if self.help {
+            return;
+        }
+        if crate::ui::consume_open_file_shortcut(ctx) {
+            self.vim.cancel();
+            self.open_dialog(ctx);
             return;
         }
         if ctx.input(|i| i.key_pressed(Key::F4)) {
@@ -714,12 +724,8 @@ impl Viewer {
         egui::TopBottomPanel::top("paged_toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("FerrisJson · Tree");
-                if ui.button("Open file").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("JSON", &["json"])
-                        .pick_file()
-                {
-                    self.open(path, ctx);
+                if ui.button("Open file").on_hover_text(crate::ui::open_file_shortcut_label()).clicked() {
+                    self.open_dialog(ctx);
                 }
                 if ui.button("Reload / Resume").clicked() {
                     self.open(self.path.clone(), ctx);
@@ -1150,7 +1156,7 @@ impl Viewer {
                     "za / zo / zc: toggle / open / close; zR / zM: expand / collapse all",
                     "[ / ]: history; yy / Ctrl+C: copy JSON; yp / Ctrl+P: copy path",
                     ".: focus Path (JSON Pointer, e.g. /items/0)",
-                    "F5: reload; F1: help; Esc: cancel pending jump and key sequence",
+                    "⌘O (macOS) / Ctrl+O (Windows): open file; F5: reload; F1: help; Esc: cancel pending jump and key sequence",
                     "Search: / ? or Ctrl+F; n / N with counts. JSONPath: Run query / Enter; F4 / Shift+F4: next / previous result (wraps).",
                     "Line numbers: current visible row is absolute; other rows show distance from the cursor. Results have independent paging, cancel and output.",
                     "During validation, only committed content is browsable; complete output waits for Ready.",

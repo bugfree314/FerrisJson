@@ -1,6 +1,16 @@
 use crate::palette::{ColorSettings, Palette, Preset};
 use eframe::egui::{self, Color32, RichText};
 
+/// egui maps COMMAND to Cmd on macOS and Ctrl on Windows/Linux. Consume the
+/// event before text fields and Vim navigation can handle the same key press.
+pub fn consume_open_file_shortcut(ctx: &egui::Context) -> bool {
+    ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::O))
+}
+
+pub fn open_file_shortcut_label() -> &'static str {
+    if cfg!(target_os = "macos") { "Open file (⌘O)" } else { "Open file (Ctrl+O)" }
+}
+
 #[derive(Clone)]
 pub struct SearchHighlight {
     signature: (String, bool, bool, crate::document::SearchScope),
@@ -208,7 +218,7 @@ pub fn cheatsheet(ctx: &egui::Context, open: &mut bool, palette: Palette) {
                     ("NAVIGATION", &[("hjkl / arrows", "Parent / down / up / child"), ("12j · 3l", "Repeat a movement with a count"), ("gg · G · 25G", "First / last / visible row 25"), ("H · M · L", "Top / middle / bottom of viewport"), ("Ctrl+d / u", "Half page down / up"), ("PageDown / Up · Ctrl+e / b", "Full page down / up"), ("[ / ]", "Back / forward through visited positions")]),
                     ("SEARCH", &[("/ · ?", "Search forward / backward"), ("n · N · 3n", "Repeat search / reverse / count"), ("Enter · Esc", "Confirm search / return to tree"), ("F3 / Shift+F3", "Next / previous match"), ("Ctrl+F", "Focus search field")]),
                     ("TREE & COPY", &[("Space · za", "Toggle selected container"), ("zo · zc", "Open / close selected container"), ("zR · zM", "Expand / collapse whole document"), ("yy / Ctrl+C", "Copy full selected JSON"), ("yp / Ctrl+P", "Copy selected path")]),
-                    ("DOCUMENT", &[("Ctrl+O · Ctrl+V", "Open file / load clipboard JSON"), ("F5", "Reload current file"), ("F1", "Toggle this cheatsheet"), ("Esc", "Cancel pending Vim keys / close dialog")]),
+                    ("DOCUMENT", &[("⌘O (macOS) / Ctrl+O (Windows)", "Open file"), ("Ctrl+V", "Load clipboard JSON"), ("F5", "Reload current file"), ("F1", "Toggle this cheatsheet"), ("Esc", "Cancel pending Vim keys / close dialog")]),
                 ];
                 for (title, rows) in groups {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
