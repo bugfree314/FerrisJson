@@ -4,9 +4,11 @@
 
 tui 分支改动：新增 Linux 纯终端 TUI，按目标系统自动选择；Windows/macOS 保留 GUI。包含树／预览、搜索、JSONPath、结果分页、取消与导出，并扩展 Linux 自动编译打包。按用户明确要求提交到 `tui` 分支，未运行测试、构建或实机验收，版本号保持 0.7.9+3；详见 [Linux TUI 说明](docs/linux-tui.md)。
 
-后续未提交修订：针对用户 Release 日志中的 7 条未使用项警告，收窄桌面专用接口的编译范围，释放终端不使用的剪贴板传输，并显示查询耗时。本轮未复跑构建或测试，等待用户确认警告清理结果。
+此前警告清理已收录于 `b913ba6`：针对用户 Release 日志中的 7 条未使用项警告，收窄桌面专用接口的编译范围，处理终端不使用的剪贴板传输，并显示查询耗时。未复跑构建或测试，警告清理结果仍待用户确认。
 
-按用户要求，后续工作区同时移除 Linux TUI 的固定 256 MiB 内存配额，按系统可用内存分配；Windows/macOS 的原有配额、磁盘和内部缓存等边界保持原样。此项未运行构建或测试，尚未提交。
+`fee325d` 按用户要求移除 Linux TUI 的固定 256 MiB 内存配额，按系统可用内存分配；Windows/macOS 的原有配额、磁盘和内部缓存等边界保持原样。此项未运行构建或测试，不表示已通过功能验收。
+
+当前未提交修订：对齐 Linux TUI 快捷键，补齐 `.`、所有面板的 n/N、逆向搜索、Ctrl+F、整页／半页、数字前缀及复制；F5 重载，搜索选项改用 F6–F8。新增四面板／双栏／单面板布局、鼠标选择与分页按钮、F9 最大化和面板内页码；Windows/macOS GUI 处理不变。未运行测试、构建或程序验收，详见下方 Linux 操作与接入记录。
 
 0.7.9+3（2026-10-17，本次版本提交）：默认 GUI 和分页树的 JSONPath 标签旁新增 Cheatsheet；F1 帮助页的 JSONPath 标题旁也提供入口。独立滚动窗口显示字段访问、数组／切片／递归／多选、标量过滤、逻辑运算及当前后端限制，每条示例可 Copy，Esc 关闭。示例复制后由用户粘贴执行，不自动修改查询。按用户明确要求提交为 0.7.9+3；未运行测试、构建、Clippy、格式检查、GUI 或基准，布局与交互待用户验收，无新增实测通过记录。
 
@@ -158,9 +160,11 @@ cargo build --release --locked --bin FerrisJson
 cat /path/to/data.json | ./target/release/FerrisJson -
 ```
 
-Tab 切换树、预览、搜索和 JSONPath；方向键／hjkl 浏览，gg/G 到首尾，Enter 展开折叠，o／Ctrl+O 输入文件路径。`/` 搜索，F5 切换大小写、F6 正则、F7 范围；F3／Shift+F3 跳搜索结果。`:`／F2 输入 JSONPath／Pointer，F4／Shift+F4 跳查询结果。结果每页 16 条，Enter 返回树。e 导出当前节点或当前结果面板的完整结果，E 显式导出部分结果；成功后原子替换目标文件。Esc 关闭输入／帮助或取消任务，Delete 清空当前结果，F1 查看可滚动帮助，q／Ctrl+C 退出。
+Tab／Shift+Tab、Alt+1/2/3/4 或点击选择树、预览、搜索、JSONPath；F9 最大化当前面板。`.` 定位路径，`/`／`?`／Ctrl+F 搜索，n/N 在所有面板按搜索方向导航；F3／Shift+F3 固定正反向，F4／Shift+F4 导航 JSONPath。`:`／F2 输入查询，F5 重载源文件；F6 大小写、F7 正则、F8 范围。方向键／hjkl、数字前缀、gg/G、展开折叠和历史沿用桌面习惯。
 
-小于 100 列时使用单面板，Tab 切换；支持 SSH 控制终端，管道 JSON 使用 Memory 并完整读入。无 `/dev/tty` 或 TERM=dumb 时使用既有非交互 CLI 参数。`--indexed`／`--sparse` 保留文件后端及各自语法限制，大文件建议显式 `--sparse`；`--sparse-pages` 为桌面旧入口，Linux 不支持。终端不依赖系统剪贴板，中文／emoji／颜色和功能键效果依赖终端。详细边界与待验收事项见 [Linux TUI 说明](docs/linux-tui.md)。上述命令供用户手动验收，本次未执行。
+预览聚焦后，PgUp/PgDn 或 Ctrl+B/E 按可见高度翻页，Ctrl+U/D 半页，j/k 一行，gg/G 首尾，w 切换换行。搜索／JSONPath 聚焦后，PgUp/PgDn、Ctrl+B/E、h/l 或点击底部翻页按钮切换 16 条结果页，首尾停止；j/k 逐项，Enter 返回树，面板显示页码和结果范围。e 导出当前节点／当前结果面板的完整结果，E 显式导出部分结果。yy／Ctrl+C 复制选中 JSON，yp／Ctrl+P 复制路径，通过终端 OSC 52 发送，需终端支持且最多 100 KiB；较大值用导出。Esc 退出输入／帮助或返回树，Ctrl+X 取消当前任务，Delete 清空当前结果，q／Ctrl+Q 退出，F1 显示完整帮助。
+
+内容区至少 110 列且 18 行时显示树／搜索与预览／JSONPath 四区；中等窗口至少 72 列且 10 行时双栏，更小时单面板。工具栏按宽度换行，短窗口收起工具栏，仍可用快捷键／F1；支持 24×8 起的小窗口、鼠标滚轮、resize 与预览末尾滚动约束。管道 JSON 使用 Memory 并完整读入，终端粘贴在输入框内编辑、普通模式加载 JSON；无 `/dev/tty` 或 TERM=dumb 时使用 CLI 参数。`--indexed`／`--sparse` 保留各自限制，`--sparse-pages` 仍为桌面旧入口。详细边界和待验收事项见 [Linux TUI 说明](docs/linux-tui.md)。上述命令供用户手动验收，本次未执行。
 
 ## 桌面操作（Windows / macOS）
 
