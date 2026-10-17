@@ -2,33 +2,36 @@
     dead_code,
     reason = "The CPU harness reuses desktop modules without launching a native window"
 )]
-#[cfg(not(test))]
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 use FerrisJson::{document, engine};
-#[cfg(not(test))]
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 #[path = "../src/fonts.rs"]
 mod fonts;
-#[cfg(not(test))]
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 #[path = "../src/palette.rs"]
 mod palette;
-#[cfg(not(test))]
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 #[path = "../src/search_worker.rs"]
 mod search_worker;
-#[cfg(not(test))]
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
+#[path = "../src/paged_query_worker.rs"]
+mod paged_query_worker;
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 #[path = "../src/shutdown.rs"]
 mod shutdown;
-#[cfg(not(test))]
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 #[path = "../src/tree_app.rs"]
 mod tree_app;
-#[cfg(not(test))]
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 #[path = "../src/tree_worker.rs"]
 mod tree_worker;
-#[cfg(not(test))]
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 #[path = "../src/ui.rs"]
 mod ui;
-#[cfg(not(test))]
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 #[path = "../src/vim.rs"]
 mod vim;
-#[cfg(not(test))]
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 fn main() {
     let result = (|| {
         let mut args = std::env::args().skip(1);
@@ -55,3 +58,9 @@ fn main() {
 }
 #[cfg(test)]
 fn main() {}
+
+#[cfg(all(not(test), any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
+fn main() {
+    eprintln!("This harness measures the desktop GUI; TUI acceptance is separate.");
+    std::process::exit(1);
+}

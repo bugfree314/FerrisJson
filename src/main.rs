@@ -4,24 +4,47 @@
     reason = "The binary and crate deliberately use the FerrisJson brand name"
 )]
 
+#[cfg(all(feature = "tui", not(any(target_os = "linux", target_os = "macos"))))]
+compile_error!("The tui feature supports Linux and macOS; use the default desktop build on Windows.");
+#[cfg(all(not(target_os = "linux"), not(feature = "desktop"), not(all(target_os = "macos", feature = "tui"))))]
+compile_error!("Select the desktop feature, or use --no-default-features --features tui on macOS.");
+
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod app;
 mod search_worker;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod sparse_app;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod tree_app;
 mod tree_worker;
-use FerrisJson::{document, engine, export, loading};
+use FerrisJson::{document, engine, export};
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
+use FerrisJson::loading;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod fonts;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod legacy_search;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod palette;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod preview_worker;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod query_worker;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod query_stream_worker;
 mod paged_query_worker;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod row_cache;
 mod shutdown;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod task_worker;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod ui;
 mod vim;
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+mod terminal_wake;
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+mod tui;
 use document::{Document, SearchScope};
 use std::{
     io::{self, IsTerminal, Read, Write},
@@ -64,7 +87,7 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --indexed      File snapshot/range backend (limited JSONPath; no full Value)\n  --sparse       Experimental progressive paged tree GUI (file only)\n  --sparse-pages  S4 finite-page browser fallback\n  --paged-tree    Paged renderer for legacy backends (file only)\n  --cache-dir D  S4 persistent snapshot/index cache; requires --sparse\n  --version      Print version\n\nWithout options, opens the desktop viewer. Piped stdin is supported in in-memory mode.",
+                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --indexed      File snapshot/range backend (limited JSONPath; no full Value)\n  --sparse       Experimental progressive paged tree (file only)\n  --sparse-pages  S4 finite-page GUI fallback (Windows/macOS)\n  --paged-tree    Paged renderer for legacy backends (file only)\n  --cache-dir D  S4 persistent snapshot/index cache; requires --sparse\n  --version      Print version\n\nWithout options, opens the viewer (Linux: TUI; macOS: desktop or --features tui; Windows: desktop). Piped stdin is supported in in-memory mode.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
@@ -195,6 +218,24 @@ fn run() -> Result<(), String> {
         output.flush().map_err(|e| e.to_string())?;
         return Ok(());
     }
+    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+    {
+        if sparse_pages {
+            return Err("--sparse-pages is a desktop GUI fallback; use --sparse in TUI mode".into());
+        }
+        let result = tui::run(file, text, indexed, sparse, cache_dir);
+        shutdown::finish();
+        result
+    }
+    #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
+    desktop(file, text, use_stdin, indexed, sparse, sparse_pages, paged_tree, cache_dir)
+}
+
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
+fn desktop(
+    file: Option<PathBuf>, text: Option<String>, use_stdin: bool, indexed: bool,
+    sparse: bool, sparse_pages: bool, paged_tree: bool, cache_dir: Option<PathBuf>,
+) -> Result<(), String> {
     // Finder launches with an empty redirected stdin. Start with an empty viewer
     // instead of trying to parse that as a JSON document; CLI parsing stays strict.
     let text = text.filter(|text| !text.is_empty());
@@ -250,6 +291,7 @@ fn run() -> Result<(), String> {
     shutdown::finish();
     result.map_err(|e| e.to_string())
 }
+
 fn stdin_redirected() -> bool {
     #[cfg(windows)]
     {

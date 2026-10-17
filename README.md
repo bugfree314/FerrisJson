@@ -2,6 +2,22 @@
 
 当前版本：**0.7.9+3**。
 
+当前工作区新增 macOS 可选 TUI：使用 `--no-default-features --features tui` 编译终端版；macOS 默认 GUI、Windows 默认 GUI、Linux 默认 TUI 保持原选择。仅检查依赖元数据，未运行构建／测试，尚未提交。
+
+项目内短命令：`cargo tui` 编译 Release 终端版，`cargo tui-pack` 编译并打包终端版；对应参数保存在 `.cargo/config.toml`，不修改全局 Cargo 配置。本轮未执行这些命令，未构建／测试、未提交。
+
+tui 分支改动：新增 Linux 纯终端 TUI，按目标系统自动选择；Windows/macOS 保留 GUI。包含树／预览、搜索、JSONPath、结果分页、取消与导出，并扩展 Linux 自动编译打包。按用户明确要求提交到 `tui` 分支，未运行测试、构建或实机验收，版本号保持 0.7.9+3；详见 [Linux TUI 说明](docs/linux-tui.md)。
+
+此前警告清理已收录于 `b913ba6`：针对用户 Release 日志中的 7 条未使用项警告，收窄桌面专用接口的编译范围，处理终端不使用的剪贴板传输，并显示查询耗时。未复跑构建或测试，警告清理结果仍待用户确认。
+
+`fee325d` 按用户要求移除 Linux TUI 的固定 256 MiB 内存配额，按系统可用内存分配；Windows/macOS 的原有配额、磁盘和内部缓存等边界保持原样。此项未运行构建或测试，不表示已通过功能验收。
+
+当前未提交修订：对齐 Linux TUI 快捷键，补齐 `.`、所有面板的 n/N、逆向搜索、Ctrl+F、整页／半页、数字前缀及复制；F5 重载，搜索选项改用 F6–F8。新增四面板／双栏／单面板布局、鼠标选择与分页按钮、F9 最大化和面板内页码；Windows/macOS GUI 处理不变。未运行测试、构建或程序验收，详见下方 Linux 操作与接入记录。
+
+针对用户报告的 E0451，工作区已改用 TUI 本地剪贴板传输类型，保留库对象封装和资源预留生命周期；未复跑构建或测试，尚未提交。
+
+TUI 单路径定位匹配多个节点时，改为提示 F2／`:` 执行 JSONPath、Alt+4 查看结果，输入标题注明单节点；不再沿用 CLI 的 `--query` 提示。此项未运行构建／测试，尚未提交。
+
 0.7.9+3（2026-10-17，本次版本提交）：默认 GUI 和分页树的 JSONPath 标签旁新增 Cheatsheet；F1 帮助页的 JSONPath 标题旁也提供入口。独立滚动窗口显示字段访问、数组／切片／递归／多选、标量过滤、逻辑运算及当前后端限制，每条示例可 Copy，Esc 关闭。示例复制后由用户粘贴执行，不自动修改查询。按用户明确要求提交为 0.7.9+3；未运行测试、构建、Clippy、格式检查、GUI 或基准，布局与交互待用户验收，无新增实测通过记录。
 
 0.7.9+2（2026-10-17，`d35a5da`）：打开文件快捷键按系统习惯使用 macOS `⌘O`、Windows／Linux `Ctrl+O`，默认 GUI、分页树及旧有限页浏览器均接入；输入框获得焦点时也可触发，帮助和打开按钮提示同步。沿用现有文件选择器与加载状态限制；按用户明确要求提交为 0.7.9+2；未运行测试、构建、Clippy、格式检查、GUI 或基准，待用户实机验收，无新增实测通过记录。
@@ -86,7 +102,7 @@ cargo run --release --example generate_json -- 64MiB random-64mib.json 42
 
 ## 从源码运行
 
-开发环境使用 Rust 1.99。Windows 需要 Rust MSVC 工具链及对应的 C++ 构建工具；macOS 需要 Rust 和 Xcode Command Line Tools（`xcode-select --install`）。
+开发环境使用 Rust 1.99。Windows 需要 Rust MSVC 工具链及对应的 C++ 构建工具；macOS 需要 Rust 和 Xcode Command Line Tools（`xcode-select --install`）；Linux 需要 Rust 工具链及 C 链接工具，默认编译 TUI，无需 X11、Wayland、GTK 或桌面门户开发包。
 
 ```powershell
 cargo run --bin FerrisJson
@@ -107,7 +123,8 @@ cargo build --release --bin FerrisJson
 | 平台 | 文件 |
 | --- | --- |
 | Windows | `target/release/FerrisJson.exe` |
-| Linux / macOS | `target/release/FerrisJson` |
+| macOS（GUI） | `target/release/FerrisJson` |
+| Linux（TUI） | `target/release/FerrisJson` |
 
 Windows 构建后启动：
 
@@ -120,7 +137,18 @@ Windows 构建后启动：
 
 图标可通过 SVG 源文件继续编辑，再导出 PNG 和多尺寸 ICO。正常构建直接使用仓库中的图标文件。
 
-### 自动编译与打包（Windows / macOS）
+### 自动编译与打包（Windows / macOS / Linux）
+
+macOS 若要终端版，可直接编译或使用同一打包入口；`--no-default-features` 排除 GUI 依赖，`--features tui` 选择 TUI：
+
+```sh
+cargo build --release --locked --no-default-features --features tui --bin FerrisJson
+./target/release/FerrisJson /path/to/data.json
+# 可选：编译并复制终端程序、README 和 LICENSE 到 bundle
+cargo run --release --locked --no-default-features --features tui --example package
+```
+
+macOS TUI 的 bundle 产物为 `target/release/bundle/FerrisJson`，不生成 `.app`。省略这些参数仍按原流程生成 GUI／`.app`；TUI 快捷键使用 Ctrl 和 Vim 键，终端无法把 macOS GUI 的 ⌘ 快捷键直接当作应用按键。以下默认命令及上述新命令本轮均未执行编译，等待用户验收。
 
 在项目目录执行同一个命令，程序会自动识别当前系统和 Rust 工具链架构，编译 Release 版本并打包：
 
@@ -134,12 +162,30 @@ cargo run --release --locked --example package
 | --- | --- |
 | Windows | `FerrisJson.exe`，同目录附带 README 和 LICENSE |
 | macOS | `FerrisJson.app`，文档位于 App 的 `Contents/Resources/` |
+| Linux | `FerrisJson` 终端程序（0755），同目录附带 README 和 LICENSE |
 
 macOS App 可在 Finder 中双击启动，或拖入「应用程序」目录。图标会从现有 PNG 自动生成 ICNS，版本号使用 `Cargo.toml` 中的版本。macOS 最低版本为 11.0；Apple Silicon 使用原生 Rust 工具链时生成 `aarch64` 产物，Intel Mac 生成 `x86_64` 产物。每次只打包当前平台与架构，不生成通用二进制，也不跨系统编译。
 
-macOS 打包使用系统自带的 `sips`、`iconutil`、`plutil` 和 `codesign`，进行无需 Apple 开发者账号的本地 ad-hoc 签名；向其他用户公开分发时，Developer ID 签名与 Apple 公证需另行完成。Windows 沿用现有 EXE 图标资源编译配置。两种平台均不生成 ZIP；重复运行会更新同名产物。
+macOS 打包使用系统自带的 `sips`、`iconutil`、`plutil` 和 `codesign`，进行无需 Apple 开发者账号的本地 ad-hoc 签名；向其他用户公开分发时，Developer ID 签名与 Apple 公证需另行完成。Windows 沿用现有 EXE 图标资源编译配置。三种平台均不生成 ZIP；重复运行会更新同名产物。Linux 打包按当前主机 target 构建，不承诺跨发行版通用或静态链接。
 
-## 桌面操作
+## Linux 终端操作
+
+Linux 自动使用 TUI，不需要手动 feature；Windows/macOS 继续使用现有桌面界面。
+
+```sh
+cargo build --release --locked --bin FerrisJson
+./target/release/FerrisJson /path/to/data.json
+./target/release/FerrisJson --sparse /path/to/large.json
+cat /path/to/data.json | ./target/release/FerrisJson -
+```
+
+Tab／Shift+Tab、Alt+1/2/3/4 或点击选择树、预览、搜索、JSONPath；F9 最大化当前面板。`.` 定位路径，`/`／`?`／Ctrl+F 搜索，n/N 在所有面板按搜索方向导航；F3／Shift+F3 固定正反向，F4／Shift+F4 导航 JSONPath。`:`／F2 输入查询，F5 重载源文件；F6 大小写、F7 正则、F8 范围。方向键／hjkl、数字前缀、gg/G、展开折叠和历史沿用桌面习惯。
+
+预览聚焦后，PgUp/PgDn 或 Ctrl+B/E 按可见高度翻页，Ctrl+U/D 半页，j/k 一行，gg/G 首尾，w 切换换行。搜索／JSONPath 聚焦后，PgUp/PgDn、Ctrl+B/E、h/l 或点击底部翻页按钮切换 16 条结果页，首尾停止；j/k 逐项，Enter 返回树，面板显示页码和结果范围。e 导出当前节点／当前结果面板的完整结果，E 显式导出部分结果。yy／Ctrl+C 复制选中 JSON，yp／Ctrl+P 复制路径，通过终端 OSC 52 发送，需终端支持且最多 100 KiB；较大值用导出。Esc 退出输入／帮助或返回树，Ctrl+X 取消当前任务，Delete 清空当前结果，q／Ctrl+Q 退出，F1 显示完整帮助。
+
+内容区至少 110 列且 18 行时显示树／搜索与预览／JSONPath 四区；中等窗口至少 72 列且 10 行时双栏，更小时单面板。工具栏按宽度换行，短窗口收起工具栏，仍可用快捷键／F1；支持 24×8 起的小窗口、鼠标滚轮、resize 与预览末尾滚动约束。管道 JSON 使用 Memory 并完整读入，终端粘贴在输入框内编辑、普通模式加载 JSON；无 `/dev/tty` 或 TERM=dumb 时使用 CLI 参数。`--indexed`／`--sparse` 保留各自限制，`--sparse-pages` 仍为桌面旧入口。详细边界和待验收事项见 [Linux TUI 说明](docs/linux-tui.md)。上述命令供用户手动验收，本次未执行。
+
+## 桌面操作（Windows / macOS）
 
 1. 点击 **Open file**、拖放文件，或点击 **Paste JSON** 粘贴内容。树视图中 Ctrl+V 也可加载剪贴板 JSON。
 2. 点击键或值选择节点；点击箭头、双击容器键名，或使用键盘展开与折叠。

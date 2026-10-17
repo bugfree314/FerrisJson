@@ -5,7 +5,10 @@ use crate::engine::{
     query::{QueryEngine, QueryRequest, stream::{Event, Input}},
     results::{ResultStore, State},
 };
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 use eframe::egui;
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+use crate::terminal_wake as egui;
 use std::{sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, thread::JoinHandle, time::{Duration, Instant}};
 
 struct Request { generation: u64, query: QueryRequest, _lease: Arc<Reservation> }

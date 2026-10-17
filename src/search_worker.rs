@@ -4,7 +4,10 @@ use crate::engine::{
     file_source::{Cancellation, Priority, with_io_context},
     search::{Event, Input, Query, ResultStore, State, Status},
 };
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 use eframe::egui;
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+use crate::terminal_wake as egui;
 
 use std::{
     collections::VecDeque,
@@ -21,6 +24,7 @@ pub struct Snapshot {
     pub waiting: bool,
     pub error: String,
     pub cursor: Option<u64>,
+    #[cfg(any(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))), test))]
     pub queue_peak: usize,
 }
 #[derive(Clone, Copy)]
@@ -239,6 +243,7 @@ impl SearchHub {
             state,
             error: b.error.clone(),
             cursor: b.cursor,
+            #[cfg(any(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))), test))]
             queue_peak: b.queue_peak,
         };
         drop(b);
@@ -249,6 +254,7 @@ impl SearchHub {
         self.0.inbox.lock().unwrap().target = Some(Target::Absolute(index));
         (self.0.wake)();
     }
+    #[cfg(any(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))), test))]
     pub fn next(&self, forward: bool, count: u64) {
         let mut b = self.0.inbox.lock().unwrap();
         let count = count.max(1);

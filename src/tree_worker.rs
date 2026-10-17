@@ -14,7 +14,10 @@ use crate::{
         tree_navigation::{Navigation, Navigator},
     },
 };
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 use eframe::egui;
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+use crate::terminal_wake as egui;
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -28,6 +31,8 @@ use std::{
 pub enum Backend {
     Sparse(OpenOptions),
     Legacy(bool),
+    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+    Stdin(String),
 }
 #[derive(Clone)]
 pub struct Status {
@@ -93,6 +98,7 @@ pub struct Task {
     stop: Arc<AtomicBool>,
     progress: Arc<AtomicU64>,
     threads: Vec<JoinHandle<()>>,
+    #[cfg(any(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))), test))]
     budget: BudgetManager,
 }
 pub struct ResultRow {
@@ -122,7 +128,9 @@ pub struct Poll {
 impl Task {
     pub fn new(path: PathBuf, backend: Backend, ctx: egui::Context) -> Result<Self, String> {
         let budget = BudgetManager::new(Limits {
-            memory: 256 * 1024 * 1024,
+            // TUI mode has no fixed memory quota; retain accounting and checked
+            // arithmetic, while leaving the desktop quota unchanged.
+            memory: if cfg!(any(target_os = "linux", all(target_os = "macos", feature = "tui"))) { usize::MAX } else { 256 * 1024 * 1024 },
             disk: 64usize.saturating_mul(1024 * 1024 * 1024),
         });
         let queues = budget.reserve(
@@ -180,7 +188,13 @@ impl Task {
             if build_stop.load(Ordering::Relaxed) {
                 return;
             }
+            #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
             let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+            let total = match &backend {
+                Backend::Stdin(text) => text.len() as u64,
+                _ => std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            };
             build_shared.0.lock().unwrap().status.total = total;
             build_ctx.request_repaint();
             let cancelled = || build_stop.load(Ordering::Relaxed);
@@ -245,6 +259,14 @@ impl Task {
                                 },
                             )?;
                             Ok(Box::new(SparseProvider::new(index)?))
+                        }
+                        #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
+                        Backend::Stdin(text) => {
+                            if cancelled() { return Err("Load cancelled".into()); }
+                            let doc = Document::parse_owned_recover_with_budget(text, build_budget)
+                                .map_err(|(error, _)| error)?;
+                            if cancelled() { return Err("Load cancelled".into()); }
+                            Ok(Box::new(LegacyProvider(Arc::new(doc))))
                         }
                         Backend::Legacy(indexed) => {
                             let doc = if indexed {
@@ -745,9 +767,11 @@ impl Task {
             stop,
             progress,
             threads: vec![builder, interactive, output, search_thread, query_thread],
+            #[cfg(any(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))), test))]
             budget,
         })
     }
+    #[cfg(any(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))), test))]
     pub fn budget(&self) -> BudgetManager {
         self.budget.clone()
     }
@@ -814,6 +838,7 @@ impl Task {
         self.shared.1.notify_all();
         Ok(())
     }
+    #[cfg(any(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))), test))]
     pub fn search_match(&self, forward: bool, count: u64) {
         self.search.next(forward, count);
     }

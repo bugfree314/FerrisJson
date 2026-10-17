@@ -9,11 +9,14 @@ license = "GPL-3.0-or-later"
 name = "FerrisJson"
 path = "src/main.rs"
 
+[features]
+default = ["desktop"]
+desktop = ["dep:eframe", "dep:rfd"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:signal-hook", "dep:unicode-width"]
+
 [dependencies]
-eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 regex = "1"
-rfd = "0.15"
 serde_json_path = "0.7"
 serde = { version = "1", features = ["derive"] }
 
@@ -22,3 +25,19 @@ winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+eframe = { version = "0.33", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+rfd = { version = "0.15", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ratatui = { version = "0.30.2", optional = true, default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.29", optional = true }
+signal-hook = { version = "0.3", optional = true }
+unicode-width = { version = "0.2.2", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
+signal-hook = "0.3"
+unicode-width = "0.2.2"
