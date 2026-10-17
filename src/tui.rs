@@ -145,6 +145,7 @@ impl Prompt {
 #[derive(Default)]
 struct Results {
     generation: u64, state: Option<State>, waiting: bool, error: String,
+    elapsed: Option<Duration>,
     selected: Option<u64>, start: u64, page: Option<ResultPage>, requested: Option<(u64, u64, u64)>,
 }
 impl Results {
@@ -210,6 +211,11 @@ impl App {
         }
         let Some(task) = &self.task else { return Ok(()); };
         let poll = task.poll();
+        // The terminal frontend has no desktop clipboard. Drain transfers here
+        // so their strings and budget reservations are released immediately.
+        drop(poll.query_clipboard);
+        drop(poll.clipboard);
+        drop(poll.path_copy);
         let search = task.search.poll();
         self.search.update(search.generation, search.state, search.waiting, search.error);
         // Adopt the initial automatic search selection. Later selections belong
@@ -218,6 +224,8 @@ impl App {
             self.search.select(cursor); self.wake.request_repaint();
         }
         let query = task.query.poll();
+        self.query_text = query.expression;
+        self.query.elapsed = query.elapsed;
         self.query.update(query.generation, query.state, query.waiting, query.error);
         if let Some(page) = poll.search_page { self.search.accept(page); }
         if let Some(page) = poll.query_page { self.query.accept(page); }
@@ -543,7 +551,8 @@ impl App {
     fn draw_results(&self, frame: &mut Frame<'_>, area: Rect, pane: Pane) {
         let (results, expression) = if pane == Pane::Query { (&self.query, &self.query_text) } else { (&self.search, &self.search_text) };
         let state = results.state.as_ref().map_or_else(|| if results.waiting { "Waiting".into() } else { "Idle".into() }, |s| format!("{:?}", s.status));
-        let block = self.block(pane, format!("{} · {} / {} · {state}", pane.name(), results.selected.map_or(0, |i| i + 1), results.count()));
+        let elapsed = results.elapsed.map_or_else(String::new, |elapsed| format!(" · {:.3} s", elapsed.as_secs_f64()));
+        let block = self.block(pane, format!("{} · {} / {} · {state}{elapsed}", pane.name(), results.selected.map_or(0, |i| i + 1), results.count()));
         let inner = block.inner(area);
         let mut lines = vec![Line::from(safe(expression, false))];
         if !results.error.is_empty() { lines.push(Line::from(Span::styled(safe(&results.error, false), Style::default().fg(Color::Red)))); }

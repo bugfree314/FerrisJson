@@ -24,6 +24,7 @@ pub struct Snapshot {
     pub waiting: bool,
     pub error: String,
     pub cursor: Option<u64>,
+    #[cfg(any(not(target_os = "linux"), test))]
     pub queue_peak: usize,
 }
 #[derive(Clone, Copy)]
@@ -242,6 +243,7 @@ impl SearchHub {
             state,
             error: b.error.clone(),
             cursor: b.cursor,
+            #[cfg(any(not(target_os = "linux"), test))]
             queue_peak: b.queue_peak,
         };
         drop(b);
@@ -252,6 +254,7 @@ impl SearchHub {
         self.0.inbox.lock().unwrap().target = Some(Target::Absolute(index));
         (self.0.wake)();
     }
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn next(&self, forward: bool, count: u64) {
         let mut b = self.0.inbox.lock().unwrap();
         let count = count.max(1);

@@ -35,6 +35,7 @@ impl Vim {
         self.count = 0;
         self.prefix = None;
     }
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn record(&mut self, key: &str) {
         self.cancel();
         self.last = key.into();
@@ -89,6 +90,7 @@ impl Vim {
         self.cancel();
         Some(command)
     }
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn take_count(&mut self, label: &str) -> usize {
         let count = self.count.max(1);
         self.record(label);

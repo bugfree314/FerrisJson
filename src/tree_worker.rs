@@ -98,6 +98,7 @@ pub struct Task {
     stop: Arc<AtomicBool>,
     progress: Arc<AtomicU64>,
     threads: Vec<JoinHandle<()>>,
+    #[cfg(any(not(target_os = "linux"), test))]
     budget: BudgetManager,
 }
 pub struct ResultRow {
@@ -764,9 +765,11 @@ impl Task {
             stop,
             progress,
             threads: vec![builder, interactive, output, search_thread, query_thread],
+            #[cfg(any(not(target_os = "linux"), test))]
             budget,
         })
     }
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn budget(&self) -> BudgetManager {
         self.budget.clone()
     }
@@ -833,6 +836,7 @@ impl Task {
         self.shared.1.notify_all();
         Ok(())
     }
+    #[cfg(any(not(target_os = "linux"), test))]
     pub fn search_match(&self, forward: bool, count: u64) {
         self.search.next(forward, count);
     }
