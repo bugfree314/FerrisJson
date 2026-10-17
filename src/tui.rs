@@ -137,7 +137,7 @@ impl Input {
     fn label(self) -> &'static str {
         match self { Self::Open => "Open file", Self::Search(false) => "Search",
             Self::Search(true) => "Search backwards", Self::Query => "JSONPath / Pointer",
-            Self::Locate => "Locate path", Self::Export(_, false) => "Export to (replaces destination)",
+            Self::Locate => "Locate path (one node)", Self::Export(_, false) => "Export to (replaces destination)",
             Self::Export(_, true) => "Export committed partial results to (replaces destination)" }
     }
 }
@@ -289,13 +289,13 @@ impl App {
                     }
                     self.frame = Some(frame);
                 }
-                Ok(_) => (), Err(error) => self.notice = error,
+                Ok(_) => (), Err(error) => self.notice = terminal_notice(error),
             }
         }
         if self.status.as_ref().is_none_or(|old| old.state != poll.status.state)
             && poll.status.state == SessionStatus::Ready { self.notice = "Ready".into(); }
         if !poll.status.message.is_empty() { self.notice = poll.status.message.clone(); }
-        if !poll.notice.is_empty() { self.notice = poll.notice; }
+        if !poll.notice.is_empty() { self.notice = terminal_notice(poll.notice); }
         if matches!(poll.status.state, SessionStatus::Failed | SessionStatus::Cancelled) { self.frame = None; }
         self.status = Some(poll.status);
         Ok(())
@@ -905,6 +905,13 @@ impl Drop for App {
 
 // JSON previews, paths, filenames, and errors may contain terminal escape/control
 // characters. Only the frontend's own terminal commands reach the terminal raw.
+fn terminal_notice(message: String) -> String {
+    if message == "Path selected multiple nodes; use --query to retrieve all results" {
+        "Path needs one node. Use F2 or : for JSONPath; Alt+4 shows results.".into()
+    } else {
+        message
+    }
+}
 fn safe(text: &str, multiline: bool) -> String {
     let mut output = String::with_capacity(text.len());
     for c in text.chars() {
@@ -984,7 +991,7 @@ Click a pane/tab to focus. Mouse wheel scrolls under the pointer. F9: maximize/r
 Wide: tree + search on the left, preview + JSONPath on the right. Medium: tree + chosen detail pane. Small: one pane.\n\n\
 Shared desktop shortcuts:\n\
 Ctrl+O / o: open file. F5: reload current file (stdin/paste must be supplied again).\n\
-. / p: locate a single path. : / F2: JSONPath or Pointer query.\n\
+. / p: locate ONE node. Multiple matches: use : / F2 for JSONPath, then Alt+4 for results.\n\
 / / Ctrl+F: forward search; ?: backward search. Enter runs.\n\
 n / N: next / opposite search match in ALL panes, following the / or ? direction. Numeric prefixes work.\n\
 F3 / Shift+F3: forward / backward search match. F4 / Shift+F4: next / previous JSONPath result.\n\
