@@ -137,6 +137,12 @@ pub struct Viewer {
     total_bytes: u64,
     kind: Option<&'static str>,
     frame_epoch: u64,
+    /// P0 observability: when the current open request started.
+    opened: Instant,
+    /// Time until the first browsable frame was displayed (T1/T2).
+    first_frame: Option<Duration>,
+    /// Time until the session reached Ready (T3).
+    ready_at: Option<Duration>,
     search_term: String,
     search_case: bool,
     search_regex: bool,
@@ -200,6 +206,9 @@ impl Viewer {
             total_bytes: 0,
             kind: None,
             frame_epoch: 0,
+            opened: Instant::now(),
+            first_frame: None,
+            ready_at: None,
             search_term: String::new(),
             search_case: false,
             search_regex: false,
@@ -244,6 +253,9 @@ impl Viewer {
         self.search_start = 0;
         self.page_request = None;
         self.status = SessionStatus::Preparing;
+        self.opened = Instant::now();
+        self.first_frame = None;
+        self.ready_at = None;
         self.path = path.clone();
         self.notice.clear();
         self.wanted = 0;
@@ -668,6 +680,9 @@ impl Viewer {
                 }
             }
             self.status = poll.status.state;
+            if self.status == SessionStatus::Ready && self.ready_at.is_none() {
+                self.ready_at = Some(self.opened.elapsed());
+            }
             self.done = poll.status.done;
             self.total_bytes = poll.status.total;
             self.kind = poll.status.kind;
@@ -684,6 +699,9 @@ impl Viewer {
                             self.wanted = frame.start;
                             self.frame_epoch = epoch;
                             self.frame = Some(frame);
+                            if self.first_frame.is_none() {
+                                self.first_frame = Some(self.opened.elapsed());
+                            }
                         }
                     }
                     Err(e) => self.notice = e,
@@ -904,7 +922,7 @@ impl Viewer {
                 }
             });
         });
-        egui::TopBottomPanel::bottom("paged_status").show(ctx,|ui|{ui.horizontal_wrapped(|ui|{ui.label(format!("{:?}",self.status));if let Some(frame)=&self.frame{ui.monospace(format!("Ln {}/{}{} · {}",frame.selected_rank+1,if frame.exact{""}else{"≥"},frame.total,self.vim.display()));}ui.label(&self.notice);});if self.status==SessionStatus::Validating{ui.label("Browsing committed content; final counts and complete output are pending validation.");}});
+        egui::TopBottomPanel::bottom("paged_status").show(ctx,|ui|{ui.horizontal_wrapped(|ui|{ui.label(format!("{:?}",self.status));if let Some(d)=self.first_frame{ui.label(format!("First frame: {} ms",d.as_millis())).on_hover_text("Time until the first browsable frame was displayed; interactive from that point.");}if let Some(d)=self.ready_at{ui.label(format!("Ready: {} ms",d.as_millis())).on_hover_text("Time until validation finished and complete counts, search, queries and output became available.");}if let Some(frame)=&self.frame{ui.monospace(format!("Ln {}/{}{} · {}",frame.selected_rank+1,if frame.exact{""}else{"≥"},frame.total,self.vim.display()));}ui.label(&self.notice);});if self.status==SessionStatus::Validating{ui.label("Browsing committed content; final counts and complete output are pending validation.");}});
         if self
             .search
             .as_ref()

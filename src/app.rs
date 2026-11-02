@@ -1,6 +1,7 @@
 use crate::engine::query::QueryEngine;
 use crate::engine::budget::{Reservation, Resource};
 use crate::engine::file_source::{Cancellation, Priority, with_io_context};
+use crate::head_view::{self, HeadView};
 use crate::preview_worker::{Output as PreviewOutput, PreviewWorker, ROW_BATCH};
 use crate::{
     document::{Document, LoadProgress, NodeIds, SearchScope},
@@ -39,6 +40,13 @@ struct CopyRequest {
     doc: Arc<Document>,
     selection: Selection,
 }
+/// Read-only first paint produced by a bounded direct read of the file head
+/// while the snapshot and index are still being built in the background.
+struct HeadPaint {
+    file: String,
+    view: HeadView,
+}
+type HeadResult = Result<(String, HeadView), String>;
 
 pub struct Viewer {
     doc: Option<Arc<Document>>,
@@ -64,6 +72,9 @@ pub struct Viewer {
     indexing: bool,
     load_started: Option<Instant>,
     open_duration: Option<Duration>,
+    head: Option<HeadPaint>,
+    head_rx: Option<Receiver<HeadResult>>,
+    first_paint: Option<Duration>,
     search_duration: Option<Duration>,
     path_duration: Option<Duration>,
     expanded: Vec<bool>,
@@ -168,6 +179,9 @@ impl Viewer {
             indexing: false,
             load_started: None,
             open_duration: None,
+            head: None,
+            head_rx: None,
+            first_paint: None,
             search_duration: None,
             path_duration: None,
             expanded: Vec::new(),
@@ -249,6 +263,19 @@ impl Viewer {
         let (tx, rx) = mpsc::channel();
         self.pending = Some(rx);
         self.error = None;
+        // First paint: a bounded direct read of the file head shows real
+        // content immediately; the snapshot, validation and index keep
+        // loading on the worker thread below.
+        let (head_tx, head_rx) = mpsc::channel();
+        self.head_rx = Some(head_rx);
+        let head_path = path.clone();
+        let head_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result =
+                head_view::read_head(&head_path).map(|view| (head_path.display().to_string(), view));
+            let _ = head_tx.send(result);
+            head_ctx.request_repaint();
+        });
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             if !wait_for_old_document(old, &waiting, &cancelled, &ctx) {
@@ -319,6 +346,9 @@ impl Viewer {
         self.loading_cancelled.store(false, Ordering::Relaxed);
         self.large_copy = None;
         self.paste_recovery = None;
+        self.head = None;
+        self.head_rx = None;
+        self.first_paint = None;
         if !self.colors.low_memory_load {
             return None;
         }
@@ -359,6 +389,8 @@ impl Viewer {
         match rx.try_recv() {
             Ok(result) => {
                 self.pending = None;
+                self.head = None;
+                self.head_rx = None;
                 match result {
                     Ok((_doc, _, _))
                         if self.indexing && self.loading_cancelled.load(Ordering::Relaxed) =>
@@ -442,6 +474,8 @@ impl Viewer {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.pending = None;
+                self.head = None;
+                self.head_rx = None;
                 if self.loading_cancelled.load(Ordering::Relaxed) {
                     self.error = None;
                     self.notice = "Opening cancelled; reopen the previous file if needed".into();
@@ -451,6 +485,32 @@ impl Viewer {
                 self.open_duration = self.load_started.take().map(|start| start.elapsed());
             }
             Err(mpsc::TryRecvError::Empty) => (),
+        }
+    }
+    fn poll_head(&mut self) {
+        let Some(rx) = &self.head_rx else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.head_rx = None;
+        if self.doc.is_some() || self.head.is_some() {
+            // The background load already finished (or painted); the full
+            // document supersedes the approximation.
+            return;
+        }
+        match result {
+            Ok((file, view)) => {
+                if let Some(start) = self.load_started {
+                    self.first_paint = Some(start.elapsed());
+                }
+                self.head = Some(HeadPaint { file, view });
+            }
+            Err(_) => {
+                // The head read failed; the background load remains the
+                // source of truth for content and errors.
+            }
         }
     }
     fn open(&mut self, ctx: &egui::Context) {
@@ -1314,6 +1374,62 @@ impl Viewer {
             self.path_results = None; self.query.clear(); self.path_duration = None;
         }
     }
+    fn head_panel(&self, ui: &mut egui::Ui) {
+        let Some(paint) = &self.head else {
+            return;
+        };
+        let view = &paint.view;
+        ui.label(RichText::new(&paint.file).strong());
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.spinner();
+            ui.label(
+                RichText::new(format!(
+                    "First content · root {} · {} of {} bytes read",
+                    view.root_kind.name(),
+                    view.bytes_read,
+                    view.total_bytes
+                ))
+                .strong(),
+            );
+        });
+        ui.label(
+            "Read-only opening preview from a direct head read. The snapshot, validation and index are still being built in the background; the complete tree replaces this page automatically.",
+        );
+        ui.add_space(6.0);
+        let palette = self.colors.active();
+        for entry in &view.entries {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&entry.label)
+                        .monospace()
+                        .strong()
+                        .color(kind_color(entry.kind.name(), palette)),
+                );
+                let preview = ui.add(
+                    egui::Label::new(RichText::new(&entry.preview).monospace()).truncate(),
+                );
+                if !entry.closed {
+                    preview.on_hover_text(
+                        "The value continues beyond the preview block; its end is not final.",
+                    );
+                }
+            });
+        }
+        if view.truncated {
+            ui.add_space(6.0);
+            ui.weak("More content exists beyond this preview; counts and values are not final.");
+        }
+        if let Some(fragment) = &view.fragment {
+            ui.add_space(6.0);
+            ui.weak("Raw opening bytes (no complete entry fits the preview block):");
+            ui.add(egui::Label::new(RichText::new(fragment).monospace()).wrap());
+        }
+        if let Some(note) = &view.parse_note {
+            ui.add_space(6.0);
+            ui.weak(format!("Head scan note: {note} (the full load reports the authoritative error)."));
+        }
+    }
     fn draw(&mut self, ctx: &egui::Context) {
         if self.preview_worker.is_none() {
             self.preview_worker = Some(PreviewWorker::new(ctx.clone()));
@@ -1331,6 +1447,7 @@ impl Viewer {
         self.path_worker
             .get_or_insert_with(|| QueryWorker::new(ctx.clone()));
         self.poll();
+        self.poll_head();
         self.poll_export(ctx);
         self.poll_operations(ctx);
         self.keyboard(ctx);
@@ -1619,6 +1736,9 @@ impl Viewer {
                             ui.label(format!("{label}: {}", format_duration(duration))).on_hover_text("Includes execution and node reveal; selection preview may finish asynchronously; excludes painting.");
                         }
                     }
+                    if let Some(duration) = self.first_paint {
+                        ui.label(format!("First paint: {}", format_duration(duration))).on_hover_text("Time until the opening content was shown from a direct head read; the snapshot and index keep loading in the background.");
+                    }
                     if self.pending.is_some() {
                         if self.indexing { ui.label(self.indexed_progress.status()); }
                         ui.label(if self.waiting_for_old.load(Ordering::Relaxed) {
@@ -1725,20 +1845,24 @@ impl Viewer {
                 ui.separator();
             }
             if self.doc.is_none() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.label(
-                        RichText::new("{ }")
-                            .size(64.0)
-                            .color(Color32::from_rgb(96, 180, 250)),
-                    );
-                    ui.heading("Explore your JSON");
-                    ui.label("Open, paste or drag a JSON file here.");
-                    ui.add_space(20.0);
-                    if ui.button("Open JSON file").clicked() {
-                        self.open(ctx);
-                    }
-                });
+                if self.head.is_some() {
+                    self.head_panel(ui);
+                } else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(100.0);
+                        ui.label(
+                            RichText::new("{ }")
+                                .size(64.0)
+                                .color(Color32::from_rgb(96, 180, 250)),
+                        );
+                        ui.heading("Explore your JSON");
+                        ui.label("Open, paste or drag a JSON file here.");
+                        ui.add_space(20.0);
+                        if ui.button("Open JSON file").clicked() {
+                            self.open(ctx);
+                        }
+                    });
+                }
                 return;
             }
             ui.label(RichText::new(&self.source).strong());

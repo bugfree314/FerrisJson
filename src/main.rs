@@ -23,6 +23,8 @@ use FerrisJson::loading;
 #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod fonts;
 #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
+mod head_view;
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod legacy_search;
 #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 mod palette;
@@ -81,13 +83,14 @@ fn run() -> Result<(), String> {
     let mut sparse = false;
     let mut sparse_pages = false;
     let mut paged_tree = false;
+    let mut glow = false;
     let mut cache_dir = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --indexed      File snapshot/range backend (limited JSONPath; no full Value)\n  --sparse       Experimental progressive paged tree (file only)\n  --sparse-pages  S4 finite-page GUI fallback (Windows/macOS)\n  --paged-tree    Paged renderer for legacy backends (file only)\n  --cache-dir D  S4 persistent snapshot/index cache; requires --sparse\n  --version      Print version\n\nWithout options, opens the viewer (Linux: TUI; macOS: desktop or --features tui; Windows: desktop). Piped stdin is supported in in-memory mode.",
+                    "FerrisJson {}\n\nUsage: FerrisJson [FILE | -] [OPTION]\n\n  --get PATH     Print exactly one selected JSON value\n  --query PATH   Print all JSONPath results as a JSON array\n  --search TEXT  Print matching paths (case-insensitive keys and values)\n  --pretty       Print formatted JSON\n  --indexed      File snapshot/range backend (limited JSONPath; no full Value)\n  --sparse       Experimental progressive paged tree (file only)\n  --sparse-pages  S4 finite-page GUI fallback (Windows/macOS)\n  --paged-tree    Paged renderer for legacy backends (file only)\n  --cache-dir D  S4 persistent snapshot/index cache; requires --sparse\n  --glow         Force the OpenGL renderer (default is wgpu; try this if wgpu fails)\n  --version      Print version\n\nWithout options, opens the viewer (Linux: TUI; macOS: desktop or --features tui; Windows: desktop). Piped stdin is supported in in-memory mode.",
                     env!("CARGO_PKG_VERSION")
                 );
                 return Ok(());
@@ -107,6 +110,7 @@ fn run() -> Result<(), String> {
                 sparse_pages = true;
             }
             "--paged-tree" => paged_tree = true,
+            "--glow" => glow = true,
             "--cache-dir" => {
                 cache_dir = Some(PathBuf::from(
                     args.next().ok_or("--cache-dir requires a directory")?,
@@ -228,18 +232,26 @@ fn run() -> Result<(), String> {
         result
     }
     #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
-    desktop(file, text, use_stdin, indexed, sparse, sparse_pages, paged_tree, cache_dir)
+    desktop(file, text, use_stdin, indexed, sparse, sparse_pages, paged_tree, cache_dir, glow)
 }
 
 #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
 fn desktop(
     file: Option<PathBuf>, text: Option<String>, use_stdin: bool, indexed: bool,
-    sparse: bool, sparse_pages: bool, paged_tree: bool, cache_dir: Option<PathBuf>,
+    sparse: bool, sparse_pages: bool, paged_tree: bool, cache_dir: Option<PathBuf>, glow: bool,
 ) -> Result<(), String> {
     // Finder launches with an empty redirected stdin. Start with an empty viewer
     // instead of trying to parse that as a JSON document; CLI parsing stays strict.
     let text = text.filter(|text| !text.is_empty());
     let options = eframe::NativeOptions {
+        // wgpu works without OpenGL 2.0+ (DirectX 12 / Vulkan / Metal), which
+        // remote desktops and VMs often cannot provide; --glow forces the
+        // OpenGL renderer back on for troubleshooting.
+        renderer: if glow {
+            eframe::Renderer::Glow
+        } else {
+            eframe::Renderer::Wgpu
+        },
         viewport: eframe::egui::ViewportBuilder::default()
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/FerrisJson.png"))
