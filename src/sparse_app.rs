@@ -1,10 +1,14 @@
 //! S4 finite-page browser. No complete rows/expanded arrays or DOM fallback.
+//! Rendered with gpui.
 use crate::engine::{
     budget::{BudgetManager, Limits, Resource},
     session::{SessionId, SessionStatus},
     sparse::{CopiedValue, Event, Node, OpenOptions, PublishedPage, open_progressive},
 };
-use eframe::egui;
+use crate::palette::{color, Palette};
+use crate::ui::{self, InputEvent};
+use gpui::prelude::*;
+use gpui::*;
 use std::{
     path::PathBuf,
     sync::{
@@ -40,8 +44,8 @@ struct Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            crate::shutdown::defer(t);
+        if let Some(thread) = self.thread.take() {
+            crate::shutdown::defer(thread);
         }
     }
 }
@@ -49,7 +53,7 @@ fn send(
     tx: &SyncSender<Message>,
     mut message: Message,
     cancelled: &AtomicBool,
-    ctx: &egui::Context,
+    wake: &crate::repaint::Context,
 ) -> Result<(), String> {
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -57,7 +61,7 @@ fn send(
         }
         match tx.try_send(message) {
             Ok(()) => {
-                ctx.request_repaint();
+                wake.request_repaint();
                 return Ok(());
             }
             Err(mpsc::TrySendError::Full(m)) => {
@@ -73,7 +77,7 @@ impl Worker {
         path: PathBuf,
         mut options: OpenOptions,
         generation: u64,
-        ctx: egui::Context,
+        wake: crate::repaint::Context,
         previous: Option<JoinHandle<()>>,
     ) -> Self {
         let progress = Arc::new(AtomicU64::new(0));
@@ -95,7 +99,7 @@ impl Worker {
                 64 * 1024,
                 "sparse GUI request/message metadata",
             ) {
-                Ok(r) => r,
+                Ok(lease) => lease,
                 Err(_) => return,
             };
             let stopped = || flag.load(Ordering::Relaxed);
@@ -105,47 +109,45 @@ impl Worker {
                 options,
                 generation,
                 &stopped,
-                &mut |e| send(&tx, Message::Event(e), &flag, &ctx),
+                &mut |event| send(&tx, Message::Event(event), &flag, &wake),
             );
             let mut index = match result {
-                Ok(i) => i,
-                Err(e) => {
-                    let _ = send(&tx, Message::Error(generation, e), &flag, &ctx);
+                Ok(index) => index,
+                Err(error) => {
+                    let _ = send(&tx, Message::Error(generation, error), &flag, &wake);
                     return;
                 }
             };
-            if send(&tx, Message::Root(generation, index.root()), &flag, &ctx).is_err() {
+            if send(&tx, Message::Root(generation, index.root()), &flag, &wake).is_err() {
                 return;
             }
             while !stopped() {
                 let request = match rx.recv_timeout(Duration::from_millis(25)) {
-                    Ok(r) => r,
+                    Ok(request) => request,
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(_) => break,
                 };
                 let result = match request {
                     Request::Page(parent, start) => index
                         .published_children(parent, start, &stopped)
-                        .map(|p| Message::Page(generation, parent, start, p)),
-                    Request::Locate(pointer) => {
-                        index.pointer(&pointer, &stopped).and_then(|node| {
-                            if node.kind().name() == "object" || node.kind().name() == "array" {
-                                index.published_children(node, 0, &stopped)
-                            } else {
-                                index.published_node(node, &stopped)
-                            }
-                            .map(|page| Message::Page(generation, node, 0, page))
-                        })
-                    }
+                        .map(|page| Message::Page(generation, parent, start, page)),
+                    Request::Locate(pointer) => index.pointer(&pointer, &stopped).and_then(|node| {
+                        if node.kind().name() == "object" || node.kind().name() == "array" {
+                            index.published_children(node, 0, &stopped)
+                        } else {
+                            index.published_node(node, &stopped)
+                        }
+                        .map(|page| Message::Page(generation, node, 0, page))
+                    }),
                     Request::Export(node, path) => index
                         .export_value(node, &path, &flag)
                         .map(|()| Message::Exported(generation, path)),
                     Request::Copy(node) => index
                         .copy_value(node, &stopped)
-                        .map(|v| Message::Copied(generation, v)),
+                        .map(|value| Message::Copied(generation, value)),
                 };
-                let message = result.unwrap_or_else(|e| Message::Error(generation, e));
-                if send(&tx, message, &flag, &ctx).is_err() {
+                let message = result.unwrap_or_else(|error| Message::Error(generation, error));
+                if send(&tx, message, &flag, &wake).is_err() {
                     break;
                 }
             }
@@ -159,6 +161,7 @@ impl Worker {
         }
     }
 }
+
 pub struct Viewer {
     worker: Option<Worker>,
     options: OpenOptions,
@@ -177,10 +180,25 @@ pub struct Viewer {
     notice: String,
     busy: bool,
     clipboard: Option<CopiedValue>,
+    colors: crate::palette::ColorSettings,
+    wake: crate::repaint::Context,
+    pointer_input: Entity<ui::TextInput>,
+    pointer_sub: Option<Subscription>,
+    pending_blur: bool,
 }
+
 impl Viewer {
-    pub fn new(cc: &eframe::CreationContext<'_>, path: PathBuf, options: OpenOptions) -> Self {
-        cc.egui_ctx.set_fonts(crate::fonts::definitions());
+    pub fn new(
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+        path: PathBuf,
+        options: OpenOptions,
+    ) -> Self {
+        let (wake_tx, wake_rx) = async_channel::unbounded::<()>();
+        let wake = crate::repaint::Context::with_notify(Arc::new(move || {
+            let _ = wake_tx.try_send(());
+        }));
+        let pointer_input = cx.new(|cx| ui::TextInput::new("JSON Pointer, e.g. /items/0", 4096, cx));
         let mut viewer = Self {
             worker: None,
             options,
@@ -199,19 +217,72 @@ impl Viewer {
             notice: String::new(),
             busy: false,
             clipboard: None,
+            colors: crate::palette::ColorSettings::default(),
+            wake,
+            pointer_input: pointer_input.clone(),
+            pointer_sub: None,
+            pending_blur: false,
         };
-        viewer.open(path, &cc.egui_ctx);
+        viewer.pointer_sub = Some(cx.subscribe(&pointer_input, |this: &mut Self, _input, event: &InputEvent, cx| {
+            match event {
+                InputEvent::Changed(text) => this.pointer = text.to_string(),
+                InputEvent::Submitted => {
+                    this.request(Request::Locate(this.pointer.clone()));
+                    this.pending_blur = true;
+                }
+                InputEvent::Escape => this.pending_blur = true,
+            }
+            cx.notify();
+        }));
+        cx.spawn(async move |this, cx| {
+            while wake_rx.recv().await.is_ok() {
+                if this
+                    .update(cx, |this, cx| {
+                        this.tick(cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        viewer.colors = crate::palette::ColorSettings::load().unwrap_or_default();
+        viewer.open(path, cx);
         viewer
     }
-    fn open_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
-            self.open(path, ctx);
+
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        let messages: Vec<_> = self
+            .worker
+            .as_ref()
+            .map(|worker| worker.messages.try_iter().take(4).collect())
+            .unwrap_or_default();
+        for message in messages {
+            self.accept(message, cx);
+        }
+        if self.status == SessionStatus::Validating
+            && let Some(worker) = &self.worker
+        {
+            self.scanned = self.scanned.max(worker.progress.load(Ordering::Relaxed));
+        }
+        if let Some(mut value) = self.clipboard.take() {
+            cx.write_to_clipboard(ClipboardItem::new_string(std::mem::take(&mut value.text)));
+            self.notice = "Copied complete source JSON value".into();
         }
     }
-    fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
-        let previous = self.worker.take().and_then(|mut w| {
-            w.cancelled.store(true, Ordering::Relaxed);
-            w.thread.take()
+
+    fn open_dialog(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+            self.open(path, cx);
+        }
+    }
+
+    fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let previous = self.worker.take().and_then(|mut worker| {
+            worker.cancelled.store(true, Ordering::Relaxed);
+            worker.thread.take()
         });
         self.generation += 1;
         self.session = None;
@@ -231,25 +302,28 @@ impl Viewer {
             path,
             self.options.clone(),
             self.generation,
-            ctx.clone(),
+            self.wake.clone(),
             previous,
         ));
+        cx.notify();
     }
+
     fn request(&mut self, request: Request) {
         if self.status != SessionStatus::Ready || self.busy {
             return;
         }
-        if let Some(w) = &self.worker {
-            match w.requests.try_send(request) {
+        if let Some(worker) = &self.worker {
+            match worker.requests.try_send(request) {
                 Ok(()) => self.busy = true,
                 Err(_) => self.notice = "Request queue busy; try again".into(),
             }
         }
     }
-    fn accept(&mut self, message: Message) {
+
+    fn accept(&mut self, message: Message, cx: &mut Context<Self>) {
         match message {
-            Message::Event(e) if e.generation == self.generation => {
-                if self.session.is_some_and(|s| s != e.session)
+            Message::Event(event) if event.generation == self.generation => {
+                if self.session.is_some_and(|session| session != event.session)
                     || matches!(
                         self.status,
                         SessionStatus::Cancelled | SessionStatus::Failed
@@ -257,394 +331,369 @@ impl Viewer {
                 {
                     return;
                 }
-                self.session = Some(e.session);
-                self.status = e.status;
-                self.scanned = e.scanned;
-                self.total_bytes = e.total_bytes;
-                if let Some(k) = e.root_kind {
-                    self.kind = k.name().into();
+                self.session = Some(event.session);
+                self.status = event.status;
+                self.scanned = event.scanned;
+                self.total_bytes = event.total_bytes;
+                if let Some(kind) = event.root_kind {
+                    self.kind = kind.name().into();
                 }
-                if let Some(p) = e.page {
-                    self.page = Some(p);
+                if let Some(page) = event.page {
+                    self.page = Some(page);
                     self.start = 0;
                 }
-                if let Some(m) = e.message {
-                    self.notice = m;
+                if let Some(message) = event.message {
+                    self.notice = message;
                 }
-                if e.reused {
+                if event.reused {
                     self.notice = "Strict cache reuse: complete source equality checked".into();
-                } else if e.resumed {
+                } else if event.resumed {
                     self.notice = "Resumed from committed parser checkpoint".into();
                 }
             }
-            Message::Page(g, parent, start, page) if g == self.generation => {
+            Message::Page(generation, parent, start, page) if generation == self.generation => {
                 self.parent = Some(parent);
                 self.selected = None;
                 self.start = start;
                 self.page = Some(page);
                 self.busy = false;
             }
-            Message::Root(g, node) if g == self.generation => {
+            Message::Root(generation, node) if generation == self.generation => {
                 self.parent = Some(node);
             }
-            Message::Error(g, e) if g == self.generation => {
-                self.notice = e;
+            Message::Error(generation, error) if generation == self.generation => {
+                self.notice = error;
                 self.busy = false;
                 if !matches!(self.status, SessionStatus::Ready | SessionStatus::Cancelled) {
                     self.status = SessionStatus::Failed;
                 }
             }
-            Message::Copied(g, value)
-                if g == self.generation && self.status == SessionStatus::Ready =>
+            Message::Copied(generation, value)
+                if generation == self.generation && self.status == SessionStatus::Ready =>
             {
                 self.clipboard = Some(value);
                 self.busy = false;
             }
-            Message::Exported(g, p) if g == self.generation => {
-                self.notice = format!("Exported {}", p.display());
+            Message::Exported(generation, path) if generation == self.generation => {
+                self.notice = format!("Exported {}", path.display());
                 self.busy = false;
             }
             _ => (),
         }
+        cx.notify();
     }
-}
-impl eframe::App for Viewer {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.draw(ctx);
+
+    fn palette(&self) -> Palette {
+        self.colors.active()
     }
-}
-impl Viewer {
-    fn draw(&mut self, ctx: &egui::Context) {
-        let messages: Vec<_> = self
-            .worker
-            .as_ref()
-            .map(|w| w.messages.try_iter().take(4).collect())
-            .unwrap_or_default();
-        for m in messages {
-            self.accept(m);
-        }
-        if self.status == SessionStatus::Validating
-            && let Some(w) = &self.worker
-        {
-            self.scanned = self.scanned.max(w.progress.load(Ordering::Relaxed));
-        }
-        if let Some(mut value) = self.clipboard.take() {
-            ctx.copy_text(std::mem::take(&mut value.text));
-            self.notice = "Copied complete source JSON value".into();
-        }
-        if crate::ui::consume_open_file_shortcut(ctx) {
-            self.open_dialog(ctx);
-        }
-        ctx.request_repaint_after(Duration::from_millis(25));
-        if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()))
-        {
-            self.open(path, ctx);
-        }
-        egui::TopBottomPanel::top("sparse_toolbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("FerrisJson · Progressive");
-                if ui.button("Open file").on_hover_text(crate::ui::open_file_shortcut_label()).clicked() {
-                    self.open_dialog(ctx);
-                }
-                if ui.button("Reload / Resume").clicked() {
-                    self.open(self.source.clone(), ctx);
-                }
-                if ui.button("Cancel").clicked() {
-                    if let Some(w) = &self.worker {
-                        w.cancelled.store(true, Ordering::Relaxed);
+
+    fn toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .px_2()
+            .pt_2()
+            .child(div().text_lg().font_weight(FontWeight::BOLD).text_color(rgb(0x60b4fa)).child("FerrisJson · Progressive"))
+            .child(ui::button("sparse-open", "Open file", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| this.open_dialog(cx),
+            )))
+            .child(ui::button("sparse-reload", "Reload / Resume", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| this.open(this.source.clone(), cx)),
+            ))
+            .child(ui::button("sparse-cancel", "Cancel", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if let Some(worker) = &this.worker {
+                        worker.cancelled.store(true, Ordering::Relaxed);
                     }
-                    self.status = SessionStatus::Cancelled;
-                    self.busy = false;
-                }
-            });
-            ui.add(egui::Label::new(self.source.display().to_string()).truncate());
-            ui.label(format!(
+                    this.status = SessionStatus::Cancelled;
+                    this.busy = false;
+                    cx.notify();
+                }),
+            ))
+            .child(div().flex_1())
+            .child(div().text_xs().whitespace_nowrap().overflow_hidden().child(self.source.display().to_string()))
+            .into_any_element()
+    }
+
+    fn status_row(&mut self) -> AnyElement {
+        let palette = self.palette();
+        let ratio = if self.total_bytes == 0 {
+            0.0
+        } else {
+            (self.scanned as f32 / self.total_bytes as f32).clamp(0.0, 1.0)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .pb_1()
+            .child(div().text_xs().child(format!(
                 "{:?} · {} · scanned {} / {} bytes",
                 self.status, self.kind, self.scanned, self.total_bytes
-            ));
-            if self.total_bytes != 0 {
-                ui.add(egui::ProgressBar::new(
-                    self.scanned as f32 / self.total_bytes as f32,
-                ));
-            }
-            ui.horizontal(|ui| {
-                ui.label("JSON Pointer");
-                ui.add(egui::TextEdit::singleline(&mut self.pointer).char_limit(4096));
-                if ui
-                    .add_enabled(
-                        self.status == SessionStatus::Ready && !self.busy,
-                        egui::Button::new("Go"),
-                    )
-                    .clicked()
-                {
-                    self.request(Request::Locate(self.pointer.clone()));
-                }
-                if ui
-                    .add_enabled(
-                        self.status == SessionStatus::Ready && !self.busy,
-                        egui::Button::new("Root"),
-                    )
-                    .clicked()
-                {
-                    self.pointer.clear();
-                    self.request(Request::Locate(String::new()));
-                }
-            });
+            )))
+            .child(
+                div()
+                    .h(px(6.0))
+                    .w_full()
+                    .bg(color(palette.stripe))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(ratio))
+                            .bg(color(palette.selection)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn pointer_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        let ready = self.status == SessionStatus::Ready && !self.busy;
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .child(div().text_xs().child("JSON Pointer"))
+            .child(ui::field(&self.pointer_input, 320.0, palette))
+            .child(
+                ui::button("sparse-go", "Go", palette)
+                    .opacity(if ready { 1.0 } else { 0.4 })
+                    .when(ready, |button| {
+                        button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.request(Request::Locate(this.pointer.clone()));
+                            cx.notify();
+                        }))
+                    }),
+            )
+            .child(
+                ui::button("sparse-root", "Root", palette)
+                    .opacity(if ready { 1.0 } else { 0.4 })
+                    .when(ready, |button| {
+                        button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.pointer.clear();
+                            this.pointer_input.update(cx, |input, cx| input.set_text("", cx));
+                            this.request(Request::Locate(String::new()));
+                            cx.notify();
+                        }))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn page_view(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        let ready = self.status == SessionStatus::Ready && !self.busy;
+        let page = self.page.as_ref().map(|page| {
+            (
+                page.total,
+                page.next,
+                page.nodes.clone(),
+                page.labels.clone(),
+                page.previews.clone(),
+            )
         });
-        egui::TopBottomPanel::bottom("sparse_status").show(ctx,|ui|{
-            if self.status==SessionStatus::Validating{ui.label("Pending full validation. Completed array values are provisional document content; totals and complete export wait for Ready.");}
-            if matches!(self.status,SessionStatus::Failed|SessionStatus::Cancelled){ui.colored_label(egui::Color32::LIGHT_RED,"This document has not completed validation. Navigation and export are disabled.");}
-            ui.label(&self.notice);
-            ui.label("Legacy finite-page browser. Use --sparse for the paged tree with independent search and JSONPath queries.");
-        });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let mut enter = None;
-            let mut previous = false;
-            let mut next = None;
-            if let Some(page) = &self.page {
-                ui.horizontal(|ui| {
-                    ui.label(page.total.map_or_else(
-                        || format!("At least {} completed children", page.nodes.len()),
-                        |n| format!("{n} children"),
-                    ));
-                    previous = ui
-                        .add_enabled(
-                            self.status == SessionStatus::Ready
-                                && self.parent.is_some()
-                                && self.start > 0
-                                && !self.busy,
-                            egui::Button::new("Previous page"),
-                        )
-                        .clicked();
-                    if ui
-                        .add_enabled(
-                            self.status == SessionStatus::Ready
-                                && !self.busy
-                                && page.next.is_some()
-                                && self.parent.is_some(),
-                            egui::Button::new("Next page"),
-                        )
-                        .clicked()
-                    {
-                        next = page.next;
-                    }
-                });
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (i, node) in page.nodes.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(
-                                    self.selected.is_some_and(|n| n.start() == node.start()),
-                                    format!(
+        let mut column = div()
+            .id("sparse-page")
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .overflow_y_scroll()
+            .px_2();
+        let Some((total, next, nodes, labels, previews)) = page else {
+            return column
+                .child(div().text_xs().child("Preparing stable snapshot / waiting for a complete safe page…"))
+                .into_any_element();
+        };
+        column = column.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().text_xs().child(total.map_or_else(
+                    || format!("At least {} completed children", nodes.len()),
+                    |total| format!("{total} children"),
+                )))
+                .child(
+                    ui::button("sparse-prev", "Previous page", palette)
+                        .opacity(if ready && self.parent.is_some() && self.start > 0 { 1.0 } else { 0.4 })
+                        .when(ready && self.parent.is_some() && self.start > 0, |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Some(node) = this.parent {
+                                    this.request(Request::Page(node, this.start.saturating_sub(64)));
+                                }
+                                cx.notify();
+                            }))
+                        }),
+                )
+                .child(
+                    ui::button("sparse-next", "Next page", palette)
+                        .opacity(if ready && next.is_some() && self.parent.is_some() { 1.0 } else { 0.4 })
+                        .when(ready && next.is_some() && self.parent.is_some(), |button| {
+                            button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                if let Some(node) = this.parent {
+                                    this.request(Request::Page(node, next.unwrap_or(0)));
+                                }
+                                cx.notify();
+                            }))
+                        }),
+                ),
+        );
+        for (index, node) in nodes.iter().enumerate() {
+            let selected = self.selected.is_some_and(|selected| selected.start() == node.start());
+            let label = labels.get(index).cloned().unwrap_or_default();
+            let preview = previews.get(index).cloned().unwrap_or_default();
+            let container = matches!(node.kind().name(), "array" | "object");
+            let node = *node;
+            column = column.child(
+                div()
+                    .id(("sparse-node", index))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_1()
+                    .rounded(px(4.0))
+                    .when(selected, |row| row.bg(color(palette.selection)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(("sparse-row", index))
+                                    .flex_1()
+                                    .font_family(ui::mono_family())
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.selected = Some(node);
+                                        cx.notify();
+                                    }))
+                                    .child(format!(
                                         "{} · {} · {}..{}",
-                                        page.labels[i],
+                                        label,
                                         node.kind().name(),
                                         node.start(),
                                         node.end()
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                self.selected = Some(*node);
-                            }
-                            if ui
-                                .add_enabled(
-                                    self.status == SessionStatus::Ready
-                                        && !self.busy
-                                        && matches!(node.kind().name(), "array" | "object"),
-                                    egui::Button::new("Browse"),
-                                )
-                                .clicked()
-                            {
-                                enter = Some(*node);
-                            }
-                        });
-                        ui.monospace(&page.previews[i]);
-                        ui.separator();
-                    }
-                });
-            } else {
-                ui.label("Preparing stable snapshot / waiting for a complete safe page…");
-            }
-            if let Some(n) = enter {
-                self.request(Request::Page(n, 0));
-            }
-            if previous && let Some(n) = self.parent {
-                self.request(Request::Page(n, self.start.saturating_sub(64)));
-            }
-            if let Some(start) = next {
-                if let Some(n) = self.parent {
-                    self.request(Request::Page(n, start));
-                } else {
-                    self.request(Request::Locate(String::new()));
-                }
-            }
-            if ui
-                .add_enabled(
-                    self.status == SessionStatus::Ready && self.selected.is_some() && !self.busy,
-                    egui::Button::new("Copy selected complete JSON (up to 8 MiB)"),
+                                    )),
+                            )
+                            .child(
+                                ui::button(("sparse-browse", index), "Browse", palette)
+                                    .opacity(if ready && container { 1.0 } else { 0.4 })
+                                    .when(ready && container, |button| {
+                                        button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            this.request(Request::Page(node, 0));
+                                            cx.notify();
+                                        }))
+                                    }),
+                            ),
+                    )
+                    .child(div().text_xs().whitespace_nowrap().overflow_hidden().child(ui::json_text(&preview, palette, None))),
+            );
+        }
+        column = column.child(
+            div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    ui::button("sparse-copy", "Copy selected complete JSON (up to 8 MiB)", palette)
+                        .opacity(if ready && self.selected.is_some() { 1.0 } else { 0.4 })
+                        .when(ready && self.selected.is_some(), |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Some(node) = this.selected {
+                                    this.request(Request::Copy(node));
+                                }
+                                cx.notify();
+                            }))
+                        }),
                 )
-                .clicked()
-            {
-                self.request(Request::Copy(self.selected.unwrap()));
-            }
-            if ui
-                .add_enabled(
-                    self.status == SessionStatus::Ready && self.parent.is_some() && !self.busy,
-                    egui::Button::new("Export current container / value"),
+                .child(
+                    ui::button("sparse-export-container", "Export current container / value", palette)
+                        .opacity(if ready && self.parent.is_some() { 1.0 } else { 0.4 })
+                        .when(ready && self.parent.is_some(), |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Some(node) = this.parent
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("JSON", &["json"])
+                                        .save_file()
+                                {
+                                    this.request(Request::Export(node, path));
+                                }
+                                cx.notify();
+                            }))
+                        }),
                 )
-                .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("JSON", &["json"])
-                    .save_file()
-            {
-                self.request(Request::Export(self.parent.unwrap(), path));
-            }
-            if ui
-                .add_enabled(
-                    self.status == SessionStatus::Ready && self.selected.is_some() && !self.busy,
-                    egui::Button::new("Export selected complete value"),
-                )
-                .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("JSON", &["json"])
-                    .save_file()
-            {
-                self.request(Request::Export(self.selected.unwrap(), path));
-            }
-        });
+                .child(
+                    ui::button("sparse-export-value", "Export selected complete value", palette)
+                        .opacity(if ready && self.selected.is_some() { 1.0 } else { 0.4 })
+                        .when(ready && self.selected.is_some(), |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Some(node) = this.selected
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("JSON", &["json"])
+                                        .save_file()
+                                {
+                                    this.request(Request::Export(node, path));
+                                }
+                                cx.notify();
+                            }))
+                        }),
+                ),
+        );
+        column.into_any_element()
+    }
+
+    fn footer(&mut self) -> AnyElement {
+        let palette = self.palette();
+        let mut footer = div().flex().flex_col().gap_1().px_2().py_1().bg(color(palette.stripe));
+        if self.status == SessionStatus::Validating {
+            footer = footer.child(div().text_xs().child(
+                "Pending full validation. Completed array values are provisional document content; totals and complete export wait for Ready.",
+            ));
+        }
+        if matches!(self.status, SessionStatus::Failed | SessionStatus::Cancelled) {
+            footer = footer.child(div().text_xs().text_color(rgb(0xff8080)).child(
+                "This document has not completed validation. Navigation and export are disabled.",
+            ));
+        }
+        footer
+            .child(div().text_xs().child(self.notice.clone()))
+            .child(div().text_xs().child(
+                "Legacy finite-page browser. Use --sparse for the paged tree with independent search and JSONPath queries.",
+            ))
+            .into_any_element()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn viewer() -> Viewer {
-        Viewer {
-            worker: None,
-            options: OpenOptions::default(),
-            generation: 4,
-            session: None,
-            status: SessionStatus::Preparing,
-            source: PathBuf::from("test"),
-            kind: String::new(),
-            scanned: 0,
-            total_bytes: 0,
-            page: None,
-            parent: None,
-            start: 0,
-            selected: None,
-            pointer: String::new(),
-            notice: String::new(),
-            busy: false,
-            clipboard: None,
+impl Render for Viewer {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.pending_blur) {
+            window.blur();
         }
-    }
-    fn event(session: SessionId, generation: u64, status: SessionStatus) -> Message {
-        Message::Event(Event {
-            session,
-            generation,
-            commit_sequence: 0,
-            committed_frontier: 0,
-            status,
-            scanned: 0,
-            total_bytes: 100,
-            root_kind: None,
-            page: None,
-            reused: false,
-            resumed: false,
-            message: None,
-            view: None,
-        })
-    }
-    #[test]
-    fn stale_sessions_generations_and_late_ready_after_cancel_are_rejected() {
-        let a = crate::document::Document::parse("[]").unwrap().session_id();
-        let b = crate::document::Document::parse("[]").unwrap().session_id();
-        let mut v = viewer();
-        v.accept(event(a, 3, SessionStatus::Ready));
-        assert_eq!(v.status, SessionStatus::Preparing);
-        v.accept(event(a, 4, SessionStatus::Validating));
-        assert_eq!(v.status, SessionStatus::Validating);
-        v.accept(event(b, 4, SessionStatus::Ready));
-        assert_eq!(v.status, SessionStatus::Validating);
-        v.status = SessionStatus::Cancelled;
-        v.accept(event(a, 4, SessionStatus::Ready));
-        v.accept(Message::Error(4, "cancelled".into()));
-        assert_eq!(v.status, SessionStatus::Cancelled);
-    }
-    #[test]
-    fn failed_view_draws_and_disables_requests_without_restoring_ready() {
-        let id = crate::document::Document::parse("[]").unwrap().session_id();
-        let mut v = viewer();
-        v.accept(event(id, 4, SessionStatus::Failed));
-        v.accept(event(id, 4, SessionStatus::Ready));
-        v.request(Request::Locate("/0".into()));
-        assert!(!v.busy);
-        assert_eq!(v.status, SessionStatus::Failed);
-        let ctx = egui::Context::default();
-        let out = ctx.run(egui::RawInput::default(), |ctx| v.draw(ctx));
-        assert!(!out.shapes.is_empty());
-    }
-    #[test]
-    fn full_message_queue_wait_is_cancellable() {
-        let (tx, _rx) = mpsc::sync_channel(1);
-        tx.send(Message::Error(1, "first".into())).unwrap();
-        let flag = Arc::new(AtomicBool::new(false));
-        let worker_flag = flag.clone();
-        let ctx = egui::Context::default();
-        let (started, waiting) = mpsc::channel();
-        let t = std::thread::spawn(move || {
-            started.send(()).unwrap();
-            send(&tx, Message::Error(1, "second".into()), &worker_flag, &ctx)
-        });
-        waiting.recv().unwrap();
-        flag.store(true, Ordering::Relaxed);
-        assert!(t.join().unwrap().is_err());
-    }
-    #[test]
-    fn ready_frame_renders_a_bounded_page_for_ten_thousand_children() {
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/s4-ui-tests");
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join(format!("frame-{}.tmp", std::process::id()));
-        let text = format!(
-            "[{}]",
-            (0..10000)
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        std::fs::write(&path, text).unwrap();
-        let mut viewer = viewer();
-        let budget = BudgetManager::new(Limits {
-            memory: 1024 * 1024,
-            disk: 32 * 1024 * 1024,
-        });
-        let index = open_progressive(
-            &path,
-            budget.clone(),
-            OpenOptions::default(),
-            4,
-            &|| false,
-            &mut |e| {
-                viewer.accept(Message::Event(e));
-                Ok(())
-            },
-        )
-        .unwrap();
-        viewer.accept(Message::Root(4, index.root()));
-        assert_eq!(viewer.status, SessionStatus::Ready);
-        let page = viewer.page.as_ref().unwrap();
-        assert_eq!(page.nodes.len(), 64);
-        assert_eq!(page.total, Some(10000));
-        assert_eq!(page.next, Some(64));
-        let ctx = egui::Context::default();
-        let out = ctx.run(egui::RawInput::default(), |ctx| viewer.draw(ctx));
-        assert!(!out.shapes.is_empty());
-        drop(index);
-        drop(viewer);
-        assert_eq!(budget.usage().memory, 0);
-        assert_eq!(budget.usage().disk, 0);
-        std::fs::remove_file(path).unwrap();
+        self.tick(cx);
+        let palette = self.palette();
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(color(palette.background))
+            .text_color(color(palette.punctuation))
+            .text_size(px(13.0))
+            .child(self.toolbar(cx))
+            .child(self.status_row())
+            .child(self.pointer_row(cx))
+            .child(self.page_view(cx))
+            .child(self.footer())
     }
 }

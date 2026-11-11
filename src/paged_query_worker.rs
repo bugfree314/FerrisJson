@@ -5,10 +5,7 @@ use crate::engine::{
     query::{QueryEngine, QueryRequest, stream::{Event, Input}},
     results::{ResultStore, State},
 };
-#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
-use eframe::egui;
-#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
-use crate::terminal_wake as egui;
+use crate::repaint;
 use std::{sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}}, thread::JoinHandle, time::{Duration, Instant}};
 
 struct Request { generation: u64, query: QueryRequest, _lease: Arc<Reservation> }
@@ -19,7 +16,7 @@ struct Inbox {
 }
 struct Shared {
     inbox: Mutex<Inbox>, changed: Condvar, epoch: Arc<AtomicU64>, stop: Arc<AtomicBool>,
-    budget: BudgetManager, ctx: egui::Context, wake: Arc<dyn Fn() + Send + Sync>,
+    budget: BudgetManager, ctx: repaint::Context, wake: Arc<dyn Fn() + Send + Sync>,
 }
 #[derive(Clone)]
 pub struct QueryHub(Arc<Shared>);
@@ -29,7 +26,7 @@ pub struct Snapshot {
     _lease: Option<Arc<Reservation>>,
 }
 impl QueryHub {
-    pub fn new(budget: BudgetManager, stop: Arc<AtomicBool>, ctx: egui::Context, wake: Arc<dyn Fn() + Send + Sync>) -> (Self, JoinHandle<()>) {
+    pub fn new(budget: BudgetManager, stop: Arc<AtomicBool>, ctx: repaint::Context, wake: Arc<dyn Fn() + Send + Sync>) -> (Self, JoinHandle<()>) {
         let hub = Self(Arc::new(Shared {
             inbox: Mutex::new(Inbox { pending: None, job: None, active: None, store: None, expression: String::new(), error: String::new(), elapsed: None, _lease: None }),
             changed: Condvar::new(), epoch: Arc::new(AtomicU64::new(0)), stop, budget, ctx, wake,

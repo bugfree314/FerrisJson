@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:eframe", "dep:rfd"]
+desktop = ["dep:gpui", "dep:rfd", "dep:async-channel"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:signal-hook", "dep:unicode-width"]
 
 [dependencies]
@@ -27,8 +27,9 @@ winresource = "0.1"
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-eframe = { version = "0.33", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+gpui = { version = "0.2.2", optional = true }
 rfd = { version = "0.15", optional = true }
+async-channel = { version = "2", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ratatui = { version = "0.30.2", optional = true, default-features = false, features = ["crossterm"] }

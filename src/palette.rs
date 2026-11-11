@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32};
+use gpui::Rgba;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -31,6 +31,17 @@ impl Preset {
             Self::Custom => "Custom",
         }
     }
+    /// Cycle to the next preset for the toolbar shortcut.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Ferris => Self::Monokai,
+            Self::Monokai => Self::Solarized,
+            Self::Solarized => Self::Claude,
+            Self::Claude => Self::VsCode,
+            Self::VsCode => Self::Custom,
+            Self::Custom => Self::Ferris,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -47,11 +58,11 @@ pub struct Palette {
     pub selection: [u8; 3],
     pub search_match: [u8; 3],
 }
-pub fn color(rgb: [u8; 3]) -> Color32 {
-    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+pub fn color(rgb: [u8; 3]) -> Rgba {
+    gpui::rgb(((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | rgb[2] as u32)
 }
 impl Palette {
-    pub fn kind(self, kind: &str) -> Color32 {
+    pub fn kind(self, kind: &str) -> Rgba {
         color(match kind {
             "string" => self.string,
             "number" => self.number,
@@ -120,20 +131,6 @@ impl Palette {
             selection: c[9],
             search_match: c[10],
         }
-    }
-    pub fn apply(self, ctx: &egui::Context, dark: bool) {
-        let mut visuals = if dark {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        };
-        visuals.panel_fill = color(self.background);
-        visuals.window_fill = color(self.background);
-        visuals.extreme_bg_color = color(self.background);
-        visuals.faint_bg_color = color(self.stripe);
-        visuals.override_text_color = Some(color(self.punctuation));
-        visuals.selection.bg_fill = color(self.selection);
-        ctx.set_visuals(visuals);
     }
 }
 

@@ -5,6 +5,9 @@
 #[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 use FerrisJson::{document, engine};
 #[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
+#[path = "../src/repaint.rs"]
+mod repaint;
+#[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]
 #[path = "../src/fonts.rs"]
 mod fonts;
 #[cfg(all(not(test), not(any(target_os = "linux", all(target_os = "macos", feature = "tui")))))]

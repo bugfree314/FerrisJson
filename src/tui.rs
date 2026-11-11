@@ -5,7 +5,7 @@ use crate::{
     engine::{budget::Reservation, results::{State, Status as ResultStatus}, search::Query,
         session::SessionStatus, sparse::OpenOptions, tree::{Clipboard, TreeFrame},
         tree_navigation::Navigation},
-    terminal_wake::Context,
+    repaint::Context,
     tree_worker::{Backend, ResultPage, Status, Task},
     vim::{Action, Vim},
 };

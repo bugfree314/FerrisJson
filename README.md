@@ -140,9 +140,18 @@ Indexed / Sparse 新查询入口支持普通选择器、存在性、标量比较
 
 | 平台 | 构建准备与默认界面 |
 | --- | --- |
-| Windows | Rust MSVC 工具链、C++ Build Tools 与含资源编译器的 Windows SDK；默认 GUI |
+| Windows | Rust MSVC 工具链、C++ Build Tools、含 `fxc.exe` 的 Windows SDK；默认 GUI。Release 构建还需按下方说明指定 shader 编译器 |
 | macOS | Rust、Xcode Command Line Tools（`xcode-select --install`）；默认 GUI，可选 TUI；打包配置最低 macOS 11.0，实际兼容性待验收 |
 | Linux | Rust、C 链接工具；默认 TUI，无需 X11 / Wayland / GTK 开发包 |
+
+Windows 的 gpui Release 构建会用 Windows SDK 的 `fxc.exe` 编译 HLSL 着色器。gpui 只自动查找 PATH 和 SDK `10.0.26100.0`；其他 SDK 版本或未加入 PATH 时，构建前设置 `GPUI_FXC_PATH`，例如：
+
+```powershell
+$env:GPUI_FXC_PATH = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe"
+cargo build --release --locked --bin FerrisJson
+```
+
+调试构建（不加 `--release`）不编译着色器，因此不需要 `fxc.exe`；当前验证过的构建方式是 Release。
 
 在仓库根目录运行：
 
@@ -203,7 +212,7 @@ cargo run --release --locked --example generate_json -- 100MB target/local-100MB
 
 | 组件 | 用途 |
 | --- | --- |
-| [egui / eframe](https://github.com/emilk/egui) | 桌面 GUI、绘制与应用框架 |
+| [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) | 桌面 GUI 渲染与应用框架 |
 | [rfd](https://github.com/PolyMeilex/rfd) | 原生文件对话框 |
 | [Serde](https://github.com/serde-rs/serde)、[serde_json](https://github.com/serde-rs/json) | 配置序列化、JSON 解析与输出 |
 | [serde_json_path](https://github.com/hiltontj/serde_json_path) | JSONPath 校验及 Memory 兼容查询 |

@@ -59,7 +59,7 @@ pub struct PreviewWorker {
     pub rows_busy: bool,
 }
 impl PreviewWorker {
-    pub fn new(ctx: eframe::egui::Context) -> Self {
+    pub fn new(ctx: crate::repaint::Context) -> Self {
         let inbox = Arc::new((Mutex::new(Inbox::default()), Condvar::new()));
         let selection_epoch = Arc::new(AtomicU64::new(0));
         let rows_epoch = Arc::new(AtomicU64::new(0));
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn selection_and_viewport_results_are_bounded_and_reject_other_sessions() {
         let doc = Arc::new(Document::parse(r#"{"one":"first","two":"last"}"#).unwrap());
-        let mut worker = PreviewWorker::new(eframe::egui::Context::default());
+        let mut worker = PreviewWorker::new(crate::repaint::Context::default());
         worker
             .select(Arc::clone(&doc), doc.node_ref(1).unwrap())
             .unwrap();
@@ -362,7 +362,7 @@ mod tests {
                 .unwrap(),
         );
         let weak = Arc::downgrade(&doc);
-        let mut worker = PreviewWorker::new(eframe::egui::Context::default());
+        let mut worker = PreviewWorker::new(crate::repaint::Context::default());
         worker
             .select(Arc::clone(&doc), doc.node_ref(1).unwrap())
             .unwrap();

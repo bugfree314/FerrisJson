@@ -137,7 +137,7 @@ cat /path/to/data.json | ./target/release/FerrisJson --pretty
 
 - --sparse 保留实验性、渐进验证、目录密度／首屏延迟及缓存限制；--indexed 仍建立完整结构索引；Linux TUI 不再设置固定内存配额，Memory 会保留完整 Value，大文件可显式选择 --sparse。
 - --paged-tree 在 Linux 使用同一 TUI 树；--sparse-pages 是旧桌面有限页回退，在 Linux 明确拒绝。
-- `tree_bench` / `search_bench` 是复用桌面 Viewer 的 CPU harness，在 Linux 提示不适用，避免拉入 GUI；它们不是 TUI 基准。其他纯引擎示例保持可用范围。
+- `tree_bench` / `search_bench` 是复用桌面分页模型、但不创建窗口的 CPU harness，在 Linux 提示不适用，避免拉入 GUI；它们不是 TUI 基准，也不再测量 egui／gpui 布局或原生帧率。其他纯引擎示例保持可用范围。
 - 终端颜色、宽字符、中文、emoji、功能键、OSC 52 和 SSH 交互依赖实际终端；没有 GUI 配色编辑器、拖放或原生系统剪贴板读取。
 - 本次只静态阅读源码／依赖 API 和锁文件，执行依赖解析及下载；未运行测试、构建、check、Clippy、格式检查、TUI、GUI、打包或基准。没有新增实测通过记录、性能数据或发布产物。
 - 待用户验收：Linux 本地终端／SSH、无 DISPLAY/WAYLAND_DISPLAY、无控制终端 CLI、stdin 与重定向、UTF-8 编辑、窄屏与 resize、搜索选项、查询分页及取消、导出完整／部分／覆盖失败、换文件时旧任务隔离、退出恢复，以及 Windows/macOS GUI 和打包回归。

@@ -4,10 +4,7 @@ use crate::engine::{
     file_source::{Cancellation, Priority, with_io_context},
     search::{Event, Input, Query, ResultStore, State, Status},
 };
-#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
-use eframe::egui;
-#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
-use crate::terminal_wake as egui;
+use crate::repaint;
 
 use std::{
     collections::VecDeque,
@@ -49,7 +46,7 @@ struct Shared {
     changed: Condvar,
     epoch: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
-    ctx: egui::Context,
+    ctx: repaint::Context,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 #[derive(Clone)]
@@ -58,7 +55,7 @@ impl SearchHub {
     pub fn new(
         budget: &BudgetManager,
         stop: Arc<AtomicBool>,
-        ctx: egui::Context,
+        ctx: repaint::Context,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(Self, JoinHandle<()>), String> {
         let shared = Arc::new(Shared {

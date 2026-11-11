@@ -4,13 +4,13 @@ use crate::{
     query::{QueryEngine, QueryRequest, stream::{Event, Input}}, results::{ResultStore, Status}},
     export::{CopyError, Selection}, query_worker::QueryOutput, task_worker::{TaskWorker, Work},
 };
-use eframe::egui;
+use crate::repaint;
 use std::{sync::{Arc, Mutex}, time::{Duration, Instant}};
 
 pub const PAGE: u64 = 16;
 #[derive(Default)]
 struct Published { store: Option<ResultStore> }
-struct Job { request: QueryRequest, source: Arc<Document>, shared: Arc<Mutex<Published>>, generation: u64, ctx: egui::Context }
+struct Job { request: QueryRequest, source: Arc<Document>, shared: Arc<Mutex<Published>>, generation: u64, ctx: repaint::Context }
 impl Work for Job {
     type Output = ResultStore;
     fn input_bytes(&self) -> usize { self.request.expression.capacity().saturating_mul(2) }
@@ -65,12 +65,12 @@ pub struct Snapshot {
     pub first: Option<usize>, pub elapsed: Option<Duration>, pub error: Option<String>, pub clipboard: Option<Clipboard>,
 }
 pub struct QueryWorker {
-    producer: TaskWorker<Job>, reader: TaskWorker<Read>, shared: Arc<Mutex<Published>>, ctx: egui::Context,
+    producer: TaskWorker<Job>, reader: TaskWorker<Read>, shared: Arc<Mutex<Published>>, ctx: repaint::Context,
     doc: Option<Arc<Document>>, expression: String, generation: u64, start: u64, rendered: Option<(u64, u64)>,
     selected: u64, reveal: bool, started: Option<Instant>, elapsed: Option<Duration>, error: Option<String>, pub busy: bool,
 }
 impl QueryWorker {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(ctx: repaint::Context) -> Self {
         Self { producer: TaskWorker::new(ctx.clone()), reader: TaskWorker::new(ctx.clone()), shared: Arc::new(Mutex::new(Published::default())), ctx,
             doc: None, expression: String::new(), generation: 0, start: 0, rendered: None, selected: 0, reveal: true,
             started: None, elapsed: None, error: None, busy: false }

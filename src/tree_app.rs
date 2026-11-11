@@ -1,115 +1,23 @@
+//! Paged tree viewer for Legacy and Sparse file backends, rendered with gpui.
 use crate::{
     engine::{
-        budget::{BudgetManager, Limits, Reservation, Resource},
         session::SessionStatus,
-        tree::{Location, TreeFrame},
+        tree::TreeFrame,
         tree_navigation::Navigation,
     },
-    palette::{ColorSettings, Palette, Preset},
+    palette::{ColorSettings, Palette, color},
     tree_worker::{Backend, Task},
+    ui::{self, InputEvent},
     vim::{Action, Vim},
 };
-use eframe::egui::{self, Key, RichText};
+use gpui::prelude::*;
+use gpui::*;
 use std::{
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
-struct LayoutCache {
-    highlight: Option<crate::ui::SearchHighlight>,
-    key: Option<(usize, Palette, u32, bool, u32)>,
-    galley: Option<Arc<egui::Galley>>,
-    _lease: Option<Reservation>,
-    builds: u64,
-    content: Option<Arc<crate::engine::tree::SelectionPreview>>,
-}
-impl LayoutCache {
-    fn new() -> Self {
-        Self {
-            highlight: None,
-            key: None,
-            galley: None,
-            _lease: None,
-            builds: 0,
-            content: None,
-        }
-    }
-    fn set_highlight(&mut self, highlight: Option<&crate::ui::SearchHighlight>) {
-        let same = match (&self.highlight, highlight) {
-            (None, None) => true,
-            (Some(old), Some(new)) => old.same_query(new),
-            _ => false,
-        };
-        if !same {
-            self.highlight = highlight.cloned();
-            self.key = None;
-        }
-    }
-    fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        frame: &TreeFrame,
-        palette: Palette,
-        wrap: bool,
-        budget: &BudgetManager,
-    ) {
-        let width = ui.available_width().max(1.0);
-        let key = (
-            Arc::as_ptr(&frame.selection) as usize,
-            palette,
-            width.to_bits(),
-            wrap,
-            ui.ctx().pixels_per_point().to_bits(),
-        );
-        if self.key.as_ref() != Some(&key) {
-            self.galley = None;
-            self._lease = None;
-            self.key = None;
-            self.content = None;
-            match budget.reserve(
-                Resource::Memory,
-                8 * 1024 * 1024,
-                "bounded selected preview layout cache",
-            ) {
-                Ok(lease) => {
-                    let text = &frame.selection.preview;
-                    let mut n = text.len().min(16 * 1024);
-                    while !text.is_char_boundary(n) {
-                        n -= 1;
-                    }
-                    let mut job = crate::ui::json_job_highlighted(&text[..n], palette, self.highlight.as_ref());
-                    job.wrap.max_width = if wrap { width } else { f32::INFINITY };
-                    job.wrap.break_anywhere = wrap;
-                    self.galley = Some(ui.fonts_mut(|fonts| fonts.layout_job(job)));
-                    self.key = Some(key);
-                    self.content = Some(frame.selection.clone());
-                    self._lease = Some(lease);
-                    self.builds += 1;
-                }
-                Err(e) => {
-                    ui.label(e);
-                    return;
-                }
-            }
-        }
-        let scroll = if wrap {
-            egui::ScrollArea::vertical()
-        } else {
-            egui::ScrollArea::both()
-        };
-        scroll
-            .id_salt("paged_preview")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if let Some(g) = &self.galley {
-                    ui.add(egui::Label::new(g.clone()).selectable(true));
-                }
-            });
-        if frame.selection.preview.len() > 16 * 1024 {
-            ui.label("Display limited to 16 KiB; complete copy and export use the full value.");
-        }
-    }
-}
+
 pub struct Viewer {
     retiring: Option<std::thread::JoinHandle<()>>,
     pending_open: Option<PathBuf>,
@@ -126,13 +34,7 @@ pub struct Viewer {
     jsonpath_help: bool,
     vim: Vim,
     focus_path: bool,
-    wanted: u64,
-    wheel: f64,
     viewport_rows: u64,
-    layout: LayoutCache,
-    layout_budget: BudgetManager,
-    frame_samples: Vec<f64>,
-    sample_lease: Option<Reservation>,
     done: u64,
     total_bytes: u64,
     kind: Option<&'static str>,
@@ -144,7 +46,7 @@ pub struct Viewer {
     search_reverse: bool,
     focus_search: bool,
     search_due: Option<Instant>,
-    search_highlight: Option<crate::ui::SearchHighlight>,
+    search_highlight: Option<ui::SearchHighlight>,
     search: Option<crate::search_worker::Snapshot>,
     search_page: Option<crate::tree_worker::SearchPage>,
     search_start: u64,
@@ -156,21 +58,54 @@ pub struct Viewer {
     query_start: u64,
     query_page_request: Option<(u64, u64, u64)>,
     query_selected: Option<u64>,
+    focus_handle: FocusHandle,
+    wake: crate::repaint::Context,
+    path_input: Entity<ui::TextInput>,
+    row_input: Entity<ui::TextInput>,
+    jsonpath_input: Entity<ui::TextInput>,
+    search_input: Entity<ui::TextInput>,
+    path_sub: Option<Subscription>,
+    row_sub: Option<Subscription>,
+    jsonpath_sub: Option<Subscription>,
+    search_sub: Option<Subscription>,
+    search_generation: u64,
+    sync_inputs: bool,
+    pending_blur: bool,
 }
+
 impl Viewer {
-    pub fn new(cc: &eframe::CreationContext<'_>, path: PathBuf, backend: Backend) -> Self {
-        cc.egui_ctx.set_fonts(crate::fonts::definitions());
-        let mut viewer = Self::empty(path.clone(), backend);
+    pub fn new(
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+        path: PathBuf,
+        backend: Backend,
+    ) -> Self {
+        let mut viewer = Self::empty(cx, path.clone(), backend);
         viewer.colors = ColorSettings::load().unwrap_or_default();
-        viewer
-            .colors
-            .active()
-            .apply(&cc.egui_ctx, viewer.colors.dark);
-        viewer.open(path, &cc.egui_ctx);
+        viewer.open(path, cx);
         viewer
     }
-    fn empty(path: PathBuf, backend: Backend) -> Self {
-        Self {
+
+    fn empty(cx: &mut Context<Self>, path: PathBuf, backend: Backend) -> Self {
+        let (wake_tx, wake_rx) = async_channel::unbounded::<()>();
+        let wake = crate::repaint::Context::with_notify(Arc::new(move || {
+            let _ = wake_tx.try_send(());
+        }));
+        cx.spawn(async move |this, cx| {
+            while wake_rx.recv().await.is_ok() {
+                if this
+                    .update(cx, |this, cx| {
+                        this.tick(cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let mut viewer = Self {
             retiring: None,
             pending_open: None,
             task: None,
@@ -186,16 +121,7 @@ impl Viewer {
             jsonpath_help: false,
             vim: Vim::default(),
             focus_path: false,
-            wanted: 0,
-            wheel: 0.0,
             viewport_rows: 24,
-            layout: LayoutCache::new(),
-            layout_budget: BudgetManager::new(Limits {
-                memory: 256 * 1024 * 1024,
-                disk: 0,
-            }),
-            frame_samples: Vec::new(),
-            sample_lease: None,
             done: 0,
             total_bytes: 0,
             kind: None,
@@ -219,14 +145,96 @@ impl Viewer {
             query_start: 0,
             query_page_request: None,
             query_selected: None,
-        }
+            focus_handle: cx.focus_handle(),
+            wake,
+            path_input: cx.new(|cx| ui::TextInput::new("/items/0", 4096, cx)),
+            row_input: cx.new(|cx| ui::TextInput::new("1", 20, cx)),
+            jsonpath_input: cx.new(|cx| ui::TextInput::new("$.items[?@.active]", 4096, cx)),
+            search_input: cx.new(|cx| ui::TextInput::new("/ Search forward...", 16 * 1024, cx)),
+            path_sub: None,
+            row_sub: None,
+            jsonpath_sub: None,
+            search_sub: None,
+            search_generation: 0,
+            sync_inputs: true,
+            pending_blur: false,
+        };
+        let path_input = viewer.path_input.clone();
+        viewer.path_sub = Some(cx.subscribe(&path_input, |this: &mut Self, _input, event: &InputEvent, cx| {
+            match event {
+                InputEvent::Changed(text) => this.query = text.to_string(),
+                InputEvent::Submitted => {
+                    this.command(Navigation::Locate(this.query.clone()));
+                    this.pending_blur = true;
+                }
+                InputEvent::Escape => {
+                    this.vim.cancel();
+                    this.pending_blur = true;
+                }
+            }
+            cx.notify();
+        }));
+        let row_input = viewer.row_input.clone();
+        viewer.row_sub = Some(cx.subscribe(&row_input, |this: &mut Self, _input, event: &InputEvent, cx| {
+            match event {
+                InputEvent::Changed(text) => this.row = text.to_string(),
+                InputEvent::Submitted => {
+                    match this.row.parse::<u64>() {
+                        Ok(n) if n > 0 => this.command(Navigation::Row(n - 1)),
+                        _ => this.notice = "Enter a positive integer row number".into(),
+                    }
+                    this.pending_blur = true;
+                }
+                InputEvent::Escape => {
+                    this.vim.cancel();
+                    this.pending_blur = true;
+                }
+            }
+            cx.notify();
+        }));
+        let jsonpath_input = viewer.jsonpath_input.clone();
+        viewer.jsonpath_sub = Some(cx.subscribe(&jsonpath_input, |this: &mut Self, _input, event: &InputEvent, cx| {
+            match event {
+                InputEvent::Changed(text) => this.jsonpath = text.to_string(),
+                InputEvent::Submitted => {
+                    this.start_query();
+                    this.pending_blur = true;
+                }
+                InputEvent::Escape => {
+                    this.vim.cancel();
+                    this.pending_blur = true;
+                }
+            }
+            cx.notify();
+        }));
+        let search_input = viewer.search_input.clone();
+        viewer.search_sub = Some(cx.subscribe(&search_input, |this: &mut Self, _input, event: &InputEvent, cx| {
+            match event {
+                InputEvent::Changed(text) => {
+                    this.search_term = text.to_string();
+                    this.search_changed(cx);
+                }
+                InputEvent::Submitted => {
+                    this.start_search();
+                    this.pending_blur = true;
+                }
+                InputEvent::Escape => {
+                    this.vim.cancel();
+                    this.pending_blur = true;
+                }
+            }
+            cx.notify();
+        }));
+        viewer
     }
-    fn open_dialog(&mut self, ctx: &egui::Context) {
+
+    fn open_dialog(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
-            self.open(path, ctx);
+            self.open(path, cx);
         }
     }
-    fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+
+    fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if let Some(previous) = self.task.take() {
             self.retiring = Some(previous.retire());
         }
@@ -246,58 +254,57 @@ impl Viewer {
         self.status = SessionStatus::Preparing;
         self.path = path.clone();
         self.notice.clear();
-        self.wanted = 0;
-        self.wheel = 0.0;
         self.vim.cancel();
-        self.layout = LayoutCache::new();
-        self.sample_lease = None;
-        self.frame_samples = Vec::new();
         self.pending_open = Some(path);
         if self.retiring.is_none() {
-            self.start_pending(ctx);
+            self.start_pending(cx);
         }
+        cx.notify();
     }
-    fn start_pending(&mut self, ctx: &egui::Context) {
+
+    fn start_pending(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.pending_open.take() else {
             return;
         };
-        self.task = match Task::new(path, self.backend.clone(), ctx.clone()) {
-            Ok(t) => {
-                self.layout_budget = t.budget();
-                self.sample_lease = None;
-                self.frame_samples = Vec::new();
-                Some(t)
-            }
-            Err(e) => {
+        self.task = match Task::new(path, self.backend.clone(), self.wake.clone()) {
+            Ok(task) => Some(task),
+            Err(error) => {
                 self.status = SessionStatus::Failed;
-                self.notice = e;
+                self.notice = error;
                 None
             }
         };
+        cx.notify();
     }
+
     fn command(&mut self, command: Navigation) {
         self.page_request = None;
         self.query_page_request = None;
         if let Some(task) = &self.task
-            && let Err(e) = task.command(command)
+            && let Err(error) = task.command(command)
         {
-            self.notice = e;
+            self.notice = error;
         }
     }
+
     fn output(&mut self, path: Option<PathBuf>, copy_path: bool) {
         if let (Some(task), Some(frame)) = (&self.task, &self.frame) {
             if !frame.exact || self.status != SessionStatus::Ready {
                 self.notice = "Pending: complete validation required".into();
                 return;
             }
-            if let Err(e) = task.output(frame.selected.clone(), path, copy_path) {
-                self.notice = e;
+            if let Err(error) = task.output(frame.selected.clone(), path, copy_path) {
+                self.notice = error;
             }
         }
     }
+
     fn start_search(&mut self) {
-        self.search_highlight = crate::ui::SearchHighlight::new(
-            &self.search_term, self.search_case, self.search_regex, self.search_scope,
+        self.search_highlight = ui::SearchHighlight::new(
+            &self.search_term,
+            self.search_case,
+            self.search_regex,
+            self.search_scope,
         );
         self.search_due = None;
         self.search_page = None;
@@ -308,34 +315,94 @@ impl Viewer {
                 task.search_clear(false);
                 return;
             }
-            let q = crate::engine::search::Query {
+            let query = crate::engine::search::Query {
                 term: self.search_term.clone(),
                 case: self.search_case,
                 regex: self.search_regex,
                 scope: self.search_scope,
             };
-            if let Err(e) = task.search_query(q, self.search_reverse) {
+            if let Err(error) = task.search_query(query, self.search_reverse) {
                 self.search_highlight = None;
-                self.notice = e;
+                self.notice = error;
             }
         }
     }
-    fn start_query(&mut self) {
-        self.query_page = None; self.query_page_error = None; self.query_page_request = None; self.query_start = 0; self.query_selected = None;
+
+    fn search_changed(&mut self, cx: &mut Context<Self>) {
+        self.search_highlight = None;
         if let Some(task) = &self.task {
-            if self.jsonpath.trim().is_empty() { task.query_clear(true); self.query_snapshot = None; return; }
-            if let Err(error) = task.query_request(self.jsonpath.clone()) { self.notice = error; }
+            task.search_clear(false);
+        }
+        self.search_page = None;
+        self.page_request = None;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        if self.colors.live_search && !self.search_term.is_empty() {
+            self.search_due = Some(Instant::now() + Duration::from_millis(200));
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.search_generation == generation
+                        && this.search_due.is_some_and(|due| Instant::now() >= due)
+                    {
+                        this.start_search();
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        } else {
+            self.search_due = None;
+        }
+    }
+
+    fn start_query(&mut self) {
+        self.query_page = None;
+        self.query_page_error = None;
+        self.query_page_request = None;
+        self.query_start = 0;
+        self.query_selected = None;
+        if let Some(task) = &self.task {
+            if self.jsonpath.trim().is_empty() {
+                task.query_clear(true);
+                self.query_snapshot = None;
+                return;
+            }
+            if let Err(error) = task.query_request(self.jsonpath.clone()) {
+                self.notice = error;
+            }
             self.query_snapshot = Some(task.query.poll());
         }
     }
+
     fn next_query_match(&mut self, backwards: bool) {
-        let count = self.query_snapshot.as_ref().and_then(|s| s.state.as_ref()).map_or(0, |s| s.count);
-        if count == 0 { return; }
+        let count = self
+            .query_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.state.as_ref())
+            .map_or(0, |state| state.count);
+        if count == 0 {
+            return;
+        }
         let index = match self.query_selected {
-            None => if backwards { count - 1 } else { 0 },
+            None => {
+                if backwards {
+                    count - 1
+                } else {
+                    0
+                }
+            }
             Some(0) if backwards => count - 1,
             Some(current) if backwards => current - 1,
-            Some(current) => if current + 1 >= count { 0 } else { current + 1 },
+            Some(current) => {
+                if current + 1 >= count {
+                    0
+                } else {
+                    current + 1
+                }
+            }
         };
         if let Some(task) = &self.task {
             match task.query_select(index) {
@@ -343,287 +410,57 @@ impl Viewer {
                     self.query_selected = Some(index);
                     let start = index / 16 * 16;
                     if self.query_start != start {
-                        self.query_start = start; self.query_page = None;
-                        self.query_page_error = None; self.query_page_request = None;
+                        self.query_start = start;
+                        self.query_page = None;
+                        self.query_page_error = None;
+                        self.query_page_request = None;
                     }
                 }
                 Err(error) => self.notice = error,
             }
         }
     }
-    fn query_results(&mut self, ui: &mut egui::Ui) {
-        use crate::engine::results::Status;
-        let Some(snapshot) = &self.query_snapshot else { return; };
-        if snapshot.expression.is_empty() { return; }
-        ui.heading("JSONPath results");
-        ui.add(egui::Label::new(RichText::new(&snapshot.expression).monospace()).truncate()).on_hover_text(&snapshot.expression);
-        let state = snapshot.state.as_ref();
-        let count = state.map_or(0, |s| s.count);
-        let complete = state.is_some_and(|s| s.status == Status::Completed);
-        if snapshot.waiting { ui.spinner(); }
-        if let Some(state) = state {
-            ui.label(format!("{:?} · {}{} matches", state.status, if complete { "" } else { "≥" }, count));
-            if !state.error.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, &state.error); }
-        } else if snapshot.waiting { ui.label("Waiting for complete source validation / preparing query…"); }
-        if !snapshot.error.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, &snapshot.error); }
-        if let Some(elapsed) = snapshot.elapsed { ui.label(format!("{:.3} s", elapsed.as_secs_f64())); }
-        let (mut clear, mut cancel, mut target, mut selected, mut output) = (false, false, None, None, None);
-        ui.horizontal_wrapped(|ui| {
-            if snapshot.waiting || state.is_some_and(|s| s.status == Status::Scanning) { cancel = ui.button("Cancel query").clicked(); }
-            clear = ui.button("Clear query").clicked();
-            if ui.add_enabled(self.query_start > 0, egui::Button::new("Previous page")).clicked() { target = Some(self.query_start.saturating_sub(16)); }
-            if ui.add_enabled(self.query_start.saturating_add(16) < count, egui::Button::new("Next page")).clicked() { target = Some(self.query_start + 16); }
-        });
-        if let Some(page) = &self.query_page {
-            ui.label(format!("{}–{} / {}{}", if page.rows.is_empty() { 0 } else { page.start + 1 }, page.start + page.rows.len() as u64, if complete { "" } else { "≥" }, count));
-            egui::ScrollArea::vertical().id_salt("paged_query_values").max_height(200.0).show(ui, |ui| {
-                for row in &page.rows {
-                    if ui.selectable_label(self.query_selected == Some(row.index), format!("{} {}", row.index + 1, row.path)).clicked() { selected = Some(row.index); }
-                    ui.add(egui::Label::new(crate::ui::json_job(&row.preview, self.colors.active())).truncate());
-                }
-            });
-        } else if count > 0 && self.query_page_error.is_none() { ui.label("Loading result page…"); }
-        if let Some(error) = &self.query_page_error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
-        if self.query_page_error.is_some() && ui.button("Retry page").clicked() { self.query_page_error = None; self.query_page_request = None; }
-        ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(complete, egui::Button::new("Copy all")).clicked() { output = Some((false, false)); }
-            if ui.add_enabled(complete, egui::Button::new("Export all")).clicked() { output = Some((true, false)); }
-            if !complete {
-                if ui.add_enabled(count > 0, egui::Button::new("Copy partial")).clicked() { output = Some((false, true)); }
-                if ui.add_enabled(count > 0, egui::Button::new("Export partial")).clicked() { output = Some((true, true)); }
-            }
-        });
-        ui.small("Copy is limited to 8 MiB; use Export for larger results.");
-        if let Some(start) = target { self.query_start = start; self.query_page = None; self.query_page_error = None; self.query_page_request = None; }
-        if let Some(task) = &self.task {
-            if let Some(index) = selected {
-                match task.query_select(index) { Ok(()) => self.query_selected = Some(index), Err(error) => self.notice = error }
-            }
-            if cancel { task.query_clear(false); self.query_page_request = None; }
-            if clear { self.query_selected = None; task.query_clear(true); self.jsonpath.clear(); self.query_snapshot = None; self.query_page = None; self.query_page_error = None; self.query_page_request = None; }
-            if let Some((export, partial)) = output {
-                let path = if export { rfd::FileDialog::new().add_filter("JSON", &["json"]).set_file_name(if partial { "query-partial.json" } else { "query-results.json" }).save_file() } else { None };
-                if (!export || path.is_some()) && let Err(error) = task.query_output(path, partial.then_some(count)) { self.notice = error; }
-            }
-        }
-    }
-    fn keyboard(&mut self, ctx: &egui::Context) {
-        if self.jsonpath_help {
-            if ctx.input(|i| i.key_pressed(Key::Escape)) { self.jsonpath_help = false; }
-            self.vim.cancel();
-            return;
-        }
-        if ctx.input(|i| i.key_pressed(Key::F1)) {
-            self.help = !self.help;
-        }
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            self.vim.cancel();
-            self.command(Navigation::CancelPending);
-            self.help = false;
-            ctx.memory_mut(|m| {
-                m.surrender_focus(egui::Id::new("paged_path"));
-                m.surrender_focus(egui::Id::new("paged_search"));
-                m.surrender_focus(egui::Id::new("paged_jsonpath"));
-            });
-        }
-        if self.help {
-            return;
-        }
-        if crate::ui::consume_open_file_shortcut(ctx) {
-            self.vim.cancel();
-            self.open_dialog(ctx);
-            return;
-        }
-        if ctx.input(|i| i.key_pressed(Key::F4)) {
-            self.next_query_match(ctx.input(|i| i.modifiers.shift));
-            return;
-        }
-        if ctx.input(|i| i.key_pressed(Key::F5)) {
-            self.open(self.path.clone(), ctx);
-            return;
-        }
-        if ctx.wants_keyboard_input() {
-            return;
-        }
-        let texts = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| {
-                    if let egui::Event::Text(t) = e {
-                        Some(t.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-        });
-        for text in texts {
-            for c in text.chars() {
-                if c == '.' {
-                    self.focus_path = true;
-                    ctx.input_mut(|i| {
-                        i.events
-                            .retain(|e| !matches!(e,egui::Event::Text(t) if t=="."))
-                    });
-                    continue;
-                }
-                if let Some(command) = self.vim.feed(c) {
-                    let count = command.count as u64;
-                    let navigation = match command.action {
-                        Action::Move(d) => Some(Navigation::Move(d as i64 * count as i64)),
-                        Action::Left => Some(Navigation::Left(count)),
-                        Action::Right => Some(Navigation::Right(count)),
-                        Action::First if command.explicit_count => {
-                            Some(Navigation::Row(count.saturating_sub(1)))
-                        }
-                        Action::Last if command.explicit_count => {
-                            Some(Navigation::Row(count.saturating_sub(1)))
-                        }
-                        Action::First => Some(Navigation::First),
-                        Action::Last => Some(Navigation::Last),
-                        Action::Toggle => Some(Navigation::Toggle),
-                        Action::Open => Some(Navigation::Open),
-                        Action::Close => Some(Navigation::Close),
-                        Action::ExpandAll => Some(Navigation::ExpandAll),
-                        Action::CollapseAll => Some(Navigation::CollapseAll),
-                        Action::History(back) => {
-                            for _ in 0..count {
-                                self.command(Navigation::History(back));
-                            }
-                            None
-                        }
-                        Action::Screen(which) => Some(Navigation::Screen(which)),
-                        Action::Copy(path) => {
-                            self.output(None, path);
-                            None
-                        }
-                        Action::Search(reverse) => {
-                            self.search_reverse = reverse;
-                            self.focus_search = true;
-                            ctx.input_mut(|i| {
-                                i.events.retain(
-                                    |e| !matches!(e, egui::Event::Text(t) if t == "/" || t == "?"),
-                                )
-                            });
-                            None
-                        }
-                        Action::Match(reverse) => {
-                            if let Some(task) = &self.task {
-                                task.search_match(!(reverse ^ self.search_reverse), count);
-                            }
-                            None
-                        }
-                    };
-                    if let Some(n) = navigation {
-                        self.command(n);
-                    }
-                }
-            }
-        }
-        let keys = ctx.input(|i| {
-            [
-                Key::ArrowDown,
-                Key::ArrowUp,
-                Key::ArrowLeft,
-                Key::ArrowRight,
-                Key::PageDown,
-                Key::PageUp,
-                Key::Space,
-            ]
-            .into_iter()
-            .filter(|k| i.key_pressed(*k))
-            .collect::<Vec<_>>()
-        });
-        for key in keys {
-            let count = self.vim.take_count("navigation") as u64;
-            let command = match key {
-                Key::ArrowDown => Navigation::Move(count as i64),
-                Key::ArrowUp => Navigation::Move(-(count as i64)),
-                Key::ArrowLeft => Navigation::Left(count),
-                Key::ArrowRight => Navigation::Right(count),
-                Key::PageDown => Navigation::Move(self.viewport_rows as i64 * count as i64),
-                Key::PageUp => Navigation::Move(-(self.viewport_rows as i64 * count as i64)),
-                _ => Navigation::Toggle,
-            };
-            self.command(command);
-        }
-        let shortcuts = ctx.input(|i| {
-            (
-                i.modifiers.ctrl,
-                i.key_pressed(Key::D),
-                i.key_pressed(Key::U),
-                i.key_pressed(Key::E),
-                i.key_pressed(Key::B),
-                i.key_pressed(Key::C),
-                i.key_pressed(Key::P),
-                i.key_pressed(Key::F),
-            )
-        });
-        if shortcuts.0
-            && (shortcuts.1
-                || shortcuts.2
-                || shortcuts.3
-                || shortcuts.4
-                || shortcuts.5
-                || shortcuts.6
-                || shortcuts.7)
-        {
-            let count = self.vim.take_count("shortcut") as i64;
-            if shortcuts.1 {
-                self.command(Navigation::Move(
-                    (self.viewport_rows / 2).max(1) as i64 * count,
-                ));
-            }
-            if shortcuts.2 {
-                self.command(Navigation::Move(
-                    -((self.viewport_rows / 2).max(1) as i64) * count,
-                ));
-            }
-            if shortcuts.3 {
-                self.command(Navigation::Move(self.viewport_rows as i64 * count));
-            }
-            if shortcuts.4 {
-                self.command(Navigation::Move(-(self.viewport_rows as i64) * count));
-            }
-            if shortcuts.5 {
-                self.output(None, false);
-            }
-            if shortcuts.6 {
-                self.output(None, true);
-            }
-            if shortcuts.7 {
-                self.focus_search = true;
-            }
-        }
-    }
-    fn draw(&mut self, ctx: &egui::Context) {
-        let started = Instant::now();
+
+    fn tick(&mut self, cx: &mut Context<Self>) {
         if self
             .retiring
             .as_ref()
             .is_some_and(|thread| thread.is_finished())
         {
             let _ = self.retiring.take().unwrap().join();
-            self.start_pending(ctx);
+            self.start_pending(cx);
         }
         if let Some(task) = &self.task {
             let poll = task.poll();
             self.query_snapshot = Some(task.query.poll());
             if let Some(page) = poll.query_page
-                && page.generation == task.query.generation() && page.start == self.query_start
+                && page.generation == task.query.generation()
+                && page.start == self.query_start
                 && self.query_page_request.is_none_or(|(_, _, count)| page.count >= count)
-            { self.query_page = Some(page); self.query_page_error = None; }
+            {
+                self.query_page = Some(page);
+                self.query_page_error = None;
+            }
             if let Some((generation, start, error)) = poll.query_page_error
-                && generation == task.query.generation() && start == self.query_start
-            { self.query_page_error = Some(error); }
-            if let Some(snapshot) = &self.query_snapshot && let Some(state) = &snapshot.state {
+                && generation == task.query.generation()
+                && start == self.query_start
+            {
+                self.query_page_error = Some(error);
+            }
+            if let Some(snapshot) = &self.query_snapshot
+                && let Some(state) = &snapshot.state
+            {
                 if state.count > 0 && self.query_selected.is_none() {
                     match task.query_select(0) {
                         Ok(()) => self.query_selected = Some(0),
                         Err(error) => self.notice = error,
                     }
                 }
-                let key = (snapshot.generation, self.query_start, state.count.min(self.query_start.saturating_add(16)));
+                let key = (
+                    snapshot.generation,
+                    self.query_start,
+                    state.count.min(self.query_start.saturating_add(16)),
+                );
                 if state.count > self.query_start && self.query_page_request != Some(key) {
                     match task.query_page(self.query_start) {
                         Ok(()) => self.query_page_request = Some(key),
@@ -631,10 +468,14 @@ impl Viewer {
                     }
                 }
             }
-            if let Some((generation, clip)) = poll.query_clipboard && generation == task.query.generation() { ctx.copy_text(clip.text); }
-            let previous_cursor = self.search.as_ref().and_then(|s| s.cursor);
+            if let Some((generation, clipboard)) = poll.query_clipboard
+                && generation == task.query.generation()
+            {
+                cx.write_to_clipboard(ClipboardItem::new_string(clipboard.text));
+            }
+            let previous_cursor = self.search.as_ref().and_then(|snapshot| snapshot.cursor);
             self.search = Some(task.search.poll());
-            if let Some(cursor) = self.search.as_ref().and_then(|s| s.cursor)
+            if let Some(cursor) = self.search.as_ref().and_then(|snapshot| snapshot.cursor)
                 && previous_cursor != Some(cursor)
                 && (cursor < self.search_start || cursor >= self.search_start.saturating_add(16))
             {
@@ -645,9 +486,7 @@ impl Viewer {
             if let Some(page) = poll.search_page
                 && page.generation == task.search.generation()
                 && page.start == self.search_start
-                && self
-                    .page_request
-                    .is_none_or(|(_, _, count)| page.count >= count)
+                && self.page_request.is_none_or(|(_, _, count)| page.count >= count)
             {
                 self.search_page = Some(page);
             }
@@ -681,12 +520,11 @@ impl Viewer {
                             .session
                             .is_none_or(|id| id == frame.selected.node.reference.session)
                         {
-                            self.wanted = frame.start;
                             self.frame_epoch = epoch;
                             self.frame = Some(frame);
                         }
                     }
-                    Err(e) => self.notice = e,
+                    Err(error) => self.notice = error,
                 }
             }
             if !poll.status.message.is_empty() {
@@ -695,511 +533,1232 @@ impl Viewer {
             if !poll.notice.is_empty() {
                 self.notice = poll.notice;
             }
-            if let Some(clip) = poll.clipboard {
-                ctx.copy_text(clip.text);
+            if let Some(clipboard) = poll.clipboard {
+                cx.write_to_clipboard(ClipboardItem::new_string(clipboard.text));
             }
             if let Some((text, _lease)) = poll.path_copy {
-                ctx.copy_text(text);
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             if matches!(
                 self.status,
                 SessionStatus::Failed | SessionStatus::Cancelled
             ) {
                 self.frame = None;
-                self.layout = LayoutCache::new();
             }
         }
-        if self.search_due.is_some_and(|due| Instant::now() >= due) {
-            self.start_search();
-        }
-        if self.search_due.is_some()
-            || self.query_snapshot.as_ref().is_some_and(|s| s.waiting)
-            || self.search.as_ref().is_some_and(|s| {
-                s.waiting
-                    || s.state
-                        .as_ref()
-                        .is_some_and(|st| st.status == crate::engine::search::Status::Scanning)
-            })
-        {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        }
-        self.keyboard(ctx);
-        if let Some(path) = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()))
-        {
-            self.open(path, ctx);
-        }
-        egui::TopBottomPanel::top("paged_toolbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("FerrisJson · Tree");
-                if ui.button("Open file").on_hover_text(crate::ui::open_file_shortcut_label()).clicked() {
-                    self.open_dialog(ctx);
-                }
-                if ui.button("Reload / Resume").clicked() {
-                    self.open(self.path.clone(), ctx);
-                }
-                if ui.button("Cancel").clicked()
-                    && let Some(task) = &self.task
-                {
-                    task.cancel();
-                    self.status = SessionStatus::Cancelled;
-                    self.frame = None;
-                }
-                if ui.checkbox(&mut self.colors.dark, "Dark").changed() {
-                    self.colors.active().apply(ctx, self.colors.dark);
-                }
-                egui::ComboBox::from_id_salt("paged_colors")
-                    .selected_text(self.colors.preset.name())
-                    .show_ui(ui, |ui| {
-                        for preset in Preset::ALL {
-                            if ui
-                                .selectable_value(&mut self.colors.preset, preset, preset.name())
-                                .changed()
-                            {
-                                self.colors.active().apply(ctx, self.colors.dark);
-                            }
-                        }
-                    });
-                if ui.button("Help").clicked() {
-                    self.help = !self.help;
-                }
-            });
-            ui.add(egui::Label::new(self.path.display().to_string()).truncate());
-            if self.status != SessionStatus::Ready {
-                ui.label(format!(
-                    "{:?} · {}: {} / {} bytes",
-                    self.status,
-                    self.kind.unwrap_or("root Pending"),
-                    self.done,
-                    self.total_bytes
-                ));
+    }
+
+    fn palette(&self) -> Palette {
+        self.colors.active()
+    }
+
+    fn input_focused(&self, window: &Window, cx: &App) -> bool {
+        self.path_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.row_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.jsonpath_input.read(cx).focus_handle(cx).is_focused(window)
+            || self.search_input.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let m = keystroke.modifiers;
+        let key = keystroke.key.as_str();
+        let secondary = m.secondary();
+        if self.jsonpath_help {
+            if key == "escape" {
+                self.jsonpath_help = false;
+                cx.notify();
             }
-            ui.horizontal(|ui| {
-                ui.label("Path");
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .id(egui::Id::new("paged_path"))
-                        .char_limit(4096),
-                );
-                if self.focus_path {
-                    response.request_focus();
-                    self.focus_path = false;
-                }
-                if (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
-                    || ui.button("Go").clicked()
-                {
-                    self.command(Navigation::Locate(self.query.clone()));
-                }
-                ui.label("Row");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.row)
-                        .char_limit(20)
-                        .desired_width(100.0),
-                );
-                if ui.button("Jump").clicked() {
-                    match self.row.parse::<u64>() {
-                        Ok(n) if n > 0 => self.command(Navigation::Row(n - 1)),
-                        _ => self.notice = "Enter a positive integer row number".into(),
+            self.vim.cancel();
+            return;
+        }
+        if key == "f1" {
+            self.help = !self.help;
+            cx.notify();
+        }
+        if key == "escape" {
+            self.vim.cancel();
+            self.command(Navigation::CancelPending);
+            self.help = false;
+            window.blur();
+            cx.notify();
+            return;
+        }
+        if self.help {
+            return;
+        }
+        if secondary && key == "o" {
+            self.vim.cancel();
+            self.open_dialog(cx);
+            return;
+        }
+        if key == "f4" {
+            self.next_query_match(m.shift);
+            cx.notify();
+            return;
+        }
+        if key == "f5" {
+            self.open(self.path.clone(), cx);
+            return;
+        }
+        if self.input_focused(window, cx) {
+            return;
+        }
+        if !m.control && !m.alt && !m.platform
+            && let Some(ch) = keystroke.key_char.as_deref().and_then(|s| s.chars().next())
+            && ch != ' '
+        {
+            if ch == '.' {
+                self.focus_path = true;
+                cx.notify();
+                return;
+            }
+            if let Some(command) = self.vim.feed(ch) {
+                let count = command.count as u64;
+                let navigation = match command.action {
+                    Action::Move(delta) => Some(Navigation::Move(delta as i64 * count as i64)),
+                    Action::Left => Some(Navigation::Left(count)),
+                    Action::Right => Some(Navigation::Right(count)),
+                    Action::First if command.explicit_count => {
+                        Some(Navigation::Row(count.saturating_sub(1)))
                     }
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("JSONPath");
-                if ui.small_button("Cheatsheet").on_hover_text("常用 JSONPath 语法与示例").clicked() {
-                    self.vim.cancel();
-                    self.jsonpath_help = true;
-                }
-                let response = ui.add(egui::TextEdit::singleline(&mut self.jsonpath)
-                    .id(egui::Id::new("paged_jsonpath")).hint_text("$.items[?@.active]").desired_width(360.0));
-                if (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) || ui.button("Run query").clicked() { self.start_query(); }
-                if ui.button("Clear query").clicked() {
-                    self.jsonpath.clear(); self.start_query();
-                }
-                let count = self.query_snapshot.as_ref().and_then(|s| s.state.as_ref()).map_or(0, |s| s.count);
-                ui.label(format!("{}/{count}", self.query_selected.map_or(0, |index| index + 1)));
-                if ui.add_enabled(count > 0, egui::Button::new("<"))
-                    .on_hover_text("Previous JSONPath match (Shift+F4)").clicked() { self.next_query_match(true); }
-                if ui.add_enabled(count > 0, egui::Button::new(">"))
-                    .on_hover_text("Next JSONPath match (F4)").clicked() { self.next_query_match(false); }
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label(if self.search_reverse {
-                    "Search ?"
-                } else {
-                    "Search /"
-                });
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.search_term)
-                        .id(egui::Id::new("paged_search"))
-                        .char_limit(16 * 1024)
-                        .desired_width(220.0),
-                );
-                if self.focus_search {
-                    response.request_focus();
-                    self.focus_search = false;
-                }
-                let mut changed = response.changed();
-                changed |= ui.checkbox(&mut self.search_case, "Case").changed();
-                changed |= ui.checkbox(&mut self.search_regex, "Regex").changed();
-                egui::ComboBox::from_id_salt("paged_search_scope")
-                    .selected_text(format!("{:?}", self.search_scope))
-                    .show_ui(ui, |ui| {
-                        for scope in [
-                            crate::document::SearchScope::All,
-                            crate::document::SearchScope::Keys,
-                            crate::document::SearchScope::Values,
-                        ] {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.search_scope,
-                                    scope,
-                                    format!("{scope:?}"),
-                                )
-                                .changed();
+                    Action::Last if command.explicit_count => {
+                        Some(Navigation::Row(count.saturating_sub(1)))
+                    }
+                    Action::First => Some(Navigation::First),
+                    Action::Last => Some(Navigation::Last),
+                    Action::Toggle => Some(Navigation::Toggle),
+                    Action::Open => Some(Navigation::Open),
+                    Action::Close => Some(Navigation::Close),
+                    Action::ExpandAll => Some(Navigation::ExpandAll),
+                    Action::CollapseAll => Some(Navigation::CollapseAll),
+                    Action::History(back) => {
+                        for _ in 0..count {
+                            self.command(Navigation::History(back));
                         }
-                    });
-                if ui.checkbox(&mut self.colors.live_search, "Live").changed() {
-                    changed = true;
-                }
-                if changed {
-                    self.search_highlight = None;
-                    if let Some(task) = &self.task {
-                        task.search_clear(false);
-                    }
-                    self.search_page = None;
-                    self.page_request = None;
-                    self.search_due = if self.colors.live_search && !self.search_term.is_empty() {
-                        Some(Instant::now() + Duration::from_millis(200))
-                    } else {
                         None
+                    }
+                    Action::Screen(which) => Some(Navigation::Screen(which)),
+                    Action::Copy(path) => {
+                        self.output(None, path);
+                        None
+                    }
+                    Action::Search(reverse) => {
+                        self.search_reverse = reverse;
+                        self.focus_search = true;
+                        None
+                    }
+                    Action::Match(reverse) => {
+                        if let Some(task) = &self.task {
+                            task.search_match(!(reverse ^ self.search_reverse), count);
+                        }
+                        None
+                    }
+                };
+                if let Some(navigation) = navigation {
+                    self.command(navigation);
+                }
+                cx.notify();
+                return;
+            }
+        }
+        for (name, command) in [
+            ("down", Navigation::Move(1)),
+            ("up", Navigation::Move(-1)),
+            ("left", Navigation::Left(1)),
+            ("right", Navigation::Right(1)),
+            ("pagedown", Navigation::Move(self.viewport_rows as i64)),
+            ("pageup", Navigation::Move(-(self.viewport_rows as i64))),
+            ("space", Navigation::Toggle),
+        ] {
+            if key == name {
+                self.command(command);
+                cx.notify();
+            }
+        }
+        if m.control {
+            let half = (self.viewport_rows / 2).max(1) as i64;
+            match key {
+                "d" => self.command(Navigation::Move(half)),
+                "u" => self.command(Navigation::Move(-half)),
+                "e" => self.command(Navigation::Move(self.viewport_rows as i64)),
+                "b" => self.command(Navigation::Move(-(self.viewport_rows as i64))),
+                "c" => self.output(None, false),
+                "p" => self.output(None, true),
+                "f" => self.focus_search = true,
+                _ => (),
+            }
+        }
+    }
+
+    fn apply_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.sync_inputs) {
+            let path = self.query.clone();
+            let row = self.row.clone();
+            let jsonpath = self.jsonpath.clone();
+            let term = self.search_term.clone();
+            self.path_input.update(cx, |input, cx| input.set_text(path, cx));
+            self.row_input.update(cx, |input, cx| input.set_text(row, cx));
+            self.jsonpath_input.update(cx, |input, cx| input.set_text(jsonpath, cx));
+            self.search_input.update(cx, |input, cx| input.set_text(term, cx));
+        }
+        if std::mem::take(&mut self.focus_path) {
+            let handle = self.path_input.read(cx).focus_handle(cx);
+            window.focus(&handle);
+        }
+        if std::mem::take(&mut self.focus_search) {
+            let handle = self.search_input.read(cx).focus_handle(cx);
+            window.focus(&handle);
+        }
+        if std::mem::take(&mut self.pending_blur) {
+            window.blur();
+        }
+    }
+
+    fn update_viewport(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let rows = ((f32::from(window.viewport_size().height) - 250.0) / 24.0)
+            .floor()
+            .clamp(1.0, 64.0) as u64;
+        if rows != self.viewport_rows {
+            self.viewport_rows = rows;
+            self.command(Navigation::ViewportRows(rows));
+            cx.notify();
+        }
+    }
+
+    fn toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        let preset = self.colors.preset.next();
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .px_2()
+            .pt_2()
+            .child(div().text_lg().font_weight(FontWeight::BOLD).text_color(rgb(0x60b4fa)).child("FerrisJson · Tree"))
+            .child(ui::button("paged-open", "Open file", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| this.open_dialog(cx),
+            )))
+            .child(ui::button("paged-reload", "Reload / Resume", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| this.open(this.path.clone(), cx),
+            )))
+            .child(ui::button("paged-cancel", "Cancel", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    if let Some(task) = &this.task {
+                        task.cancel();
+                    }
+                    this.status = SessionStatus::Cancelled;
+                    this.frame = None;
+                    cx.notify();
+                },
+            )))
+            .child(ui::toggle("paged-dark", "Dark", self.colors.dark, palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.colors.dark = !this.colors.dark;
+                    cx.notify();
+                }),
+            ))
+            .child(ui::button("paged-preset", self.colors.preset.name(), palette).on_click(
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.colors.preset = preset;
+                    cx.notify();
+                }),
+            ))
+            .child(ui::button("paged-help", "Help", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.help = !this.help;
+                    cx.notify();
+                },
+            )))
+            .child(div().flex_1())
+            .child(div().text_xs().whitespace_nowrap().overflow_hidden().child(self.path.display().to_string()))
+            .into_any_element()
+    }
+
+    fn path_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        let mut row = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .child(div().text_xs().child("Path"))
+            .child(ui::field(&self.path_input, 260.0, palette))
+            .child(ui::button("paged-go", "Go", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.command(Navigation::Locate(this.query.clone()));
+                    cx.notify();
+                },
+            )))
+            .child(div().text_xs().child("Row"))
+            .child(ui::field(&self.row_input, 80.0, palette))
+            .child(ui::button("paged-jump", "Jump", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    match this.row.parse::<u64>() {
+                        Ok(n) if n > 0 => this.command(Navigation::Row(n - 1)),
+                        _ => this.notice = "Enter a positive integer row number".into(),
+                    }
+                    cx.notify();
+                },
+            )));
+        if self.status != SessionStatus::Ready {
+            row = row.child(div().text_xs().text_color(rgb(0x64b4eb)).child(format!(
+                "{:?} · {}: {} / {} bytes",
+                self.status,
+                self.kind.unwrap_or("root pending"),
+                self.done,
+                self.total_bytes
+            )));
+        }
+        row.into_any_element()
+    }
+
+    fn jsonpath_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        let count = self
+            .query_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.state.as_ref())
+            .map_or(0, |state| state.count);
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .px_2()
+            .pb_1()
+            .child(div().text_xs().child("JSONPath"))
+            .child(ui::button("paged-jsonpath-help", "Cheatsheet", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.vim.cancel();
+                    this.jsonpath_help = true;
+                    cx.notify();
+                }),
+            ))
+            .child(ui::field(&self.jsonpath_input, 320.0, palette))
+            .child(ui::button("paged-run-query", "Run query", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.start_query();
+                    cx.notify();
+                }),
+            ))
+            .child(ui::button("paged-clear-query", "Clear query", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.jsonpath.clear();
+                    this.jsonpath_input.update(cx, |input, cx| input.set_text("", cx));
+                    this.start_query();
+                    cx.notify();
+                }),
+            ))
+            .child(div().text_xs().child(format!(
+                "{}/{count}",
+                self.query_selected.map_or(0, |index| index + 1)
+            )))
+            .child(ui::button("paged-query-prev", "<", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.next_query_match(true);
+                    cx.notify();
+                },
+            )))
+            .child(ui::button("paged-query-next", ">", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.next_query_match(false);
+                    cx.notify();
+                },
+            )))
+            .into_any_element()
+    }
+
+    fn search_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .px_2()
+            .pb_1()
+            .child(div().text_xs().child(if self.search_reverse { "Search ?" } else { "Search /" }))
+            .child(ui::field(&self.search_input, 220.0, palette))
+            .child(ui::toggle("paged-search-case", "Case", self.search_case, palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.search_case = !this.search_case;
+                    this.search_changed(cx);
+                    cx.notify();
+                }),
+            ))
+            .child(ui::toggle("paged-search-regex", "Regex", self.search_regex, palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.search_regex = !this.search_regex;
+                    this.search_changed(cx);
+                    cx.notify();
+                }),
+            ))
+            .child(ui::button("paged-search-scope", format!("{:?}", self.search_scope), palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.search_scope = match this.search_scope {
+                        crate::document::SearchScope::All => crate::document::SearchScope::Keys,
+                        crate::document::SearchScope::Keys => crate::document::SearchScope::Values,
+                        crate::document::SearchScope::Values => crate::document::SearchScope::All,
                     };
-                }
-                if (response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))
-                    || ui.button("Search").clicked()
-                {
-                    self.start_search();
-                }
-                if ui.button("Clear").clicked() {
-                    self.search_term.clear();
-                    self.start_search();
-                }
-                if ui.button("Stop search").clicked()
-                    && let Some(task) = &self.task
-                {
-                    task.search_clear(true);
-                    self.page_request = None;
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Expand all · zR").clicked() {
-                    self.command(Navigation::ExpandAll);
-                }
-                if ui.button("Collapse all · zM").clicked() {
-                    self.command(Navigation::CollapseAll);
-                }
-                if ui.button("First · gg").clicked() {
-                    self.command(Navigation::First);
-                }
-                if ui.button("Last · G").clicked() {
-                    self.command(Navigation::Last);
-                }
-            });
-        });
-        egui::TopBottomPanel::bottom("paged_status").show(ctx,|ui|{ui.horizontal_wrapped(|ui|{ui.label(format!("{:?}",self.status));if let Some(frame)=&self.frame{ui.monospace(format!("Ln {}/{}{} · {}",frame.selected_rank+1,if frame.exact{""}else{"≥"},frame.total,self.vim.display()));}ui.label(&self.notice);});if self.status==SessionStatus::Validating{ui.label("Browsing committed content; final counts and complete output are pending validation.");}});
+                    this.search_changed(cx);
+                    cx.notify();
+                }),
+            ))
+            .child(ui::toggle("paged-live", "Live", self.colors.live_search, palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.colors.live_search = !this.colors.live_search;
+                    this.search_changed(cx);
+                    cx.notify();
+                }),
+            ))
+            .child(ui::button("paged-search", "Search", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.start_search();
+                    cx.notify();
+                },
+            )))
+            .child(ui::button("paged-search-clear", "Clear", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.search_term.clear();
+                    this.search_input.update(cx, |input, cx| input.set_text("", cx));
+                    this.start_search();
+                    cx.notify();
+                },
+            )))
+            .child(ui::button("paged-search-stop", "Stop search", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    if let Some(task) = &this.task {
+                        task.search_clear(true);
+                    }
+                    this.page_request = None;
+                    cx.notify();
+                }),
+            ))
+            .into_any_element()
+    }
+
+    fn actions_row(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .px_2()
+            .pb_1()
+            .child(ui::button("paged-expand", "Expand all · zR", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.command(Navigation::ExpandAll);
+                    cx.notify();
+                }),
+            ))
+            .child(ui::button("paged-collapse", "Collapse all · zM", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.command(Navigation::CollapseAll);
+                    cx.notify();
+                }),
+            ))
+            .child(ui::button("paged-first", "First · gg", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.command(Navigation::First);
+                    cx.notify();
+                },
+            )))
+            .child(ui::button("paged-last", "Last · G", palette).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.command(Navigation::Last);
+                    cx.notify();
+                },
+            )))
+            .into_any_element()
+    }
+
+    fn main_area(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mut area = div().flex().flex_1().min_h(px(0.));
         if self
             .search
             .as_ref()
-            .is_some_and(|s| s.state.is_some() || s.waiting)
+            .is_some_and(|snapshot| snapshot.state.is_some() || snapshot.waiting)
         {
-            egui::SidePanel::left("paged_search_results")
-                .default_width(260.0)
-                .resizable(true)
-                .show(ctx, |ui| {
-                    ui.heading("Search results");
-                    if let Some(snapshot) = &self.search {
-                        if let Some(state) = &snapshot.state {
-                            ui.label(format!(
-                                "{:?} · {}{} matches · {} scanned · queue {}/4",
-                                state.status,
-                                if state.status == crate::engine::search::Status::Completed {
-                                    ""
-                                } else {
-                                    "≥"
-                                },
-                                state.count,
-                                state.scanned,
-                                snapshot.queue_peak
-                            ));
-                            if !state.error.is_empty() {
-                                ui.label(&state.error);
-                            }
-                            ui.horizontal(|ui| {
-                                if ui.button("Prev").clicked() {
-                                    self.search_start = self.search_start.saturating_sub(16);
-                                    self.page_request = None;
-                                    self.search_page = None;
-                                }
-                                if ui
-                                    .add_enabled(
-                                        self.search_start.saturating_add(16) < state.count,
-                                        egui::Button::new("Next"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.search_start += 16;
-                                    self.page_request = None;
-                                    self.search_page = None;
-                                }
-                            });
-                        } else {
-                            ui.label("Preparing search / waiting for source validation…");
-                        }
-                    }
-                    if let Some(page) = &self.search_page {
-                        ui.label(format!(
-                            "From {} · {} committed",
-                            page.start + 1,
-                            page.count
-                        ));
-                        egui::ScrollArea::vertical()
-                            .max_height((ui.available_height() - 110.0).max(40.0))
-                            .show(ui, |ui| {
-                                for row in &page.rows {
-                                    if ui
-                                        .selectable_label(
-                                            self.search.as_ref().and_then(|s| s.cursor)
-                                                == Some(row.index),
-                                            if let Some(highlight) = &self.search_highlight {
-                                                highlight.text_job(
-                                                    &format!("{} {}", row.index + 1, row.path),
-                                                    ui.visuals().text_color(), self.colors.active(), true,
-                                                ).into()
-                                            } else {
-                                                egui::WidgetText::from(format!("{} {}", row.index + 1, row.path))
-                                            },
-                                        )
-                                        .clicked()
-                                        && let Some(task) = &self.task
-                                    {
-                                        task.search_select(row.index);
-                                    }
-                                    ui.add(egui::Label::new(crate::ui::json_job_highlighted(
-                                        &row.preview, self.colors.active(), self.search_highlight.as_ref(),
-                                    )).truncate());
-                                }
-                            });
-                    }
-                    for (label, paths, partial) in [
-                        ("Export all values", false, false),
-                        ("Export all paths", true, false),
-                        ("Export partial values", false, true),
-                        ("Export partial paths", true, true),
-                    ] {
-                        if ui.button(label).clicked()
-                            && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("JSON", &["json"])
-                                .save_file()
-                            && let Some(task) = &self.task
-                            && let Err(e) = task.search_export(path, paths, partial)
-                        {
-                            self.notice = e;
-                        }
-                    }
-                });
+            area = area.child(self.search_panel(cx));
         }
-        egui::SidePanel::right("paged_inspector")
-            .resizable(true)
-            .default_width(420.0)
-            .show(ctx, |ui| {
-                self.query_results(ui);
-                ui.separator();
-                let mut copy = false;
-                let mut path = false;
-                let mut export = false;
-                ui.horizontal(|ui| {
-                    ui.heading("Value preview");
-                    ui.checkbox(&mut self.colors.wrap_values, "Wrap");
-                });
-                if let Some(frame) = &self.frame {
-                    ui.add(
-                        egui::Label::new(RichText::new(&frame.selection.path).monospace())
-                            .truncate(),
-                    )
-                    .on_hover_text(&frame.selection.path);
-                    ui.horizontal(|ui| {
-                        let ready = self.status == SessionStatus::Ready && frame.exact;
-                        copy = ui
-                            .add_enabled(ready, egui::Button::new("Copy JSON"))
-                            .clicked();
-                        path = ui
-                            .add_enabled(ready, egui::Button::new("Copy path"))
-                            .clicked();
-                        export = ui.add_enabled(ready, egui::Button::new("Export")).clicked();
-                    });
-                    self.layout.set_highlight(self.search_highlight.as_ref());
-                    self.layout.show(
-                        ui,
-                        frame,
-                        self.colors.active(),
-                        self.colors.wrap_values,
-                        &self.layout_budget,
-                    );
-                } else {
-                    ui.label("Waiting for a committed page…");
-                }
-                if copy {
-                    self.output(None, false);
-                }
-                if path {
-                    self.output(None, true);
-                }
-                if export
-                    && let Some(path) = rfd::FileDialog::new()
+        area = area
+            .child(self.tree_list(cx))
+            .child(self.inspector(cx));
+        area.into_any_element()
+    }
+
+    fn search_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        let mut panel = div()
+            .w(px(260.0))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_1()
+            .border_r_1()
+            .border_color(color(palette.selection))
+            .child(div().font_weight(FontWeight::BOLD).child("Search results"));
+        if let Some(snapshot) = &self.search
+            && let Some(state) = &snapshot.state
+        {
+            let status = state.status;
+            let count = state.count;
+            let scanned = state.scanned;
+            let error = state.error.clone();
+            let queue_peak = snapshot.queue_peak;
+            let completed = status == crate::engine::search::Status::Completed;
+            panel = panel
+                .child(div().text_xs().child(format!(
+                    "{:?} · {}{} matches · {} scanned · queue {}/4",
+                    status,
+                    if completed { "" } else { "≥" },
+                    count,
+                    scanned,
+                    queue_peak
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(ui::button("search-page-prev", "Prev", palette).on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| {
+                                this.search_start = this.search_start.saturating_sub(16);
+                                this.page_request = None;
+                                this.search_page = None;
+                                cx.notify();
+                            },
+                        )))
+                        .child(
+                            ui::button("search-page-next", "Next", palette)
+                                .opacity(if self.search_start.saturating_add(16) < count { 1.0 } else { 0.4 })
+                                .when(self.search_start.saturating_add(16) < count, |button| {
+                                    button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.search_start += 16;
+                                        this.page_request = None;
+                                        this.search_page = None;
+                                        cx.notify();
+                                    }))
+                                }),
+                        ),
+                );
+            if !error.is_empty() {
+                panel = panel.child(div().text_xs().text_color(rgb(0xff8080)).child(error));
+            }
+        }
+        let rows = self
+            .search_page
+            .as_ref()
+            .map(|page| {
+                page.rows
+                    .iter()
+                    .map(|row| (row.index, row.path.clone(), row.preview.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(page) = &self.search_page {
+            panel = panel.child(div().text_xs().child(format!(
+                "From {} · {} committed",
+                page.start + 1,
+                page.count
+            )));
+        }
+        let cursor = self.search.as_ref().and_then(|snapshot| snapshot.cursor);
+        let highlight = self.search_highlight.clone();
+        let mut list = div().id("paged-search-results").flex().flex_col().flex_1().min_h(px(0.0)).overflow_y_scroll();
+        for (index, path, preview) in rows {
+            let selected = cursor == Some(index);
+            let text = match &highlight {
+                Some(highlight) => StyledText::new(format!("{} {path}", index + 1))
+                    .with_runs(highlight.runs(&format!("{} {path}", index + 1), color(palette.punctuation), palette, true)),
+                None => StyledText::new(format!("{} {path}", index + 1)),
+            };
+            list = list.child(
+                div()
+                    .id(("search-result", index as usize))
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .p_1()
+                    .cursor_pointer()
+                    .when(selected, |row| row.bg(color(palette.selection)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if let Some(task) = &this.task {
+                            task.search_select(index);
+                        }
+                        cx.notify();
+                    }))
+                    .child(text)
+                    .child(
+                        div()
+                            .text_xs()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .child(ui::json_text(&preview, palette, highlight.as_ref())),
+                    ),
+            );
+        }
+        panel = panel.child(list);
+        let mut exports = div().flex().items_center().flex_wrap().gap_1();
+        for (id, label, paths, partial) in [
+            ("export-values", "All values", false, false),
+            ("export-paths", "All paths", true, false),
+            ("export-partial-values", "Partial values", false, true),
+            ("export-partial-paths", "Partial paths", true, true),
+        ] {
+            exports = exports.child(ui::button(id, label, palette).on_click(cx.listener(
+                move |this, _: &ClickEvent, _, cx| {
+                    if let Some(path) = rfd::FileDialog::new()
                         .add_filter("JSON", &["json"])
                         .save_file()
-                {
-                    self.output(Some(path), false);
-                }
-            });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let rect = ui.available_rect_before_wrap();
-            let rows = (rect.height() / 24.0).floor().clamp(1.0, 64.0) as u64;
-            if rows != self.viewport_rows {
-                self.viewport_rows = rows;
-                self.command(Navigation::ViewportRows(rows));
-            }
-            let mut select: Option<Location> = None;
-            let mut toggle: Option<Location> = None;
-            if let Some(frame) = &self.frame {
-                let number_digits = frame.total.max(1).to_string().len();
-                let number_width = number_digits as f32 * 9.0 + 12.0;
-                for row in frame.rows.iter().take(rows as usize) {
-                    ui.horizontal(|ui| {
-                        let number = if row.rank == frame.selected_rank { row.rank + 1 } else { row.rank.abs_diff(frame.selected_rank) };
-                        ui.add_sized([number_width, 24.0], egui::Label::new(
-                            RichText::new(format!("{number:>width$}", width = number_digits)).monospace()
-                                .color(if row.rank == frame.selected_rank { ui.visuals().text_color() } else { ui.visuals().weak_text_color() }),
-                        ));
-                        ui.add_space((row.location.ancestors.len().min(32) * 12) as f32);
-                        if row.location.node.container() {
-                            if ui
-                                .small_button(if row.expanded { "▾" } else { "▸" })
-                                .clicked()
-                            {
-                                toggle = Some(row.location.clone());
-                            }
-                        } else {
-                            ui.add_space(18.0);
-                        }
-                        let palette = self.colors.active();
-                        let foreground = palette.kind(row.location.node.kind);
-                        let mut text = if let Some(highlight) = &self.search_highlight {
-                            highlight.text_job(&row.label, foreground, palette, true)
-                        } else {
-                            let mut job = egui::text::LayoutJob::default();
-                            job.append(&row.label, 0.0, egui::TextFormat {
-                                font_id: egui::FontId::monospace(13.0), color: foreground, ..Default::default()
-                            });
-                            job
-                        };
-                        text.append("  ", 0.0, egui::TextFormat::default());
-                        let preview = crate::ui::json_job_highlighted(&row.preview, palette, self.search_highlight.as_ref());
-                        let offset = text.text.len();
-                        text.text.push_str(&preview.text);
-                        text.sections.extend(preview.sections.into_iter().map(|mut section| {
-                            section.byte_range = section.byte_range.start + offset..section.byte_range.end + offset;
-                            section
-                        }));
-                        if ui
-                            .add(
-                                egui::Button::selectable(
-                                    row.location.node.reference == frame.selected.node.reference,
-                                    text,
-                                )
-                                .truncate(),
-                            )
-                            .clicked()
-                        {
-                            select = Some(row.location.clone());
-                        }
-                    });
-                }
-                ui.label(format!(
-                    "Window {}..{}; {}{} visible rows",
-                    frame.start + 1,
-                    frame.start + frame.rows.len() as u64,
-                    if frame.exact { "" } else { "at least " },
-                    frame.total
-                ));
+                        && let Some(task) = &this.task
+                        && let Err(error) = task.search_export(path, paths, partial)
+                    {
+                        this.notice = error;
+                    }
+                    cx.notify();
+                },
+            )));
+        }
+        panel.child(exports).into_any_element()
+    }
+
+    fn tree_list(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        let mut list = div()
+            .id("tree-list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(240.0))
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .px_1();
+        let Some(frame) = &self.frame else {
+            return list
+                .child(div().p_2().text_xs().child("Preparing snapshot / waiting for a complete safe page…"))
+                .into_any_element();
+        };
+        let digits = frame.total.max(1).to_string().len();
+        let selected_rank = frame.selected_rank;
+        let total = frame.total;
+        let exact = frame.exact;
+        let visible = self.viewport_rows.max(1) as usize;
+        let start = frame.start;
+        let count = frame.rows.len();
+        let rows: Vec<_> = frame
+            .rows
+            .iter()
+            .take(visible)
+            .map(|row| {
+                (
+                    row.rank,
+                    row.expanded,
+                    row.label.clone(),
+                    row.preview.clone(),
+                    row.location.clone(),
+                )
+            })
+            .collect();
+        let highlight = self.search_highlight.clone();
+        for (rank, expanded, label, preview, location) in rows {
+            let number = if rank == selected_rank {
+                rank + 1
             } else {
-                ui.label("Preparing snapshot / waiting for a complete safe page…");
-            }
-            if let Some(location) = select {
-                self.command(Navigation::Select(location));
-            }
-            if let Some(location) = toggle {
-                self.command(Navigation::Select(location));
-                self.command(Navigation::Toggle);
-            }
-            if !self.help && !self.jsonpath_help
-                && !ctx.wants_keyboard_input()
-                && ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| rect.contains(p)))
-            {
-                self.wheel += ctx.input(|i| i.smooth_scroll_delta.y) as f64 / 24.0;
-                let delta = self.wheel.trunc() as i64;
-                self.wheel -= delta as f64;
-                if delta != 0 {
-                    self.wanted = if delta > 0 {
-                        self.wanted.saturating_sub(delta as u64)
+                rank.abs_diff(selected_rank)
+            };
+            let container = location.node.container();
+            let kind = location.node.kind;
+            let depth = location.ancestors.len().min(32);
+            let is_selected = location.node.reference == frame.selected.node.reference;
+            let id = location.clone();
+            let toggle_id = location.clone();
+            let label_text = if let Some(highlight) = &highlight {
+                StyledText::new(label.clone())
+                    .with_runs(highlight.runs(&label, palette.kind(kind), palette, true))
+            } else {
+                ui::plain_text(&label, palette.kind(kind))
+            };
+            list = list.child(
+                div()
+                    .id(("paged-row", rank as usize))
+                    .flex()
+                    .items_center()
+                    .h(px(24.0))
+                    .w_full()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .when(is_selected, |row| row.bg(color(palette.selection)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.command(Navigation::Select(id.clone()));
+                        window.blur();
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(digits as f32 * 8.0 + 12.0))
+                            .text_xs()
+                            .child(format!("{number:>width$}", width = digits)),
+                    )
+                    .child(div().w(px(depth as f32 * 12.0)).flex_none())
+                    .child(if container {
+                        ui::button(("paged-expander", rank as usize), if expanded { "▾" } else { "▸" }, palette)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.command(Navigation::Select(toggle_id.clone()));
+                                this.command(Navigation::Toggle);
+                                window.blur();
+                                cx.notify();
+                            }))
+                            .into_any_element()
                     } else {
-                        self.wanted.saturating_add(delta.unsigned_abs())
-                    };
-                    self.command(Navigation::Anchor(self.wanted));
-                }
+                        div().w(px(18.0)).into_any_element()
+                    })
+                    .child(label_text)
+                    .child(div().text_color(color(palette.punctuation)).child("  "))
+                    .child(div().flex_1().min_w(px(0.0)).overflow_hidden().child(ui::json_text(&preview, palette, highlight.as_ref()))),
+            );
+        }
+        list = list.child(div().p_1().text_xs().child(format!(
+            "Window {}..{}; {}{} visible rows",
+            start + 1,
+            start + count as u64,
+            if exact { "" } else { "at least " },
+            total
+        )));
+        list.into_any_element()
+    }
+
+    fn inspector(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        div()
+            .w(px(420.0))
+            .min_w(px(280.0))
+            .flex()
+            .flex_col()
+            .h_full()
+            .border_l_1()
+            .border_color(color(palette.selection))
+            .child(self.query_panel(cx))
+            .child(div().h(px(1.0)).bg(color(palette.selection)))
+            .child(self.preview_panel(cx))
+            .into_any_element()
+    }
+
+    fn query_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_1()
+            .min_h(px(0.0))
+            .child(div().font_weight(FontWeight::BOLD).child("JSONPath results"));
+        let Some(snapshot) = &self.query_snapshot else {
+            return panel
+                .child(div().text_xs().child("Waiting for a committed page…"))
+                .into_any_element();
+        };
+        if snapshot.expression.is_empty() {
+            return panel
+                .child(div().text_xs().child("Run a JSONPath query to inspect matching values."))
+                .into_any_element();
+        }
+        let expression = snapshot.expression.clone();
+        let waiting = snapshot.waiting;
+        let elapsed = snapshot.elapsed;
+        let error = snapshot.error.clone();
+        let state = snapshot.state.clone();
+        panel = panel.child(div().text_xs().font_family(ui::mono_family()).whitespace_nowrap().overflow_hidden().child(expression));
+        if let Some(state) = &state {
+            let completed = state.status == crate::engine::results::Status::Completed;
+            let count = state.count;
+            panel = panel.child(div().text_xs().child(format!(
+                "{:?} · {}{} matches",
+                state.status,
+                if completed { "" } else { "≥" },
+                count
+            )));
+            if !state.error.is_empty() {
+                panel = panel.child(div().text_xs().text_color(rgb(0xff8080)).child(state.error.clone()));
             }
-        });
+        } else if waiting {
+            panel = panel.child(div().text_xs().child("Waiting for complete source validation / preparing query…"));
+        }
+        if !error.is_empty() {
+            panel = panel.child(div().text_xs().text_color(rgb(0xff8080)).child(error));
+        }
+        if let Some(elapsed) = elapsed {
+            panel = panel.child(div().text_xs().child(format!("{:.3} s", elapsed.as_secs_f64())));
+        }
+        let count = state.as_ref().map_or(0, |state| state.count);
+        let complete = state
+            .as_ref()
+            .is_some_and(|state| state.status == crate::engine::results::Status::Completed);
+        let scanning = waiting
+            || state
+                .as_ref()
+                .is_some_and(|state| state.status == crate::engine::results::Status::Scanning);
+        panel = panel.child(
+            div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap_1()
+                .child(
+                    ui::button("paged-query-cancel", "Cancel query", palette)
+                        .opacity(if scanning { 1.0 } else { 0.4 })
+                        .when(scanning, |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Some(task) = &this.task {
+                                    task.query_clear(false);
+                                }
+                                this.query_page_request = None;
+                                cx.notify();
+                            }))
+                        }),
+                )
+                .child(ui::button("paged-query-clear", "Clear query", palette).on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.query_selected = None;
+                        if let Some(task) = &this.task {
+                            task.query_clear(true);
+                        }
+                        this.jsonpath.clear();
+                        this.jsonpath_input.update(cx, |input, cx| input.set_text("", cx));
+                        this.query_snapshot = None;
+                        this.query_page = None;
+                        this.query_page_error = None;
+                        this.query_page_request = None;
+                        cx.notify();
+                    }),
+                ))
+                .child(
+                    ui::button("paged-query-prev-page", "Previous page", palette)
+                        .opacity(if self.query_start > 0 { 1.0 } else { 0.4 })
+                        .when(self.query_start > 0, |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.query_start = this.query_start.saturating_sub(16);
+                                this.query_page = None;
+                                this.query_page_error = None;
+                                this.query_page_request = None;
+                                cx.notify();
+                            }))
+                        }),
+                )
+                .child(
+                    ui::button("paged-query-next-page", "Next page", palette)
+                        .opacity(if self.query_start.saturating_add(16) < count { 1.0 } else { 0.4 })
+                        .when(self.query_start.saturating_add(16) < count, |button| {
+                            button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.query_start += 16;
+                                this.query_page = None;
+                                this.query_page_error = None;
+                                this.query_page_request = None;
+                                cx.notify();
+                            }))
+                        }),
+                ),
+        );
+        if let Some(page) = &self.query_page {
+            panel = panel.child(div().text_xs().child(format!(
+                "{}–{} / {}{}",
+                if page.rows.is_empty() { 0 } else { page.start + 1 },
+                page.start + page.rows.len() as u64,
+                if complete { "" } else { "≥" },
+                count
+            )));
+            let rows: Vec<_> = page
+                .rows
+                .iter()
+                .map(|row| (row.index, row.path.clone(), row.preview.clone()))
+                .collect();
+            let selected = self.query_selected;
+            let mut values = div().id("paged-query-values").flex().flex_col().max_h(px(200.0)).overflow_y_scroll();
+            for (index, path, preview) in rows {
+                values = values.child(
+                    div()
+                        .id(("paged-query-row", index as usize))
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .p_1()
+                        .cursor_pointer()
+                        .when(selected == Some(index), |row| row.bg(color(palette.selection)))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            if let Some(task) = &this.task {
+                                match task.query_select(index) {
+                                    Ok(()) => this.query_selected = Some(index),
+                                    Err(error) => this.notice = error,
+                                }
+                            }
+                            cx.notify();
+                        }))
+                        .child(div().text_xs().font_family(ui::mono_family()).child(format!("{} {path}", index + 1)))
+                        .child(div().text_xs().whitespace_nowrap().overflow_hidden().child(ui::json_text(&preview, palette, None))),
+                );
+            }
+            panel = panel.child(values);
+        } else if count > 0 && self.query_page_error.is_none() {
+            panel = panel.child(div().text_xs().child("Loading result page…"));
+        }
+        if let Some(error) = &self.query_page_error {
+            panel = panel.child(div().text_xs().text_color(rgb(0xff8080)).child(error.clone()));
+        }
+        if self.query_page_error.is_some() {
+            panel = panel.child(ui::button("paged-query-retry", "Retry page", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.query_page_error = None;
+                    this.query_page_request = None;
+                    cx.notify();
+                }),
+            ));
+        }
+        panel
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(
+                        ui::button("paged-copy-all", "Copy all", palette)
+                            .opacity(if complete { 1.0 } else { 0.4 })
+                            .when(complete, |button| {
+                                button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    if let Some(task) = &this.task
+                                        && let Err(error) = task.query_output(None, None)
+                                    {
+                                        this.notice = error;
+                                    }
+                                    cx.notify();
+                                }))
+                            }),
+                    )
+                    .child(
+                        ui::button("paged-export-all", "Export all", palette)
+                            .opacity(if complete { 1.0 } else { 0.4 })
+                            .when(complete, |button| {
+                                button.on_click(cx.listener(
+                                    move |this, _: &ClickEvent, _, cx| {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("JSON", &["json"])
+                                            .set_file_name("query-results.json")
+                                            .save_file()
+                                            && let Some(task) = &this.task
+                                            && let Err(error) = task.query_output(Some(path), None)
+                                        {
+                                            this.notice = error;
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
+                            }),
+                    )
+                    .child(
+                        ui::button("paged-copy-partial", "Copy partial", palette)
+                            .opacity(if count > 0 && !complete { 1.0 } else { 0.4 })
+                            .when(count > 0 && !complete, |button| {
+                                button.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    if let Some(task) = &this.task
+                                        && let Err(error) = task.query_output(None, Some(count))
+                                    {
+                                        this.notice = error;
+                                    }
+                                    cx.notify();
+                                }))
+                            }),
+                    )
+                    .child(
+                        ui::button("paged-export-partial", "Export partial", palette)
+                            .opacity(if count > 0 && !complete { 1.0 } else { 0.4 })
+                            .when(count > 0 && !complete, |button| {
+                                button.on_click(cx.listener(
+                                    move |this, _: &ClickEvent, _, cx| {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("JSON", &["json"])
+                                            .set_file_name("query-partial.json")
+                                            .save_file()
+                                            && let Some(task) = &this.task
+                                            && let Err(error) = task.query_output(Some(path), Some(count as u64))
+                                        {
+                                            this.notice = error;
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
+                            }),
+                    ),
+            )
+            .child(div().text_xs().child("Copy is limited to 8 MiB; use Export for larger results."))
+            .into_any_element()
+    }
+
+    fn preview_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.palette();
+        let wrap = self.colors.wrap_values;
+        let header = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .child(div().font_weight(FontWeight::BOLD).child("Value preview"))
+            .child(ui::toggle("paged-wrap-values", "Wrap", wrap, palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.colors.wrap_values = !this.colors.wrap_values;
+                    cx.notify();
+                }),
+            ));
+        let Some(frame) = &self.frame else {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_1()
+                .child(header)
+                .child(div().text_xs().child("Waiting for a committed page…"))
+                .into_any_element();
+        };
+        let path = frame.selection.path.clone();
+        let ready = self.status == SessionStatus::Ready && frame.exact;
+        let mut preview = frame.selection.preview.clone();
+        let mut truncated = false;
+        if preview.len() > 16 * 1024 {
+            let mut end = 16 * 1024;
+            while !preview.is_char_boundary(end) {
+                end -= 1;
+            }
+            preview.truncate(end);
+            truncated = true;
+        }
+        let highlight = self.search_highlight.clone();
+        let buttons = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .child(
+                ui::button("paged-copy-json", "Copy JSON", palette)
+                    .opacity(if ready { 1.0 } else { 0.4 })
+                    .when(ready, |button| {
+                        button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.output(None, false);
+                            cx.notify();
+                        }))
+                    }),
+            )
+            .child(
+                ui::button("paged-copy-path", "Copy path", palette)
+                    .opacity(if ready { 1.0 } else { 0.4 })
+                    .when(ready, |button| {
+                        button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.output(None, true);
+                            cx.notify();
+                        }))
+                    }),
+            )
+            .child(
+                ui::button("paged-export", "Export", palette)
+                    .opacity(if ready { 1.0 } else { 0.4 })
+                    .when(ready, |button| {
+                        button.on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("JSON", &["json"])
+                                .save_file()
+                            {
+                                this.output(Some(path), false);
+                            }
+                            cx.notify();
+                        }))
+                    }),
+            );
+        let mut area = div()
+            .id("paged-preview")
+            .flex_1()
+            .min_h(px(0.0))
+            .p_1()
+            .text_size(px(13.0));
+        area = if wrap {
+            area.overflow_y_scroll()
+        } else {
+            area.overflow_scroll().whitespace_nowrap()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_1()
+            .p_1()
+            .child(header)
+            .child(div().text_xs().whitespace_nowrap().overflow_hidden().child(path))
+            .child(buttons)
+            .child(area.child(ui::json_text(&preview, palette, highlight.as_ref())))
+            .when(truncated, |column| {
+                column.child(div().text_xs().child(
+                    "Display limited to 16 KiB; complete copy and export use the full value.",
+                ))
+            })
+            .into_any_element()
+    }
+
+    fn status_bar(&mut self, window: &Window, cx: &App) -> AnyElement {
+        let palette = self.palette();
+        let mut left = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_2()
+            .text_xs()
+            .child(div().font_family(ui::mono_family()).child(format!("{:?}", self.status)));
+        if let Some(frame) = &self.frame {
+            left = left.child(div().font_family(ui::mono_family()).child(format!(
+                "Ln {}/{}{} · {}",
+                frame.selected_rank + 1,
+                if frame.exact { "" } else { "≥" },
+                frame.total,
+                self.vim.display()
+            )));
+        }
+        left = left
+            .child(div().font_family(ui::mono_family()).text_color(if self.input_focused(window, cx) { rgb(0x64b4eb) } else { color(palette.punctuation) }).child(self.input_focused(window, cx).then_some("INPUT").unwrap_or("NORMAL")))
+            .child(div().whitespace_nowrap().overflow_hidden().child(self.notice.clone()));
+        if self.status == SessionStatus::Validating {
+            left = left.child(div().text_xs().child(
+                "Browsing committed content; final counts and complete output are pending validation.",
+            ));
+        }
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px_2()
+            .py_1()
+            .bg(color(palette.stripe))
+            .child(left)
+            .into_any_element()
+    }
+
+    fn overlays(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut overlays = Vec::new();
         if self.help {
-            egui::Window::new("Paged tree shortcuts").open(&mut self.help).show(ctx, |ui| {
-                for line in [
-                    "hjkl / arrows: move, parent, expand or child; digits repeat",
-                    "gg / G: first / last; number + gg or G: exact integer row",
-                    "H M L: viewport top / middle / bottom",
-                    "PageUp / PageDown: page; Ctrl+U / D: half page; Ctrl+B / E: page",
-                    "za / zo / zc: toggle / open / close; zR / zM: expand / collapse all",
-                    "[ / ]: history; yy / Ctrl+C: copy JSON; yp / Ctrl+P: copy path",
-                    ".: focus Path (JSON Pointer, e.g. /items/0)",
-                    "⌘O (macOS) / Ctrl+O (Windows): open file; F5: reload; F1: help; Esc: cancel pending jump and key sequence",
-                    "Search: / ? or Ctrl+F; n / N with counts. JSONPath: Run query / Enter; F4 / Shift+F4: next / previous result (wraps).",
-                    "Line numbers: current visible row is absolute; other rows show distance from the cursor. Results have independent paging, cancel and output.",
-                    "During validation, only committed content is browsable; complete output waits for Ready.",
-                ] { ui.label(line); }
-            });
-        }
-        crate::ui::jsonpath_cheatsheet(ctx, &mut self.jsonpath_help);
-        if self.sample_lease.is_none() && self.retiring.is_none() {
-            self.sample_lease = self
-                .layout_budget
-                .reserve(Resource::Memory, 8192 * 8, "bounded GUI frame samples")
-                .ok();
-            if self.sample_lease.is_some() {
-                self.frame_samples = Vec::with_capacity(8192);
+            let palette = self.palette();
+            let mut body = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_xl().font_weight(FontWeight::BOLD).child("Paged tree shortcuts"));
+            for line in [
+                "hjkl / arrows: move, parent, expand or child; digits repeat",
+                "gg / G: first / last; number + gg or G: exact integer row",
+                "H M L: viewport top / middle / bottom",
+                "PageUp / PageDown: page; Ctrl+U / D: half page; Ctrl+B / E: page",
+                "za / zo / zc: toggle / open / close; zR / zM: expand / collapse all",
+                "[ / ]: history; yy / Ctrl+C: copy JSON; yp / Ctrl+P: copy path",
+                ".: focus Path (JSON Pointer, e.g. /items/0)",
+                "⌘O (macOS) / Ctrl+O (Windows): open file; F5: reload; F1: help; Esc: cancel pending jump and key sequence",
+                "Search: / ? or Ctrl+F; n / N with counts. JSONPath: Run query / Enter; F4 / Shift+F4: next / previous result (wraps).",
+                "Line numbers: current visible row is absolute; other rows show distance from the cursor. Results have independent paging, cancel and output.",
+                "During validation, only committed content is browsable; complete output waits for Ready.",
+            ] {
+                body = body.child(div().text_xs().child(line));
             }
+            body = body.child(ui::button("paged-close-help", "Close", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.help = false;
+                    cx.notify();
+                }),
+            ));
+            overlays.push(ui::modal("paged-help-modal", palette, 640.0, body).into_any_element());
         }
-        if self.frame_samples.len() < self.frame_samples.capacity() {
-            self.frame_samples
-                .push(started.elapsed().as_secs_f64() * 1000.0);
+        if self.jsonpath_help {
+            let palette = self.palette();
+            let mut body = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_xl().font_weight(FontWeight::BOLD).child("JSONPath cheatsheet"));
+            let rows = [
+                ("$", "根节点：选择整份 JSON。"),
+                ("$.users", "选择根对象的 users 字段。"),
+                ("$.users[*].name", "选取每个用户的 name 字段。"),
+                ("$..email", "递归查找任意深度的 email 字段。"),
+                ("$.users[?(@.active == true)]", "布尔值为真；true、false、null 不加引号。"),
+                ("$.users[0:10]", "前 10 项；切片格式为 [起点:终点:步长]，不包含终点。"),
+                ("/users/0/name", "JSON Pointer 也可用于 Path。"),
+            ];
+            for (index, (expression, explanation)) in rows.into_iter().enumerate() {
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .p_1()
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(color(palette.selection))
+                        .child(div().flex_1().text_xs().font_family(ui::mono_family()).child(expression))
+                        .child(ui::button(("paged-copy-path", index), "Copy", palette).on_click(
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(expression.to_string()));
+                                this.notice = "Copied".into();
+                                cx.notify();
+                            }),
+                        )),
+                );
+                body = body.child(div().text_xs().child(explanation));
+            }
+            body = body.child(ui::button("paged-close-jsonpath", "Close", palette).on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.jsonpath_help = false;
+                    cx.notify();
+                }),
+            ));
+            overlays.push(ui::modal("paged-jsonpath-modal", palette, 620.0, body).into_any_element());
         }
-        ctx.request_repaint_after(Duration::from_millis(
-            if matches!(
-                self.status,
-                SessionStatus::Preparing | SessionStatus::Validating
-            ) {
-                16
-            } else {
-                250
-            },
-        ));
+        overlays
     }
 }
+
+impl Render for Viewer {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_focus(window, cx);
+        self.tick(cx);
+        self.apply_focus(window, cx);
+        self.update_viewport(window, cx);
+        let palette = self.palette();
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(color(palette.background))
+            .text_color(color(palette.punctuation))
+            .text_size(px(13.0))
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .can_drop(|value, _, _| value.is::<ExternalPaths>())
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                if let Some(path) = paths.paths().first() {
+                    this.open(path.clone(), cx);
+                }
+            }))
+            .child(self.toolbar(cx))
+            .child(self.path_row(cx))
+            .child(self.jsonpath_row(cx))
+            .child(self.search_row(cx))
+            .child(self.actions_row(cx))
+            .child(self.main_area(cx))
+            .child(self.status_bar(window, cx))
+            .children(self.overlays(cx))
+    }
+}
+
 impl Drop for Viewer {
     fn drop(&mut self) {
         if let Some(retiring) = self.retiring.take() {
@@ -1207,70 +1766,125 @@ impl Drop for Viewer {
         }
     }
 }
-impl eframe::App for Viewer {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.draw(ctx);
+
+/// Headless driver used by the benchmark examples. It keeps the same paged
+/// task, navigation and polling code as the viewer but never creates a window,
+/// so the measurements cover engine and paging CPU only.
+struct Harness {
+    task: Task,
+    frame: Option<TreeFrame>,
+    status: SessionStatus,
+    epoch: u64,
+    notice: String,
+    search: Option<crate::search_worker::Snapshot>,
+}
+
+impl Harness {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        Ok(Self {
+            task: Task::new(
+                path,
+                Backend::Sparse(crate::engine::sparse::OpenOptions::default()),
+                crate::repaint::Context::default(),
+            )?,
+            frame: None,
+            status: SessionStatus::Preparing,
+            epoch: 0,
+            notice: String::new(),
+            search: None,
+        })
+    }
+
+    fn poll(&mut self) {
+        let poll = self.task.poll();
+        self.search = Some(self.task.search.poll());
+        self.status = poll.status.state;
+        if !poll.status.message.is_empty() {
+            self.notice = poll.status.message;
+        }
+        if let Some((epoch, result)) = poll.frame
+            && epoch == self.task.epoch.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            match result {
+                Ok(frame) => {
+                    self.epoch = epoch;
+                    self.frame = Some(frame);
+                }
+                Err(error) => self.notice = error,
+            }
+        }
+        if matches!(
+            self.status,
+            SessionStatus::Failed | SessionStatus::Cancelled
+        ) {
+            self.frame = None;
+        }
+    }
+
+    fn command(&mut self, command: Navigation) {
+        if let Err(error) = self.task.command(command) {
+            self.notice = error;
+        }
+    }
+
+    fn wait(&mut self, predicate: &dyn Fn(&TreeFrame) -> bool, limit: Duration) -> Result<f64, String> {
+        let start = Instant::now();
+        loop {
+            self.poll();
+            let epoch = self.task.epoch.load(std::sync::atomic::Ordering::Relaxed);
+            if self.epoch == epoch && self.frame.as_ref().is_some_and(predicate) {
+                return Ok(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            if start.elapsed() > limit {
+                return Err(format!("Navigation deadline exceeded: {}", self.notice));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn close(mut self) -> Result<(), String> {
+        let thread = self.task.retire();
+        self.frame = None;
+        thread.join().map_err(|_| "Tree task join failed".to_string())
     }
 }
 
-/// Development harness: measures CPU UI preparation, not native/GPU FPS.
+/// Development harness: measures engine, paging and polling CPU. It does not
+/// open a window, so native rendering and GPU frame time are out of scope.
 #[allow(
     dead_code,
-    reason = "Called by the tree_bench example which reuses this renderer"
+    reason = "Called by the tree_build benchmark examples which reuse this renderer"
 )]
 pub fn benchmark_search(path: PathBuf, expected: u64) -> Result<serde_json::Value, String> {
-    let ctx = egui::Context::default();
-    ctx.set_fonts(crate::fonts::definitions());
-    let mut viewer = Viewer::empty(
-        path.clone(),
-        Backend::Sparse(crate::engine::sparse::OpenOptions::default()),
-    );
-    viewer.open(path.clone(), &ctx);
-    let input = || egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(1280.0, 900.0),
-        )),
-        ..Default::default()
-    };
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(600);
-    while viewer.status != SessionStatus::Ready || viewer.frame.as_ref().is_none_or(|f| !f.exact) {
-        let output = ctx.run(input(), |ctx| viewer.draw(ctx));
-        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
-        if viewer.status == SessionStatus::Failed {
-            return Err(viewer.notice.clone());
-        }
-        if Instant::now() > deadline {
-            return Err("Search benchmark build timeout".into());
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let ready_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let budget = viewer.task.as_ref().unwrap().budget();
+    let mut harness = Harness::new(path.clone())?;
+    let budget = harness.task.budget();
+    let ready_ms = harness.wait(
+        &|frame| frame.exact && frame.total > 1,
+        Duration::from_secs(600),
+    )?;
     let mut reports = Vec::new();
-    viewer.search_scope = crate::document::SearchScope::Values;
-    viewer.search_case = true;
     for (term, matches) in [("NEEDLE", 3), ("x", expected)] {
-        viewer.search_term = term.into();
+        let query = crate::engine::search::Query {
+            term: term.into(),
+            case: true,
+            regex: false,
+            scope: crate::document::SearchScope::Values,
+        };
+        harness
+            .task
+            .search_query(query, false)
+            .map_err(|error| error.to_string())?;
         let start = Instant::now();
-        viewer.start_search();
         let mut first = None;
-        let mut frames = Vec::new();
-        let mut ticks = 0;
+        let mut samples = Vec::new();
         loop {
             let tick = Instant::now();
-            let output = ctx.run(input(), |ctx| viewer.draw(ctx));
-            let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
-            if frames.len() < 8192 {
-                frames.push(tick.elapsed().as_secs_f64() * 1000.0);
+            harness.poll();
+            if samples.len() < 8192 {
+                samples.push(tick.elapsed().as_secs_f64() * 1000.0);
             }
-            ticks += 1;
-            if ticks % 20 == 0 {
-                viewer.command(Navigation::First);
-            }
-            if let Some(s) = &viewer.search
-                && let Some(state) = &s.state
+            if let Some(snapshot) = &harness.search
+                && let Some(state) = &snapshot.state
             {
                 if state.count > 0 && first.is_none() {
                     first = Some(start.elapsed().as_secs_f64() * 1000.0);
@@ -1283,101 +1897,96 @@ pub fn benchmark_search(path: PathBuf, expected: u64) -> Result<serde_json::Valu
                             "Unexpected search result {state:?}; expected {matches}"
                         ));
                     }
-                    let store = viewer
+                    let store = harness
                         .task
-                        .as_ref()
-                        .unwrap()
                         .search
                         .store()
                         .ok_or("Missing completed result store")?;
                     for hit in [0, matches / 2, matches - 1] {
-                        let loc = store.location(hit, &|| false)?;
+                        let location = store.location(hit, &|| false)?;
                         let expected_ordinal = if term == "NEEDLE" {
                             [0, expected / 2, expected - 1][hit as usize]
                         } else {
                             hit
                         };
-                        if loc
+                        if location
                             .ancestors
                             .first()
-                            .is_none_or(|e| e.ordinal != expected_ordinal)
+                            .is_none_or(|edge| edge.ordinal != expected_ordinal)
                         {
                             return Err("First/middle/last result location mismatch".into());
                         }
                     }
-                    frames.sort_by(f64::total_cmp);
-                    let p95 = frames[(frames.len() - 1) * 95 / 100];
-                    reports.push(serde_json::json!({"term":term,"matches":state.count,"scanned":state.scanned,"first_observed_ms":first,"complete_observed_ms":start.elapsed().as_secs_f64()*1000.0,"gui_cpu_p95_ms":p95,"gui_cpu_max_ms":frames.last(),"gui_frames":frames.len(),"queue_peak":s.queue_peak,"budget":budget.usage()}));
+                    samples.sort_by(f64::total_cmp);
+                    let p95 = samples[(samples.len() - 1) * 95 / 100];
+                    reports.push(serde_json::json!({
+                        "term": term,
+                        "matches": state.count,
+                        "scanned": state.scanned,
+                        "first_observed_ms": first,
+                        "complete_observed_ms": start.elapsed().as_secs_f64() * 1000.0,
+                        "poll_p95_ms": p95,
+                        "poll_max_ms": samples.last(),
+                        "poll_samples": samples.len(),
+                        "queue_peak": snapshot.queue_peak,
+                        "budget": budget.usage(),
+                    }));
                     break;
                 }
             }
-            if Instant::now() > deadline {
+            if start.elapsed() > Duration::from_secs(600) {
                 return Err("Search benchmark timeout".into());
             }
             std::thread::sleep(Duration::from_millis(2));
         }
     }
-    viewer.search_page = None;
-    viewer.frame = None;
-    viewer.layout = LayoutCache::new();
-    viewer
-        .task
-        .take()
-        .unwrap()
-        .retire()
-        .join()
-        .map_err(|_| "Search task join failed")?;
-    drop(viewer);
+    harness.close()?;
     let after = budget.usage();
     if after.disk != 0 {
         return Err(format!("Search files leaked: {after:?}"));
     }
-    Ok(
-        serde_json::json!({"file":path.display().to_string(),"bytes":std::fs::metadata(path).map_err(|e|e.to_string())?.len(),"ready_ms":ready_ms,"searches":reports,"after_retirement":after,"scope":"headless egui CPU+tessellation; no native window/GPU/RSS claim"}),
-    )
+    Ok(serde_json::json!({
+        "file": path.display().to_string(),
+        "bytes": std::fs::metadata(&path).map_err(|error| error.to_string())?.len(),
+        "ready_ms": ready_ms,
+        "searches": reports,
+        "after_retirement": after,
+        "scope": "headless engine/paging/polling CPU; gpui rendering and native FPS not measured",
+    }))
 }
+
+/// Development harness: navigation, expansion and polling CPU without a window.
 #[allow(dead_code, reason = "Standalone CPU benchmark entry")]
 pub fn benchmark_live(
     path: PathBuf,
     expected: u64,
     nested: bool,
 ) -> Result<serde_json::Value, String> {
-    let ctx = egui::Context::default();
-    ctx.set_fonts(crate::fonts::definitions());
-    let mut viewer = Viewer::empty(
-        path.clone(),
-        Backend::Sparse(crate::engine::sparse::OpenOptions::default()),
-    );
-    viewer.open(path, &ctx);
-    let budget = viewer
-        .task
-        .as_ref()
-        .ok_or("Cannot start tree task")?
-        .budget();
-    let mut validating = Vec::new();
-    let mut ready_times = Vec::new();
+    let mut harness = Harness::new(path)?;
+    let budget = harness.task.budget();
     let started = Instant::now();
+    let mut validating = Vec::new();
+    let mut ready_samples = Vec::new();
     let mut first_page = None;
-    let input = || egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(1120.0, 760.0),
-        )),
-        ..Default::default()
-    };
-    while viewer.status != SessionStatus::Ready || viewer.frame.as_ref().is_none_or(|f| !f.exact) {
+    loop {
         let frame_started = Instant::now();
-        let output = ctx.run(input(), |ctx| viewer.draw(ctx));
-        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        harness.poll();
         let elapsed = frame_started.elapsed().as_secs_f64() * 1000.0;
-        if viewer.status == SessionStatus::Failed {
-            return Err(viewer.notice.clone());
+        if harness.status == SessionStatus::Failed {
+            return Err(harness.notice.clone());
         }
-        if viewer.status == SessionStatus::Validating && validating.len() < 8192 {
+        if harness.status == SessionStatus::Validating && validating.len() < 8192 {
             validating.push(elapsed);
         }
-        if first_page.is_none() && viewer.frame.as_ref().is_some_and(|f| f.rows.len() > 1) {
+        if first_page.is_none()
+            && harness.frame.as_ref().is_some_and(|frame| frame.rows.len() > 1)
+        {
             first_page = Some(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        if harness.status == SessionStatus::Ready
+            && harness.frame.as_ref().is_some_and(|frame| frame.exact)
+        {
+            break;
         }
         if started.elapsed() > Duration::from_secs(1800) {
             return Err("Tree build deadline exceeded".into());
@@ -1385,31 +1994,9 @@ pub fn benchmark_live(
         std::thread::sleep(Duration::from_millis(16));
     }
     let ready_ms = started.elapsed().as_secs_f64() * 1000.0;
-    if viewer.frame.as_ref().unwrap().total != expected + 1 {
+    if harness.frame.as_ref().unwrap().total != expected + 1 {
         return Err("Unexpected initial row count".into());
     }
-    let wait =
-        |viewer: &mut Viewer, predicate: &dyn Fn(&TreeFrame) -> bool| -> Result<f64, String> {
-            let start = Instant::now();
-            loop {
-                let _ = ctx.run(input(), |ctx| viewer.draw(ctx));
-                if viewer.frame_epoch
-                    == viewer
-                        .task
-                        .as_ref()
-                        .unwrap()
-                        .epoch
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    && viewer.frame.as_ref().is_some_and(predicate)
-                {
-                    return Ok(start.elapsed().as_secs_f64() * 1000.0);
-                }
-                if start.elapsed() > Duration::from_secs(60) {
-                    return Err(format!("Navigation deadline exceeded: {}", viewer.notice));
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        };
     let mut probes = Vec::new();
     for ordinal in [0, expected / 2, expected - 1] {
         let pointer = if nested {
@@ -1417,14 +2004,17 @@ pub fn benchmark_live(
         } else {
             format!("/{ordinal}")
         };
-        let path = if nested {
+        let wanted = if nested {
             format!("$[{ordinal}][\"id\"]")
         } else {
             format!("$[{ordinal}]")
         };
-        viewer.command(Navigation::Locate(pointer));
-        let elapsed = wait(&mut viewer, &|f| f.selection.path == path)?;
-        let text = &viewer.frame.as_ref().unwrap().selection.preview;
+        harness.command(Navigation::Locate(pointer));
+        let elapsed = harness.wait(
+            &|frame| frame.selection.path == wanted,
+            Duration::from_secs(60),
+        )?;
+        let text = &harness.frame.as_ref().unwrap().selection.preview;
         if nested {
             if text != &ordinal.to_string() {
                 return Err("Nested id mismatch".into());
@@ -1436,19 +2026,25 @@ pub fn benchmark_live(
                 || !text.ends_with('"')
                 || !text.as_bytes()[prefix.len()..text.len() - 1]
                     .iter()
-                    .all(|b| *b == b'x')
+                    .all(|byte| *byte == b'x')
             {
                 return Err("Scalar full-value probe mismatch".into());
             }
         }
-        probes.push(serde_json::json!({"ordinal":ordinal,"locate_ms":elapsed}));
+        probes.push(serde_json::json!({"ordinal": ordinal, "locate_ms": elapsed}));
     }
-    viewer.command(Navigation::ExpandAll);
+    harness.command(Navigation::ExpandAll);
     let full_rows = expected * (if nested { 8 } else { 1 }) + 1;
-    let expand_ms = wait(&mut viewer, &|f| f.total == full_rows)?;
-    viewer.command(Navigation::Last);
-    let end_ms = wait(&mut viewer, &|f| f.selected_rank == full_rows - 1)?;
-    let last_path = &viewer.frame.as_ref().unwrap().selection.path;
+    let expand_ms = harness.wait(
+        &|frame| frame.total == full_rows,
+        Duration::from_secs(60),
+    )?;
+    harness.command(Navigation::Last);
+    let end_ms = harness.wait(
+        &|frame| frame.selected_rank == full_rows - 1,
+        Duration::from_secs(60),
+    )?;
+    let last_path = &harness.frame.as_ref().unwrap().selection.path;
     let wanted = if nested {
         format!("$[{}][\"payload\"]", expected - 1)
     } else {
@@ -1457,10 +2053,10 @@ pub fn benchmark_live(
     if last_path != &wanted {
         return Err("Full expansion end path mismatch".into());
     }
-    viewer.command(Navigation::CollapseAll);
-    let collapse_ms = wait(&mut viewer, &|f| f.total == 1)?;
-    viewer.command(Navigation::ExpandAll);
-    wait(&mut viewer, &|f| f.total == full_rows)?;
+    harness.command(Navigation::CollapseAll);
+    let collapse_ms = harness.wait(&|frame| frame.total == 1, Duration::from_secs(60))?;
+    harness.command(Navigation::ExpandAll);
+    harness.wait(&|frame| frame.total == full_rows, Duration::from_secs(60))?;
     let mut interactions = Vec::with_capacity(120);
     for operation in 0..120 {
         let start = Instant::now();
@@ -1470,23 +2066,22 @@ pub fn benchmark_live(
             2 => Navigation::Last,
             3 => Navigation::First,
             _ => Navigation::Anchor(
-                ((operation as u64 * 7919) % (full_rows.max(1))).min(full_rows - 1),
+                ((operation as u64 * 7919) % full_rows.max(1)).min(full_rows - 1),
             ),
         };
-        viewer.command(command);
-        wait(&mut viewer, &|_| true)?;
+        harness.command(command);
+        harness.wait(&|_| true, Duration::from_secs(60))?;
         interactions.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     for frame_number in 0..600 {
         if frame_number % 20 == 0 {
             let anchor = ((frame_number as u64 / 20) * (full_rows / 30)).min(full_rows - 1);
-            viewer.command(Navigation::Anchor(anchor));
+            harness.command(Navigation::Anchor(anchor));
         }
         let before = Instant::now();
-        let output = ctx.run(input(), |ctx| viewer.draw(ctx));
-        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
-        ready_times.push(before.elapsed().as_secs_f64() * 1000.0);
-        if viewer.frame.as_ref().is_some_and(|f| f.rows.len() > 64) {
+        harness.poll();
+        ready_samples.push(before.elapsed().as_secs_f64() * 1000.0);
+        if harness.frame.as_ref().is_some_and(|frame| frame.rows.len() > 64) {
             return Err("UI window exceeded 64 rows".into());
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -1494,205 +2089,35 @@ pub fn benchmark_live(
     fn stats(mut values: Vec<f64>) -> serde_json::Value {
         values.sort_by(f64::total_cmp);
         if values.is_empty() {
-            return serde_json::json!({"samples":0});
+            return serde_json::json!({"samples": 0});
         }
-        serde_json::json!({"samples":values.len(),"p50_ms":values[values.len()/2],"p95_ms":values[(values.len()-1)*95/100],"max_ms":values.last().unwrap()})
+        serde_json::json!({
+            "samples": values.len(),
+            "p50_ms": values[values.len() / 2],
+            "p95_ms": values[(values.len() - 1) * 95 / 100],
+            "max_ms": values.last().unwrap(),
+        })
     }
-    let result = serde_json::json!({"package_version":env!("CARGO_PKG_VERSION"),"first_page_ms":first_page,"ready_ms":ready_ms,"full_rows":full_rows,"expand_ms":expand_ms,"collapse_ms":collapse_ms,"last_ms":end_ms,"probes":probes,"validating_cpu_frames":stats(validating),"ready_cpu_frames":stats(ready_times),"interaction_latency":stats(interactions),"layout_builds":viewer.layout.builds,"managed":budget.usage(),"ui_window_max":64,"scope":"headless egui CPU, with actual background building; native/GPU FPS unverified"});
-    drop(viewer);
+    let result = serde_json::json!({
+        "package_version": env!("CARGO_PKG_VERSION"),
+        "first_page_ms": first_page,
+        "ready_ms": ready_ms,
+        "full_rows": full_rows,
+        "expand_ms": expand_ms,
+        "collapse_ms": collapse_ms,
+        "last_ms": end_ms,
+        "probes": probes,
+        "validating_poll_samples": stats(validating),
+        "ready_poll_samples": stats(ready_samples),
+        "interaction_latency": stats(interactions),
+        "managed": budget.usage(),
+        "ui_window_max": 64,
+        "scope": "headless engine/paging CPU, with actual background building; gpui rendering and native FPS unverified",
+    });
+    harness.close()?;
     crate::shutdown::finish();
     if budget.usage().memory != 0 || budget.usage().disk != 0 {
         return Err("Tree task retained budget after close".into());
     }
     Ok(result)
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::{
-        budget::Limits,
-        tree::{LegacyProvider, PagedTree},
-    };
-    #[test]
-    fn preview_layout_reuses_frames_and_invalidates_inputs() {
-        let b = BudgetManager::new(Limits {
-            memory: 256 * 1024 * 1024,
-            disk: 1024 * 1024 * 1024,
-        });
-        let d =
-            crate::document::Document::parse_owned_recover_with_budget("[1,2]".into(), b.clone())
-                .map_err(|(e, _)| e)
-                .unwrap();
-        let mut tree = PagedTree::new(Box::new(LegacyProvider(Arc::new(d))), &|| false).unwrap();
-        let root = tree.root(&|| false).unwrap();
-        let mut f = tree.frame(0, 64, &root, &|| false).unwrap();
-        let ctx = egui::Context::default();
-        let mut cache = LayoutCache::new();
-        let draw =
-            |cache: &mut LayoutCache, f: &TreeFrame, palette: Palette, wrap: bool, width: f32| {
-                let input = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(width, 400.0),
-                    )),
-                    ..Default::default()
-                };
-                let _ = ctx.run(input, |ctx| {
-                    egui::CentralPanel::default()
-                        .show(ctx, |ui| cache.show(ui, f, palette, wrap, &b));
-                });
-            };
-        let palette = ColorSettings::default().active();
-        draw(&mut cache, &f, palette, true, 600.0);
-        draw(&mut cache, &f, palette, true, 600.0);
-        assert_eq!(cache.builds, 1);
-        draw(&mut cache, &f, palette, false, 600.0);
-        assert_eq!(cache.builds, 2);
-        draw(&mut cache, &f, palette, false, 500.0);
-        assert_eq!(cache.builds, 3);
-        let light = ColorSettings {
-            dark: false,
-            ..Default::default()
-        }
-        .active();
-        draw(&mut cache, &f, light, false, 500.0);
-        assert_eq!(cache.builds, 4);
-        ctx.set_pixels_per_point(2.0);
-        draw(&mut cache, &f, light, false, 500.0);
-        assert_eq!(cache.builds, 5);
-        let selected = tree.row(1, &|| false).unwrap();
-        f = tree.frame(0, 64, &selected, &|| false).unwrap();
-        draw(&mut cache, &f, light, false, 500.0);
-        assert_eq!(cache.builds, 6);
-        drop(cache);
-        drop(f);
-        drop(tree);
-        assert_eq!(b.usage().memory, 0);
-        assert_eq!(b.usage().disk, 0);
-    }
-    #[test]
-    fn repeated_open_keeps_only_latest_request_while_old_threads_retire() {
-        let ctx = egui::Context::default();
-        let mut v = Viewer::empty(PathBuf::new(), Backend::Legacy(false));
-        let (tx, rx) = std::sync::mpsc::channel();
-        v.retiring = Some(std::thread::spawn(move || {
-            rx.recv().unwrap();
-        }));
-        for n in 0..100 {
-            v.open(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join(format!("target/nonexistent-s5-open-{n}.tmp")),
-                &ctx,
-            );
-            assert!(v.task.is_none());
-            assert!(v.retiring.is_some());
-        }
-        assert!(
-            v.pending_open
-                .as_ref()
-                .unwrap()
-                .ends_with("nonexistent-s5-open-99.tmp")
-        );
-        tx.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while v
-            .retiring
-            .as_ref()
-            .is_some_and(|thread| !thread.is_finished())
-        {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        while v.status != SessionStatus::Failed {
-            let _ = ctx.run(Default::default(), |ctx| v.draw(ctx));
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(v.pending_open.is_none());
-        assert!(v.retiring.is_none());
-        assert!(v.frame.is_none());
-    }
-    #[test]
-    fn dot_preserves_query_and_help_blocks_shortcut() {
-        let ctx = egui::Context::default();
-        let mut v = Viewer::empty(PathBuf::new(), Backend::Legacy(false));
-        v.query = "/existing".into();
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::Text(".".into())],
-                ..Default::default()
-            },
-            |ctx| v.keyboard(ctx),
-        );
-        assert!(v.focus_path);
-        assert_eq!(v.query, "/existing");
-        v.focus_path = false;
-        v.help = true;
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::Text(".".into())],
-                ..Default::default()
-            },
-            |ctx| v.keyboard(ctx),
-        );
-        assert!(!v.focus_path);
-        v.help = false;
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut v.query).id(egui::Id::new("paged_path")))
-                    .request_focus();
-            });
-        });
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::Text(".".into())],
-                ..Default::default()
-            },
-            |ctx| {
-                v.keyboard(ctx);
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut v.query).id(egui::Id::new("paged_path")),
-                    );
-                });
-            },
-        );
-        assert!(!v.focus_path);
-        assert!(v.query.contains('.'));
-    }
-    #[test]
-    fn search_triggers_preserve_term_consume_trigger_and_reverse_direction() {
-        let ctx = egui::Context::default();
-        let mut v = Viewer::empty(PathBuf::new(), Backend::Legacy(false));
-        v.search_term = "existing".into();
-        for (text, reverse) in [("/", false), ("?", true)] {
-            let _ = ctx.run(
-                egui::RawInput {
-                    events: vec![egui::Event::Text(text.into())],
-                    ..Default::default()
-                },
-                |ctx| {
-                    v.keyboard(ctx);
-                    assert!(ctx.input(|i| {
-                        i.events
-                            .iter()
-                            .all(|e| !matches!(e, egui::Event::Text(t) if t == text))
-                    }));
-                },
-            );
-            assert!(v.focus_search);
-            assert_eq!(v.search_reverse, reverse);
-            assert_eq!(v.search_term, "existing");
-            v.focus_search = false;
-        }
-        v.help = true;
-        let _ = ctx.run(
-            egui::RawInput {
-                events: vec![egui::Event::Text("/".into())],
-                ..Default::default()
-            },
-            |ctx| v.keyboard(ctx),
-        );
-        assert!(!v.focus_search);
-    }
 }

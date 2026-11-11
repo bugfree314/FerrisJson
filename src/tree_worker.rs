@@ -14,10 +14,7 @@ use crate::{
         tree_navigation::{Navigation, Navigator},
     },
 };
-#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
-use eframe::egui;
-#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
-use crate::terminal_wake as egui;
+use crate::repaint;
 use std::{
     collections::VecDeque,
     path::PathBuf,
@@ -126,7 +123,7 @@ pub struct Poll {
     pub notice: String,
 }
 impl Task {
-    pub fn new(path: PathBuf, backend: Backend, ctx: egui::Context) -> Result<Self, String> {
+    pub fn new(path: PathBuf, backend: Backend, ctx: repaint::Context) -> Result<Self, String> {
         let budget = BudgetManager::new(Limits {
             // TUI mode has no fixed memory quota; retain accounting and checked
             // arithmetic, while leaving the desktop quota unchanged.
@@ -1088,7 +1085,7 @@ mod tests {
         let task = Task::new(
             input.0.clone(),
             Backend::Sparse(OpenOptions::default()),
-            egui::Context::default(),
+            repaint::Context::default(),
         )
         .unwrap();
         let frame = wait(&task, |f| f.exact);
@@ -1187,7 +1184,7 @@ mod tests {
         let task = Task::new(
             input.0.clone(),
             Backend::Sparse(OpenOptions::default()),
-            egui::Context::default(),
+            repaint::Context::default(),
         )
         .unwrap();
         drop(wait(&task, |f| f.exact));
@@ -1217,7 +1214,7 @@ mod tests {
         let task = Task::new(
             input.0.clone(),
             Backend::Sparse(OpenOptions::default()),
-            egui::Context::default(),
+            repaint::Context::default(),
         )
         .unwrap();
         drop(wait(&task, |f| f.exact));
@@ -1282,7 +1279,7 @@ mod tests {
         let task = Task::new(
             input.0.clone(),
             Backend::Legacy(false),
-            egui::Context::default(),
+            repaint::Context::default(),
         )
         .unwrap();
         let b = task.budget();
@@ -1314,7 +1311,7 @@ mod tests {
         let task = Task::new(
             input.0.clone(),
             Backend::Sparse(OpenOptions::default()),
-            egui::Context::default(),
+            repaint::Context::default(),
         )
         .unwrap();
         let b = task.budget();
@@ -1352,7 +1349,7 @@ mod tests {
         let task = Task::new(
             input.0.clone(),
             Backend::Sparse(OpenOptions::default()),
-            egui::Context::default(),
+            repaint::Context::default(),
         )
         .unwrap();
         let first = wait(&task, |f| f.exact);
@@ -1394,7 +1391,7 @@ mod tests {
         let task = Task::new(
             input.0.clone(),
             Backend::Sparse(OpenOptions::default()),
-            egui::Context::default(),
+            repaint::Context::default(),
         )
         .unwrap();
         let partial = wait(&task, |f| !f.exact && f.total >= 2);
@@ -1420,7 +1417,7 @@ mod tests {
         let task = Task::new(
             input.0.clone(),
             Backend::Sparse(OpenOptions::default()),
-            egui::Context::default(),
+            repaint::Context::default(),
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);

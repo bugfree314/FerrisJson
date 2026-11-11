@@ -42,7 +42,7 @@ pub struct TaskWorker<W: Work> {
     session: Option<SessionId>,
 }
 impl<W: Work> TaskWorker<W> {
-    pub fn new(ctx: eframe::egui::Context) -> Self {
+    pub fn new(ctx: crate::repaint::Context) -> Self {
         let inbox: Arc<(Mutex<Inbox<W>>, Condvar)> = Arc::new((
             Mutex::new(Inbox {
                 pending: None,
@@ -177,7 +177,7 @@ mod tests {
     type Completion = super::Completion<QueryOutput>;
     #[test]
     fn full_result_channel_does_not_retain_documents() {
-        let ctx = eframe::egui::Context::default();
+        let ctx = crate::repaint::Context::default();
         let worker = Worker::new(ctx);
         let send = || {
             let doc = Arc::new(Document::parse("[1,2,3]").unwrap());
@@ -215,7 +215,7 @@ mod tests {
     }
     #[test]
     fn newer_requests_replace_old_queries_and_use_the_new_document() {
-        let mut worker = Worker::new(eframe::egui::Context::default());
+        let mut worker = Worker::new(crate::repaint::Context::default());
         let old =
             Arc::new(Document::parse(&serde_json::json!(vec!["old"; 20_000]).to_string()).unwrap());
         worker.submit(old, QueryRequest::new("$[*]")).unwrap();
@@ -240,7 +240,7 @@ mod tests {
     }
     #[test]
     fn cancellation_resets_busy_and_worker_accepts_new_requests() {
-        let mut worker = Worker::new(eframe::egui::Context::default());
+        let mut worker = Worker::new(crate::repaint::Context::default());
         let doc = Arc::new(Document::parse(r#"{"x":1}"#).unwrap());
         worker
             .submit(Arc::clone(&doc), QueryRequest::new("$.x"))

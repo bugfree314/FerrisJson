@@ -42,9 +42,8 @@ mod task_worker;
 mod ui;
 mod vim;
 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
-mod terminal_wake;
-#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "tui")))]
 mod tui;
+mod repaint;
 use document::{Document, SearchScope};
 use std::{
     io::{self, IsTerminal, Read, Write},
@@ -236,60 +235,107 @@ fn desktop(
     file: Option<PathBuf>, text: Option<String>, use_stdin: bool, indexed: bool,
     sparse: bool, sparse_pages: bool, paged_tree: bool, cache_dir: Option<PathBuf>,
 ) -> Result<(), String> {
+    use gpui::{App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
     // Finder launches with an empty redirected stdin. Start with an empty viewer
     // instead of trying to parse that as a JSON document; CLI parsing stays strict.
     let text = text.filter(|text| !text.is_empty());
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_icon(
-                eframe::icon_data::from_png_bytes(include_bytes!("../assets/FerrisJson.png"))
-                    .map_err(|e| format!("Cannot load FerrisJson icon: {e}"))?,
-            )
-            .with_inner_size([1120.0, 760.0])
-            .with_min_inner_size([700.0, 480.0]),
-        ..Default::default()
-    };
-    let result = eframe::run_native(
-        "FerrisJson",
-        options,
-        Box::new(move |cc| {
+    Application::new().run(move |cx: &mut App| {
+        fonts::install(cx);
+        crate::ui::bind_text_input_keys(cx);
+        let bounds = Bounds::centered(None, size(px(1120.), px(760.)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("FerrisJson".into()),
+                ..Default::default()
+            }),
+            window_min_size: Some(size(px(700.), px(480.))),
+            ..Default::default()
+        };
+        let mut text = text;
+        let mut file = file;
+        let opened = cx.open_window(options, move |window, cx| {
             if paged_tree {
-                return Ok(Box::new(tree_app::Viewer::new(
-                    cc,
-                    file.unwrap(),
-                    tree_worker::Backend::Legacy(indexed),
-                )) as Box<dyn eframe::App>);
+                let path = file.take().expect("paged tree requires a file");
+                let view = cx.new(|cx| {
+                    tree_app::Viewer::new(window, cx, path, tree_worker::Backend::Legacy(indexed))
+                });
+                return cx.new(|_| Root::Paged(view));
             }
             if sparse && !sparse_pages {
-                return Ok(Box::new(tree_app::Viewer::new(
-                    cc,
-                    file.unwrap(),
-                    tree_worker::Backend::Sparse(engine::sparse::OpenOptions {
-                        cache_dir,
-                        ..Default::default()
-                    }),
-                )) as Box<dyn eframe::App>);
+                let path = file.take().expect("sparse tree requires a file");
+                let view = cx.new(|cx| {
+                    tree_app::Viewer::new(
+                        window,
+                        cx,
+                        path,
+                        tree_worker::Backend::Sparse(engine::sparse::OpenOptions {
+                            cache_dir: cache_dir.clone(),
+                            ..Default::default()
+                        }),
+                    )
+                });
+                return cx.new(|_| Root::Paged(view));
             }
             if sparse {
-                return Ok(Box::new(sparse_app::Viewer::new(
-                    cc,
-                    file.unwrap(),
-                    engine::sparse::OpenOptions {
-                        cache_dir,
-                        ..Default::default()
-                    },
-                )) as Box<dyn eframe::App>);
+                let path = file.take().expect("sparse viewer requires a file");
+                let view = cx.new(|cx| {
+                    sparse_app::Viewer::new(
+                        window,
+                        cx,
+                        path,
+                        engine::sparse::OpenOptions {
+                            cache_dir: cache_dir.clone(),
+                            ..Default::default()
+                        },
+                    )
+                });
+                return cx.new(|_| Root::Sparse(view));
             }
-            Ok(Box::new(app::Viewer::new(
-                cc,
-                if use_stdin { None } else { file },
-                text,
-                indexed,
-            )))
-        }),
-    );
+            let view = cx.new(|cx| {
+                app::Viewer::new(
+                    window,
+                    cx,
+                    if use_stdin { None } else { file.take() },
+                    text.take(),
+                    indexed,
+                )
+            });
+            cx.new(|_| Root::Default(view))
+        });
+        if let Err(error) = opened {
+            eprintln!("Cannot open FerrisJson window: {error}");
+            cx.quit();
+        }
+        cx.activate(true);
+    });
     shutdown::finish();
-    result.map_err(|e| e.to_string())
+    Ok(())
+}
+
+/// The window hosts one of the three desktop views. gpui needs a single view
+/// type at the window root, so each entry point is created as an entity and
+/// rendered through this dispatcher.
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
+enum Root {
+    Default(gpui::Entity<app::Viewer>),
+    Paged(gpui::Entity<tree_app::Viewer>),
+    Sparse(gpui::Entity<sparse_app::Viewer>),
+}
+
+#[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "tui"))))]
+impl gpui::Render for Root {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        match self {
+            Root::Default(view) => gpui::IntoElement::into_any_element(view.clone()),
+            Root::Paged(view) => gpui::IntoElement::into_any_element(view.clone()),
+            Root::Sparse(view) => gpui::IntoElement::into_any_element(view.clone()),
+        }
+    }
 }
 
 fn stdin_redirected() -> bool {

@@ -11,7 +11,6 @@ use crate::{
     search_worker::SearchHub,
     task_worker::{TaskWorker, Work},
 };
-use eframe::egui;
 use std::{
     sync::{Arc, atomic::{AtomicBool, Ordering}},
     thread::JoinHandle,
@@ -129,7 +128,7 @@ pub struct Update {
 }
 
 pub struct SearchWorker {
-    ctx: egui::Context,
+    ctx: crate::repaint::Context,
     hub: Option<SearchHub>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -148,7 +147,7 @@ pub struct SearchWorker {
 }
 
 impl SearchWorker {
-    pub fn new(ctx: egui::Context) -> Self {
+    pub fn new(ctx: crate::repaint::Context) -> Self {
         Self {
             ctx: ctx.clone(), hub: None, stop: Arc::new(AtomicBool::new(false)), thread: None,
             reader: TaskWorker::new(ctx), doc: None, session: None, initial: None,
@@ -227,15 +226,6 @@ impl SearchWorker {
             hub.next(!backwards, count as u64);
             self.read_revision = None;
             self.busy = true;
-        }
-    }
-    pub fn cancel_scan(&mut self) {
-        if let Some(hub) = &self.hub {
-            hub.cancel();
-            self.reader.cancel();
-            self.initial = None;
-            self.read_revision = None;
-            self.busy = false;
         }
     }
     pub fn poll(&mut self) -> Option<Update> {

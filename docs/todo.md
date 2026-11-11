@@ -12,6 +12,21 @@
 
 本次没有升级版本、暂存或提交。S0 保持暂停，专项继续采用十进制 100/300/500 MB 的低 / 高命中；历史 S3–S5 的特殊范围不改写。下文“当前验证与发布状态”也是历史阶段记录，不能作为 0.8.0 验收依据。
 
+## 2026-11-11 UI 框架迁移到 gpui（未提交、未验收）
+
+- [x] 桌面 GUI 由 eframe/egui 改为 gpui 0.2.2：默认查看器、分页树查看器和实验性稀疏分页查看器均改为 gpui 视图；应用图标仍由构建脚本嵌入 EXE，窗口图标入口随 eframe 移除。
+- [x] 新增框架中立的重绘通知模块，worker 不再依赖窗口库；搜索、预览、查询、分页任务和 TUI 共用同一唤醒接口。
+- [x] `tree_bench`／`search_bench` 改为无窗口的引擎／分页／轮询 CPU harness，不再创建视图或计算 egui 布局；报告键从 `gui_cpu_*` 改为 `poll_*`，删除 `layout_builds`，并注明 gpui 渲染与原生帧率未测量。
+- [x] 重新实现单行输入框（IME、选区、剪贴板、Enter/Esc）、JSON 高亮 runs、工具栏、状态栏、检查器分隔条与全部弹窗；配色、字体回退、拖放和 Vim 键位保留。
+- [x] 同步 Cargo.toml／Cargo.lock 依赖，并用 `cargo metadata` 核对清单与锁文件一致。
+- [x] Windows Release 构建前置条件已记录到 README：gpui 只在 `not(debug_assertions)` 下用 `fxc.exe` 编译 HLSL 着色器，且只自动查找 PATH 与 SDK `10.0.26100.0`；本机 SDK 为 `10.0.19041.0`／`10.0.22621.0`，因此构建前需设置 `GPUI_FXC_PATH`（已用 `C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\fxc.exe` 验证）。属工具链前置条件，不是代码错误。
+- [x] 按 gpui 0.2.2 真实 API 修正迁移代码：可点击元素改为 `Stateful<Div>`（`button`／`toggle`／`modal` 先分配 id）、滚动容器补 id、`TextInput` 焦点改用 `Focusable::focus_handle`、`StyledText` 改为拥有字符串、`Bounds` 用 `size.height`、帮助／JSONPath 静态表改为 `&'static` 并解引用迭代，`help_section` 与 `tree_row` 借用冲突一并修正。
+- [x] `cargo build --release --bin FerrisJson` 通过（gpui 构建脚本需 `GPUI_FXC_PATH`），`cargo build --release --examples` 通过；本 crate 与两个 harness 无告警。修正后删除了迁移遗留的死代码（`SearchWorker::cancel_scan`、`open_file_shortcut_label`、`SearchHighlight::same_query`、`TextInput::content`、`repaint::Context::request_repaint_after`）。
+- [ ] 调试 profile（`cargo check`／`cargo build`，无 `--release`）在本机失败在依赖 `ring` 的构建脚本（`target/debug` 下 cl.exe／lib.exe 报“拒绝访问”），与迁移代码无关；着色器编译本身在调试 profile 不执行。Release 是当前可验证的构建方式。
+- [ ] 整个迁移尚未人工验收（窗口交互、输入法、剪贴板、拖放、弹窗层级、平台标题栏图标／菜单）。首版构建仅证明代码可通过编译。
+- [ ] 原 `Open file` 按钮的快捷键提示（`Ctrl+O`／`⌘O`）随 egui 的 `on_hover_text` 移除；gpui 0.2.2 的工具提示需要额外视图，且旧版并未真正绑定该快捷键。若需要恢复，应作为独立改动实现真实按键绑定与提示。
+- [ ] 版本仍为 0.8.0，尚未提交；按用户要求只暂存代码，版本、README 版本索引与优化历史在带版本号的提交时再统一同步。
+
 使用 Rust 编写并编译为原生程序的本地 JSON 查看器，参考 fx 的键盘交互与 JSONBolt 的树形界面，由作者与 OpenAI Codex 协作开发。
 
 当前版本为 **0.8.0**（本次版本提交）；Edition 2024，GPL-3.0-or-later。2026-10-17：收录已通过 `12d791a` 合入 main 的 TUI 系列。当前仅同步版本与文档，按用户明确要求提交，不运行测试、构建或其他代码验证，未创建新标签／推送；功能、跨平台与大文件验收仍待用户执行，S0 继续暂停。
